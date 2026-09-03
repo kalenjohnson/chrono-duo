@@ -168,10 +168,19 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         float fs = h * 0.26f;
         setText(fs, Color.rgb(190, 200, 255), true, Paint.Align.LEFT, true);
         c.drawText("HP", tx, row1, text);
-        c.drawText("MP", tx, row2, text);
+        int hpCur = snap.inBattle ? m.battleCurHp : m.curHp;
+        int hpMax = snap.inBattle ? m.battleMaxHp : m.maxHp;
         setText(fs, Color.WHITE, false, Paint.Align.RIGHT, true);
-        c.drawText(m.curHp + "/" + m.maxHp, valRight, row1, text);
-        c.drawText(m.curMp + "/" + m.maxMp, valRight, row2, text);
+        c.drawText(hpCur + "/" + hpMax, valRight, row1, text);
+        if (snap.inBattle) {
+            // MP offsets inside the battle actor block aren't calibrated
+            // (see PartySnapshot) -- show only HP, live, during battle.
+        } else {
+            setText(fs, Color.rgb(190, 200, 255), true, Paint.Align.LEFT, true);
+            c.drawText("MP", tx, row2, text);
+            setText(fs, Color.WHITE, false, Paint.Align.RIGHT, true);
+            c.drawText(m.curMp + "/" + m.maxMp, valRight, row2, text);
+        }
     }
 
     /**
@@ -313,6 +322,62 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     }
 
     /**
+     * Battle-mode centerpiece: replaces the map/location content with one
+     * HP bar per enemy, CT-style (green &gt; yellow &gt; red by remaining
+     * fraction). Drawn inside the same torn-parchment clip as the map, so it
+     * inherits the aged-paper overlay drawn after this returns.
+     */
+    private void drawBattleContent(Canvas c, RectF parchment) {
+        int w = getWidth(), h = getHeight();
+        setText(h * 0.045f, INK, true, Paint.Align.CENTER, false);
+        text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        c.drawText("Battle", parchment.centerX(), parchment.top + h * 0.085f, text);
+
+        int n = snap.enemies.size();
+        if (n == 0) return;
+        float areaTop = parchment.top + h * 0.13f;
+        float areaBottom = parchment.bottom - h * 0.09f;
+        float rowH = Math.min(h * 0.075f, (areaBottom - areaTop) / n);
+        float barLeft = parchment.left + w * 0.09f;
+        float barRight = parchment.right - w * 0.09f;
+        for (int i = 0; i < n; i++) {
+            float rowTop = areaTop + i * rowH;
+            drawEnemyBar(c, snap.enemies.get(i), i, barLeft, rowTop, barRight - barLeft, rowH * 0.62f);
+        }
+    }
+
+    /** One CT-style enemy HP bar: label above, colored fill bar with numeric readout. */
+    private void drawEnemyBar(Canvas c, PartySnapshot.Enemy e, int index, float l, float t, float w, float h) {
+        setText(h * 0.62f, INK, true, Paint.Align.LEFT, false);
+        text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        c.drawText("Enemy " + (index + 1), l, t, text);
+        setText(h * 0.62f, INK, false, Paint.Align.RIGHT, false);
+        text.setTypeface(Typeface.MONOSPACE);
+        c.drawText(e.curHp + "/" + e.maxHp, l + w, t, text);
+
+        float barTop = t + h * 0.28f;
+        float barH = h * 0.6f;
+        RectF track = new RectF(l, barTop, l + w, barTop + barH);
+        fill.setShader(null);
+        fill.setColor(Color.argb(160, 40, 30, 15));
+        c.drawRoundRect(track, barH * 0.4f, barH * 0.4f, fill);
+
+        float frac = e.maxHp > 0 ? Math.max(0f, Math.min(1f, e.curHp / (float) e.maxHp)) : 0f;
+        if (frac > 0f) {
+            RectF fillRect = new RectF(track);
+            fillRect.right = track.left + track.width() * frac;
+            int barColor = frac > 0.5f ? Color.rgb(70, 190, 90)
+                    : frac > 0.2f ? Color.rgb(230, 200, 60)
+                    : Color.rgb(210, 60, 60);
+            fill.setColor(barColor);
+            c.drawRoundRect(fillRect, barH * 0.4f, barH * 0.4f, fill);
+        }
+        stroke.setStrokeWidth(1.5f);
+        stroke.setColor(Color.argb(150, 96, 72, 40));
+        c.drawRoundRect(track, barH * 0.4f, barH * 0.4f, stroke);
+    }
+
+    /**
      * Before any party data has arrived (no members yet), skip the whole
      * parchment/DS-panel rendering and show a minimal black-screen wordmark
      * instead — no boxes, no subtitle, nothing else to imply readiness that
@@ -351,7 +416,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // past the ripped edge (drawParchmentBase() above already built it)
         c.save();
         c.clipPath(tornPaper);
-        if (overworld) {
+        if (snap.inBattle) {
+            drawBattleContent(c, parchment);
+        } else if (overworld) {
             // small title above the map
             setText(h * 0.045f, INK, true, Paint.Align.CENTER, false);
             text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));

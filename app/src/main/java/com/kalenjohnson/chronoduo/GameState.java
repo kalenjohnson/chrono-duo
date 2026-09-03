@@ -31,6 +31,9 @@ public final class GameState {
     public static native void nativeUpdateBattleFlag();           // GL thread only
     public static native boolean nativeGetBattleFlag();
     public static native void nativeDumpBattleBuffers(String dir); // any thread; uses cached node ptr
+    // Live battle actor array (10 * 0x80-byte slots), or null if not in battle
+    // or any pointer in the chase is bad. Any thread; uses cached node ptr.
+    public static native byte[] nativeReadBattleActors();
 
     /** Scene-graph node type/name patterns hidden by the "clean UI" tick. */
     public static final String[] HIDDEN_UI_PATTERNS = {"FieldMenu", "WorldMenu"};

@@ -572,6 +572,42 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeDumpBattleBuffers(JNIEnv *env, j
     (*env)->ReleaseStringUTFChars(env, jdir, dir);
 }
 
+// Live battle actor array snapshot for the second-screen panel poller. Same
+// pointer chase as nativeDumpBattleBuffers (g_battle_node -> +0x320 SceneBattle
+// -> +0x68 chara array), but returns the raw bytes directly instead of writing
+// files, and is meant to be called every UI poll tick (~500ms) -- NOT the GL
+// thread. Actor array layout (SNES-heritage, verified live): stride 0x80 per
+// actor, at least 10 slots; +0x03 = current HP, +0x05 = max HP (u16 LE).
+// Slots 0-2 are the party (in party order), slots 3+ are enemies (a slot is
+// "present" if max HP > 0). Returns NULL whenever any link in the chain is
+// missing/implausible or no battle is active -- callers must treat that as
+// "not in battle" and fall back to field mode.
+#define BTLCHARA_STRIDE 0x80
+#define BTLCHARA_SLOTS  10
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeReadBattleActors(JNIEnv *env, jclass cls) {
+    if (!g_battle_node) return NULL;
+
+    uint8_t *sb = NULL;
+    if (!safe_read((uint8_t *)g_battle_node + 0x320, &sb, sizeof(sb)) || !plausible_any(sb)) {
+        return NULL;
+    }
+    uint8_t *chara_ptr = NULL;
+    if (!safe_read(sb + BTLCHARA_OFFSET, &chara_ptr, sizeof(chara_ptr)) || !plausible_any(chara_ptr)) {
+        return NULL;
+    }
+
+    size_t len = BTLCHARA_SLOTS * BTLCHARA_STRIDE;
+    uint8_t buf[BTLCHARA_SLOTS * BTLCHARA_STRIDE];
+    if (!safe_read(chara_ptr, buf, len)) return NULL;
+
+    jbyteArray arr = (*env)->NewByteArray(env, (jsize)len);
+    if (!arr) return NULL;
+    (*env)->SetByteArrayRegion(env, arr, 0, (jsize)len, (const jbyte *)buf);
+    return arr;
+}
+
 // Raw bytes of the embedded cSfcWork object itself (for calibration dumps).
 JNIEXPORT jbyteArray JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeReadSfc(JNIEnv *env, jclass cls, jint off, jint len) {

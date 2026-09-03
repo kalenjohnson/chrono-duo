@@ -20,13 +20,43 @@ public final class PartySnapshot {
     private static final int NAMES_BASE = 0x19a8;
     private static final int NAME_STRIDE = 0x18;
 
+    // Battle actor array (see GameState.nativeReadBattleActors): stride 0x80
+    // per actor, at least 10 slots. u16 LE +0x03 = current HP, +0x05 = max HP.
+    // Slots 0-2 = party (party order), slots 3+ = enemies (present if maxHP >
+    // 0). MP offsets within the block are NOT reliably known -- calibration
+    // against fight6/battle_*_btlchara.bin (8 generations, party = Crono +
+    // Marle only) found a candidate for Crono (cur=+0x30, max=+0x45, matching
+    // the known 8/10 exactly in all 8 captures) but the equivalent search for
+    // Marle's known 12/14 found no offset at all matching 14 anywhere in her
+    // block, in any capture -- and Crono's "match" isn't adjacent the way HP's
+    // +0x03/+0x05 pair is (21-byte gap), unlike a real stat pair. Given a real
+    // MP field should generalize across party members at a consistent relative
+    // offset and this one doesn't, it's treated as a coincidental match on
+    // small integers rather than the real field. MP is therefore left out of
+    // battle mode entirely; only HP is shown live during battle.
+    private static final int BTL_STRIDE = 0x80;
+    private static final int BTL_SLOTS = 10;
+    private static final int BTL_PARTY_SLOTS = 3;
+    private static final int BTL_HP_OFF = 0x03;
+    private static final int BTL_MAXHP_OFF = 0x05;
+    private static final int BTL_MAX_PLAUSIBLE_HP = 9999;
+
     public static final class Member {
         public String name;
         public int level, curHp, maxHp, curMp, maxMp;
         public int slot; // 1-based party slot (record +0x11c); -1 = not in party
+        // Live battle HP, when inBattle -- overrides curHp/maxHp for display
+        // purposes while a fight is active (see PartyPanelView).
+        public int battleCurHp, battleMaxHp;
+    }
+
+    public static final class Enemy {
+        public int curHp, maxHp;
     }
 
     public final List<Member> members = new ArrayList<>();
+    public boolean inBattle;
+    public final List<Enemy> enemies = new ArrayList<>();
     public int gold;        // cSfcWork+0x1a04 (u32), found by differential dump
     public int playSeconds; // cSfcWork+0x1a10 (u32), monotonically rising
     public String mapName = ""; // cached from ChronoCanvas::getFieldMapName()
@@ -38,6 +68,11 @@ public final class PartySnapshot {
         if (b == null || off + 4 > b.length) return 0;
         return (b[off] & 0xff) | (b[off + 1] & 0xff) << 8
                 | (b[off + 2] & 0xff) << 16 | (b[off + 3] & 0xff) << 24;
+    }
+
+    private static int u16(byte[] b, int off) {
+        if (b == null || off + 2 > b.length) return 0;
+        return (b[off] & 0xff) | (b[off + 1] & 0xff) << 8;
     }
 
     public static PartySnapshot read() {
@@ -74,6 +109,30 @@ public final class PartySnapshot {
             snap.members.add(m);
         }
         snap.members.sort((a, b2) -> a.slot - b2.slot);
+
+        byte[] btl = GameState.nativeReadBattleActors();
+        if (btl != null && btl.length >= BTL_SLOTS * BTL_STRIDE) {
+            snap.inBattle = true;
+            for (int i = 0; i < BTL_PARTY_SLOTS && i < snap.members.size(); i++) {
+                int base = i * BTL_STRIDE;
+                int curHp = u16(btl, base + BTL_HP_OFF);
+                int maxHp = u16(btl, base + BTL_MAXHP_OFF);
+                if (maxHp <= 0 || maxHp > BTL_MAX_PLAUSIBLE_HP || curHp > BTL_MAX_PLAUSIBLE_HP) continue;
+                Member m = snap.members.get(i);
+                m.battleCurHp = curHp;
+                m.battleMaxHp = maxHp;
+            }
+            for (int i = BTL_PARTY_SLOTS; i < BTL_SLOTS; i++) {
+                int base = i * BTL_STRIDE;
+                int curHp = u16(btl, base + BTL_HP_OFF);
+                int maxHp = u16(btl, base + BTL_MAXHP_OFF);
+                if (maxHp <= 0 || maxHp > BTL_MAX_PLAUSIBLE_HP || curHp > BTL_MAX_PLAUSIBLE_HP) continue;
+                Enemy e = new Enemy();
+                e.curHp = curHp;
+                e.maxHp = maxHp;
+                snap.enemies.add(e);
+            }
+        }
         return snap;
     }
 
@@ -93,11 +152,17 @@ public final class PartySnapshot {
         if (gold != o.gold || playSeconds != o.playSeconds
                 || !mapName.equals(o.mapName)
                 || worldX != o.worldX || worldY != o.worldY) return false;
+        if (inBattle != o.inBattle || enemies.size() != o.enemies.size()) return false;
         for (int i = 0; i < members.size(); i++) {
             Member a = members.get(i), b = o.members.get(i);
             if (!a.name.equals(b.name) || a.level != b.level
                     || a.curHp != b.curHp || a.maxHp != b.maxHp
-                    || a.curMp != b.curMp || a.maxMp != b.maxMp) return false;
+                    || a.curMp != b.curMp || a.maxMp != b.maxMp
+                    || a.battleCurHp != b.battleCurHp || a.battleMaxHp != b.battleMaxHp) return false;
+        }
+        for (int i = 0; i < enemies.size(); i++) {
+            Enemy a = enemies.get(i), b = o.enemies.get(i);
+            if (a.curHp != b.curHp || a.maxHp != b.maxHp) return false;
         }
         return true;
     }
