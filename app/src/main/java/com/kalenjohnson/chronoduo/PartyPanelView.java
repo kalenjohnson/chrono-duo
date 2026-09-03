@@ -261,6 +261,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // AppActivity#onCreate. Called when the user taps "Import DS ROM...".
     public interface SettingsHost {
         void requestRomImport();
+        /** Pixel-graphics toggle changed: (un)register the original-sprite replacements. */
+        void onPixelGraphicsChanged(boolean enabled);
     }
     private SettingsHost settingsHost;
 
@@ -406,6 +408,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                     && pixelGraphicsHitBox.contains(event.getX(), event.getY())) {
                 pixelGraphicsOn = !pixelGraphicsOn;
                 GameState.setPixelGraphicsPref(getContext(), pixelGraphicsOn);
+                if (settingsHost != null) settingsHost.onPixelGraphicsChanged(pixelGraphicsOn);
                 invalidate();
                 return true;
             }

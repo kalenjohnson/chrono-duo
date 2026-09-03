@@ -123,6 +123,10 @@ public class AppActivity extends Cocos2dxActivity {
 
         secondScreen = new SecondScreenManager(this);
         secondScreen.setSettingsHost(new PartyPanelView.SettingsHost() {
+            @Override public void onPixelGraphicsChanged(boolean enabled) {
+                if (enabled) scanOrigArtReplacements();
+                else com.kalenjohnson.chronoduo.GameState.nativeClearTextureReplacements();
+            }
             @Override public void requestRomImport() {
                 launchRomPicker();
             }
@@ -155,7 +159,8 @@ public class AppActivity extends Cocos2dxActivity {
             }
         });
         extractCompanionAssets();
-        scanOrigArtReplacements();
+        // Original-sprite replacements ride on the pixel-graphics preference.
+        if (com.kalenjohnson.chronoduo.GameState.getPixelGraphicsPref(this)) scanOrigArtReplacements();
 
         com.kalenjohnson.chronoduo.GameState.attach();
         // Frame-perfect menu parking: a per-rendered-frame GL tick that kills
