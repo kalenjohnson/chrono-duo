@@ -15,6 +15,7 @@ import android.graphics.Typeface;
 import android.view.MotionEvent;
 import android.view.View;
 
+import java.io.File;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -68,6 +69,19 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private String fadingOutTitle;
     private long titleFadeStart = -1L;
 
+    // Field-mode area-map bitmap crossfade: kept separate from the title
+    // fade above since the two triggers don't always coincide (fieldMapId
+    // can change while the location name stays the same -- distinct
+    // sub-areas sharing a name -- or a rendered minimap can appear/disappear
+    // beneath unchanged text once ChronoAssets finishes/loses it). Reuses
+    // TITLE_FADE_NANOS as its duration. prevAreaMapBitmap/prevAreaMapId
+    // snapshot what was showing right before the id changed, so the
+    // fading-out side keeps drawing its own bitmap while the incoming one
+    // fades in.
+    private int prevAreaMapId = -1;
+    private Bitmap prevAreaMapBitmap;
+    private long areaMapFadeStart = -1L;
+
     // Per-slot eased HP-bar fractions (enemy battle bars). Keyed by enemy
     // index -- there's no persistent enemy identity to key on, and slot
     // order is stable within one fight, matching the "enemy slot" ask.
@@ -83,7 +97,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // the indoor/area-map panel, for lining up rendered area_minimap_%03d.png
     // files with live ids while building out the ds_maps/ set. Never shown
     // once that set is complete -- flip off then.
-    private static final boolean SHOW_MAP_ID = false;
+    private static final boolean SHOW_MAP_ID = true; // debug aid: map id after the location name
     // Dev calibration readout: appends the live field-tile position (one
     // decimal place) to the field-mode location title, so a player can
     // report on-screen positions to calibrate AreaMapCalib's per-map
@@ -210,6 +224,62 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private static final float BACK_GLYPH_RADIUS = 12f;
     private static final float BACK_HIT_HALF = 24f;
 
+    // --- settings screen (DS ROM import) -----------------------------------
+    // Implemented by AppActivity (a different package, hence public) and
+    // wired onto this view via SecondScreenManager -- see that class and
+    // AppActivity#onCreate. Called when the user taps "Import DS ROM...".
+    public interface SettingsHost {
+        void requestRomImport();
+    }
+    private SettingsHost settingsHost;
+
+    /** Sets (or clears, with null) the host that handles ROM-import requests from the settings screen -- see {@link SettingsHost}. */
+    public void setSettingsHost(SettingsHost host) {
+        settingsHost = host;
+    }
+
+    // Small "gear" chip, top-left corner, mirroring the eye toggle's
+    // top-right placement/hit-box style (see drawEyeToggle) -- shown in
+    // field/overworld modes (never battle; the eye toggle owns that corner
+    // there, and mid-battle isn't a sane time to open settings). Tapping it
+    // enters settingsMode.
+    private final RectF gearHitBox = new RectF();
+    private boolean settingsMode;
+
+    // Import status, pushed from AppActivity via setImportStatus as the
+    // background ROM import (see SettingsHost) progresses. importError is
+    // non-null only after a failed import; cleared by the next attempt.
+    private boolean importing;
+    private int importDone, importTotal;
+    private String importStage = "";
+    private String importError;
+    // Hit boxes for the settings screen's two buttons, updated only while
+    // drawSettingsScreen actually draws them (import button hit box is left
+    // empty while importing, so a tap can't double-fire a second import).
+    private final RectF importButtonHitBox = new RectF();
+    private final RectF settingsBackHitBox = new RectF();
+
+    /**
+     * Pushes live DS-ROM-import progress/result to the settings screen (see
+     * {@link #drawSettingsScreen}); called from AppActivity on the main
+     * thread as the background import advances. {@code importing} true means
+     * an import is in flight ({@code done}/{@code total}/{@code stage}
+     * reflect {@link SettingsHost}'s progress callback); {@code importing}
+     * false with a non-null {@code error} means the last attempt failed;
+     * {@code importing} false with a null {@code error} means idle (either
+     * never attempted, or the last attempt succeeded -- either way the
+     * status row falls back to counting files on disk, see {@link
+     * #countDsMaps}).
+     */
+    public void setImportStatus(boolean importing, int done, int total, String stage, String error) {
+        this.importing = importing;
+        this.importDone = done;
+        this.importTotal = total;
+        this.importStage = stage != null ? stage : "";
+        this.importError = error;
+        invalidate();
+    }
+
     private static final int[] PORTRAIT_COLORS = {
             Color.rgb(196, 84, 40), Color.rgb(120, 180, 230), Color.rgb(120, 200, 120),
             Color.rgb(190, 160, 70), Color.rgb(80, 160, 90), Color.rgb(230, 200, 140),
@@ -225,6 +295,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // marker tile: same nearest-neighbor upscale as the map, but kept fully
     // opaque (unlike mapPaint) so it stays crisp on top of the sepia map
     private final Paint markerPaint = new Paint();
+    // Scratch paints for the area-map crossfade: copied from mapPaint/
+    // markerPaint each frame (via Paint.set) and given a fade-specific
+    // alpha, so the shared mapPaint/markerPaint alpha is never mutated
+    // persistently.
+    private final Paint areaMapFadePaint = new Paint();
+    private final Paint markerFadePaint = new Paint();
     // Src/dst rects computed by the most recent drawAreaMapBitmap() call --
     // exposed so the field-position marker (drawFieldContent) can map a
     // point through the same crop/scale without recomputing it. areaMapSrc
@@ -280,6 +356,26 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
         if (event.getAction() != MotionEvent.ACTION_DOWN) return false;
+        if (settingsMode) {
+            if (!importing && !importButtonHitBox.isEmpty()
+                    && importButtonHitBox.contains(event.getX(), event.getY())) {
+                if (settingsHost != null) settingsHost.requestRomImport();
+                return true;
+            }
+            if (!settingsBackHitBox.isEmpty()
+                    && settingsBackHitBox.contains(event.getX(), event.getY())) {
+                settingsMode = false;
+                invalidate();
+                return true;
+            }
+            return true; // swallow every touch while the settings modal is up
+        }
+        if (!snap.inBattle && !gearHitBox.isEmpty()
+                && gearHitBox.contains(event.getX(), event.getY())) {
+            settingsMode = true;
+            invalidate();
+            return true;
+        }
         if (snap.inBattle && !eyeHitBox.isEmpty()
                 && eyeHitBox.contains(event.getX(), event.getY())) {
             toggleHiddenHpMode();
@@ -560,6 +656,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     }
 
     public void update(PartySnapshot s) {
+        if (settingsMode && s.inBattle) {
+            // the gear chip is never shown in battle -- if battle starts
+            // while settings happens to be open (e.g. an ambush), get out of
+            // the way rather than block the battle UI on the bottom screen.
+            settingsMode = false;
+        }
         boolean hadContent = !snap.members.isEmpty();
         ContentMode oldMode = modeOf(snap);
         ContentMode newMode = modeOf(s);
@@ -576,6 +678,20 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             // the smaller title-only micro-fade, not the full mode crossfade.
             fadingOutTitle = snap.mapName;
             titleFadeStart = System.nanoTime();
+        }
+        if (hadContent && oldMode == ContentMode.FIELD && newMode == ContentMode.FIELD
+                && snap.fieldMapId != s.fieldMapId) {
+            // area-map identity changed while staying in FIELD mode (a new
+            // area's bitmap, or the placeholder text <-> a rendered minimap
+            // becoming available) -- crossfade the bitmap independently of
+            // the title micro-fade above; deliberately not an "else if" off
+            // that block since fieldMapId can change without mapName
+            // changing (or vice versa). An ordinary position update or a
+            // re-read with the same id leaves fieldMapId untouched, so it
+            // never lands here.
+            prevAreaMapBitmap = ChronoAssets.getAreaMap(snap.fieldMapId);
+            prevAreaMapId = snap.fieldMapId;
+            areaMapFadeStart = System.nanoTime();
         }
         if (targetingUntil > 0 && (!s.inBattle || s.menuOpen)) {
             // exit targeting early: either the next command menu has opened
@@ -623,10 +739,14 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         modeFadeStart = -1L;
         titleFadeStart = -1L;
         fadingOutTitle = null;
+        prevAreaMapBitmap = null;
+        prevAreaMapId = -1;
+        areaMapFadeStart = -1L;
         targetingUntil = -1L;
         pendingMenuClose = false;
         pendingMenuCloseAt = -1L;
         listSel = 0;
+        settingsMode = false;
         ChronoAssets.removeListener(this);
         super.onDetachedFromWindow();
     }
@@ -1355,6 +1475,128 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     }
 
     /**
+     * Small "gear" toggle glyph (ring + teeth + center dot, INK color) in the
+     * parchment's top-left corner -- same size/hit-box style as {@link
+     * #drawEyeToggle}'s top-right eye, drawn only outside battle (see {@link
+     * #onDraw}). Tapping within its hit box (see {@link #onTouchEvent})
+     * enters {@link #settingsMode}. Updates {@link #gearHitBox} every call so
+     * the hit-test always matches the glyph's current on-screen position.
+     */
+    private void drawGearToggle(Canvas c, RectF parchment) {
+        // Drawn ~2.4x the eye glyph's size and inset well inside the ink
+        // frame: at the eye's size it read as a speck on the frame line.
+        float r = EYE_GLYPH_RADIUS * 2.4f;
+        float cx = parchment.left + r + 30f;
+        float cy = parchment.top + r + 30f;
+        float half = Math.max(EYE_HIT_HALF, r * 1.6f);
+        gearHitBox.set(cx - half, cy - half, cx + half, cy + half);
+
+        int inkA = Color.argb(230, Color.red(INK), Color.green(INK), Color.blue(INK));
+        stroke.setStrokeWidth(3.5f);
+        stroke.setColor(inkA);
+        c.drawCircle(cx, cy, r * 0.7f, stroke);
+        for (int i = 0; i < 8; i++) {
+            double ang = Math.toRadians(i * 45);
+            float x0 = (float) (cx + Math.cos(ang) * r * 0.72f);
+            float y0 = (float) (cy + Math.sin(ang) * r * 0.72f);
+            float x1 = (float) (cx + Math.cos(ang) * r * 1.15f);
+            float y1 = (float) (cy + Math.sin(ang) * r * 1.15f);
+            c.drawLine(x0, y0, x1, y1, stroke);
+        }
+        fill.setShader(null);
+        fill.setColor(inkA);
+        c.drawCircle(cx, cy, r * 0.3f, fill);
+    }
+
+    /** Counts {@code area_minimap_*.png} files under {@code <filesDir>/ds_maps} for the settings screen's status row -- see {@link #drawSettingsScreen}. */
+    private int countDsMaps() {
+        File dir = new File(getContext().getFilesDir(), "ds_maps");
+        File[] files = dir.listFiles((d, name) -> name.startsWith("area_minimap_") && name.endsWith(".png"));
+        return files != null ? files.length : 0;
+    }
+
+    /** Builds the "DS maps: ..." status line's value half -- see {@link #setImportStatus} for the states this reflects. */
+    private String importStatusText() {
+        if (importing) {
+            if ("unzipping".equals(importStage)) {
+                // done/total here are MB copied so far / total MB (from setImportStatus's
+                // "unzipping" stage), not the maps-processed counts the default line below
+                // uses -- shown as its own "unzipping... N/M MB" line instead. Total can be 0
+                // if the zip entry's size wasn't known up front; fall back to showing bytes
+                // copied twice rather than a misleading "/0".
+                int total = importTotal > 0 ? importTotal : importDone;
+                return "unzipping... " + importDone + "/" + total + " MB";
+            }
+            StringBuilder sb = new StringBuilder("importing... ").append(importDone).append('/').append(importTotal);
+            if (importStage != null && !importStage.isEmpty()) sb.append(' ').append(importStage);
+            return sb.toString();
+        }
+        if (importError != null) return "error: " + importError;
+        int n = countDsMaps();
+        return n > 0 ? (n + " maps") : "not imported";
+    }
+
+    /**
+     * The settings screen: same parchment chrome as the normal panel (title,
+     * "DS maps: <status>" row, a short explanatory line, an "Import DS
+     * ROM..." button that's disabled -- no hit box -- while {@link
+     * #importing}, and a "Back" button that returns to the normal panel).
+     * Drawn instead of {@link #drawContent}/the status boxes/gold-time
+     * corners whenever {@link #settingsMode} is true -- see {@link #onDraw}.
+     */
+    private void drawSettingsScreen(Canvas c) {
+        int w = getWidth(), h = getHeight();
+        float pad = w * 0.02f;
+        RectF parchment = new RectF(pad * 3, h * 0.2f, w - pad * 3, h - pad * 2.2f);
+        drawParchmentBase(c, parchment);
+
+        c.save();
+        c.clipPath(tornPaper);
+
+        setText(h * 0.06f, INK, true, Paint.Align.CENTER, false);
+        text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        c.drawText("Settings", parchment.centerX(), parchment.top + h * 0.11f, text);
+
+        setText(h * 0.04f, INK, false, Paint.Align.LEFT, false);
+        text.setTypeface(Typeface.MONOSPACE);
+        c.drawText("DS maps: " + importStatusText(), parchment.left + w * 0.06f,
+                parchment.top + h * 0.2f, text);
+
+        setText(h * 0.026f, Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK)),
+                false, Paint.Align.LEFT, false);
+        c.drawText("Room maps are available if you can provide the",
+                parchment.left + w * 0.06f, parchment.top + h * 0.275f, text);
+        c.drawText("Chrono Trigger DS ROM (.nds or .zip).",
+                parchment.left + w * 0.06f, parchment.top + h * 0.31f, text);
+
+        c.restore();
+        drawParchmentOverlay(c, parchment);
+
+        Bitmap winTex = ChronoAssets.getWindowTex();
+
+        float btnW = parchment.width() * 0.6f;
+        float btnH = h * 0.09f;
+        RectF importBtn = new RectF(parchment.centerX() - btnW / 2f, parchment.top + h * 0.4f,
+                parchment.centerX() + btnW / 2f, parchment.top + h * 0.4f + btnH);
+        drawCommandButton(c, importBtn, "Import DS ROM...", winTex, false);
+        if (importing) {
+            fill.setShader(null);
+            fill.setColor(Color.argb(150, 0, 0, 0));
+            c.drawRect(importBtn, fill);
+            importButtonHitBox.setEmpty();
+        } else {
+            importButtonHitBox.set(importBtn);
+        }
+
+        float backW = parchment.width() * 0.4f;
+        float backH = h * 0.08f;
+        RectF backBtn = new RectF(parchment.centerX() - backW / 2f, parchment.bottom - h * 0.15f,
+                parchment.centerX() + backW / 2f, parchment.bottom - h * 0.15f + backH);
+        drawCommandButton(c, backBtn, "Back", winTex, false);
+        settingsBackHitBox.set(backBtn);
+    }
+
+    /**
      * Before any party data has arrived (no members yet), skip the whole
      * parchment/DS-panel rendering and show a minimal black-screen wordmark
      * instead — no boxes, no subtitle, nothing else to imply readiness that
@@ -1467,6 +1709,24 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 ? (fadingOutTitle != null ? fadingOutTitle + "  #" + s.fieldMapId : fadingOutTitle) : fadingOutTitle);
         if (fadingLabel != null) fadingLabel += posSuffix;
 
+        // Area-map crossfade state for this draw -- resolved once up front
+        // so both the title-fade branch and the plain-draw branch below can
+        // share it. Only progressed/settled when live (never for the
+        // fading-out fadeSnap side of a mode crossfade).
+        boolean areaMapFading = live && areaMapFadeStart >= 0;
+        float mapT = 1f;
+        if (areaMapFading) {
+            long elapsed = System.nanoTime() - areaMapFadeStart;
+            mapT = Math.min(1f, elapsed / (float) TITLE_FADE_NANOS);
+            if (mapT >= 1f) {
+                // fade finished this frame -- settle, draw the plain way
+                areaMapFading = false;
+                areaMapFadeStart = -1L;
+                prevAreaMapBitmap = null;
+                prevAreaMapId = -1;
+            }
+        }
+
         if (live && titleFadeStart >= 0) {
             long elapsed = System.nanoTime() - titleFadeStart;
             float t = Math.min(1f, elapsed / (float) TITLE_FADE_NANOS);
@@ -1476,10 +1736,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 text.setAlpha((int) (255 * t));
                 c.drawText(label, parchment.centerX(), ty, text);
                 text.setAlpha(255);
-                if (areaMap != null) {
-                    drawAreaMapBitmap(c, parchment, areaMap, w, h);
-                    drawFieldPosMarkerIfCalibrated(c, s, h);
-                }
+                drawAreaMapWithFade(c, parchment, s, w, h, areaMap, areaMapFading, mapT);
                 return;
             }
             // fade finished this frame -- settle and fall through to a plain draw
@@ -1487,9 +1744,45 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             fadingOutTitle = null;
         }
         c.drawText(label, parchment.centerX(), ty, text);
+        drawAreaMapWithFade(c, parchment, s, w, h, areaMap, areaMapFading, mapT);
+    }
+
+    /**
+     * Draws the field panel's area-map bitmap, crossfading between
+     * {@link #prevAreaMapBitmap} (fading out, alpha 255-&gt;0) and
+     * {@code areaMap} (fading in, alpha 0-&gt;255) over
+     * {@link #TITLE_FADE_NANOS} whenever {@code fading} is true -- covers a
+     * fieldMapId change to a different rendered map, and either direction
+     * between a rendered map and the text-only placeholder (a null
+     * {@code areaMap} or null {@link #prevAreaMapBitmap} simply skips that
+     * side's draw). The live position marker is drawn only on the incoming
+     * ({@code areaMap}) side and fades in with it. Outside of a fade this is
+     * just the original plain draw at full opacity.
+     */
+    private void drawAreaMapWithFade(Canvas c, RectF parchment, PartySnapshot s, int w, int h,
+                                      Bitmap areaMap, boolean fading, float t) {
+        if (!fading) {
+            if (areaMap != null) {
+                drawAreaMapBitmap(c, parchment, areaMap, w, h, mapPaint);
+                drawFieldPosMarkerIfCalibrated(c, s, h, markerPaint);
+            }
+            return;
+        }
+        if (prevAreaMapBitmap != null) {
+            areaMapFadePaint.set(mapPaint);
+            areaMapFadePaint.setAlpha((int) (mapPaint.getAlpha() * (1f - t)));
+            drawAreaMapBitmap(c, parchment, prevAreaMapBitmap, w, h, areaMapFadePaint);
+        }
         if (areaMap != null) {
-            drawAreaMapBitmap(c, parchment, areaMap, w, h);
-            drawFieldPosMarkerIfCalibrated(c, s, h);
+            areaMapFadePaint.set(mapPaint);
+            areaMapFadePaint.setAlpha((int) (mapPaint.getAlpha() * t));
+            // drawn last so areaMapSrc/areaMapDst (stashed by
+            // drawAreaMapBitmap) reflect the incoming map, matching what
+            // the position marker below needs to map through.
+            drawAreaMapBitmap(c, parchment, areaMap, w, h, areaMapFadePaint);
+            markerFadePaint.set(markerPaint);
+            markerFadePaint.setAlpha((int) (255 * t));
+            drawFieldPosMarkerIfCalibrated(c, s, h, markerFadePaint);
         }
     }
 
@@ -1497,10 +1790,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // avoid an allocation every draw.
     private final float[] areaMapCalibOut = new float[2];
 
-    /** Looks up s's field position via AreaMapCalib and draws the marker if it maps to a point inside the drawn area map. */
-    private void drawFieldPosMarkerIfCalibrated(Canvas c, PartySnapshot s, int h) {
+    /** Looks up s's field position via AreaMapCalib and draws the marker (with {@code markPaint}'s alpha) if it maps to a point inside the drawn area map. */
+    private void drawFieldPosMarkerIfCalibrated(Canvas c, PartySnapshot s, int h, Paint markPaint) {
         if (AreaMapCalib.toMapPixel(s.fieldMapId, s.fieldX, s.fieldY, areaMapCalibOut)) {
-            drawFieldPosMarker(c, areaMapCalibOut[0], areaMapCalibOut[1], h);
+            drawFieldPosMarker(c, areaMapCalibOut[0], areaMapCalibOut[1], h, markPaint);
         }
     }
 
@@ -1521,7 +1814,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      * (nearest-neighbour via {@link #mapPaint}, parchment-blended alpha) but
      * fit to the crop's own aspect ratio rather than a fixed 4:3.
      */
-    private void drawAreaMapBitmap(Canvas c, RectF parchment, Bitmap areaMap, int w, int h) {
+    private void drawAreaMapBitmap(Canvas c, RectF parchment, Bitmap areaMap, int w, int h, Paint paint) {
         RectF area = new RectF(parchment.left + w * 0.06f, parchment.top + h * 0.13f,
                 parchment.right - w * 0.06f, parchment.bottom - h * 0.09f);
         float margin = Math.min(area.width(), area.height()) * 0.04f;
@@ -1536,7 +1829,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         float dw = src.width() * scale, dh = src.height() * scale;
         RectF dst = new RectF(area.centerX() - dw / 2f, area.centerY() - dh / 2f,
                 area.centerX() + dw / 2f, area.centerY() + dh / 2f);
-        c.drawBitmap(areaMap, src, dst, mapPaint);
+        c.drawBitmap(areaMap, src, dst, paint);
 
         // Stash the src/dst rects this draw used, so drawFieldContent's
         // position-marker overlay can map a 256x192-image-space point (see
@@ -1553,7 +1846,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      * by the {@link #drawAreaMapBitmap} call this frame). Skips drawing if
      * the point falls outside {@code areaMapDst} (off the visible crop).
      */
-    private void drawFieldPosMarker(Canvas c, float imgX, float imgY, int h) {
+    private void drawFieldPosMarker(Canvas c, float imgX, float imgY, int h, Paint markPaint) {
         if (areaMapDst.width() <= 0 || areaMapDst.height() <= 0) return;
         if (areaMapSrc.width() <= 0 || areaMapSrc.height() <= 0) return;
         float u = (imgX - areaMapSrc.left) / (float) areaMapSrc.width();
@@ -1566,9 +1859,13 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         if (mark != null) {
             float ms = h * 0.03f;
             RectF markDst = new RectF(mx - ms, my - ms * 1.4f, mx + ms, my + ms * 0.6f);
-            c.drawBitmap(mark, null, markDst, markerPaint);
+            c.drawBitmap(mark, null, markDst, markPaint);
         } else {
-            fill.setColor(Color.rgb(210, 50, 70));
+            // fallback diamond: no bitmap asset to hand markPaint's alpha
+            // to, so fold it into the fill color's own alpha component
+            // instead (fill is re-colored fresh on every use elsewhere, so
+            // this doesn't leak a persistent alpha onto it).
+            fill.setColor(Color.argb(markPaint.getAlpha(), 210, 50, 70));
             Path marker = new Path();
             float ms = h * 0.016f;
             marker.moveTo(mx, my - ms);
@@ -1584,6 +1881,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     protected void onDraw(Canvas c) {
         if (snap.members.isEmpty()) {
             drawWordmark(c);
+            return;
+        }
+        if (settingsMode) {
+            drawSettingsScreen(c);
             return;
         }
 
@@ -1631,6 +1932,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         c.restore();
 
         if (titleFadeStart >= 0) animating = true;
+        if (areaMapFadeStart >= 0) animating = true;
         if (pressedCommand >= 0 && pressedAt >= 0
                 && System.nanoTime() - pressedAt < PRESS_FEEDBACK_NANOS) {
             animating = true;
@@ -1653,6 +1955,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         boolean targeting = snap.inBattle && isTargetingActive(bandNow);
         boolean listMode = snap.inBattle && snap.listOpen && !snap.listRows.isEmpty();
         if (snap.inBattle) {
+            gearHitBox.setEmpty();
             drawEyeToggle(c, parchment);
             if (targeting) {
                 drawTargetingButtons(c, parchment);
@@ -1676,6 +1979,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             targetCount = 0;
             listVisibleCount = 0;
             listBackHitBox.setEmpty();
+            drawGearToggle(c, parchment);
         }
         // targeting mode has its own wall-clock timeout (see
         // isTargetingActive) that isn't tied to a snapshot change, so the

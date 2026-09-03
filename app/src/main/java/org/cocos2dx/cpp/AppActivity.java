@@ -47,6 +47,14 @@ public class AppActivity extends Cocos2dxActivity {
     // ACTION_UP must be swallowed too, or the game sees a bare release with
     // no press it knows about (a "stuck key" style half-press).
     private final Set<Integer> swallowedKeys = new HashSet<>();
+    // Request code for the SAF document picker used by requestRomImport/
+    // launchRomPicker below. No androidx.activity dependency in this project
+    // (see app/build.gradle) -- Cocos2dxActivity already forwards
+    // onActivityResult through Cocos2dxHelper's OnActivityResultListener set
+    // and into super, so overriding it here (classic startActivityForResult
+    // style) is the natural fit rather than adding a new dependency for an
+    // ActivityResultLauncher.
+    private static final int REQUEST_ROM_IMPORT = 4242;
 
     public static native void setAssetManager(Context context, AssetManager assetManager);
     public static native void setExternalStorageInfo(String path1, String path2, String packageName);
@@ -99,8 +107,26 @@ public class AppActivity extends Cocos2dxActivity {
         // (user-pushed DS-style area minimaps -- same "external files dir"
         // used below for worldmap_hd.png).
         com.kalenjohnson.chronoduo.ChronoAssets.setExternalFilesDir(ext != null ? ext : getFilesDir());
+        // Private files dir: where DsMapImporter writes DS-derived maps
+        // decoded on-device from a user-supplied ROM (see requestRomImport/
+        // importRomFromUri below) -- checked before externalFilesDir by
+        // ChronoAssets.getAreaMap().
+        com.kalenjohnson.chronoduo.ChronoAssets.setFilesDir(getFilesDir());
+        // area_calib.json: filesDir/ds_maps first (the on-device import
+        // output), externalFilesDir/ds_maps as a dev-push fallback -- first
+        // one found wins (AreaMapCalib.load is a no-op on a missing file).
+        File calibFile = new File(new File(getFilesDir(), "ds_maps"), "area_calib.json");
+        if (!calibFile.isFile() && ext != null) {
+            calibFile = new File(new File(ext, "ds_maps"), "area_calib.json");
+        }
+        com.kalenjohnson.chronoduo.AreaMapCalib.load(calibFile);
 
         secondScreen = new SecondScreenManager(this);
+        secondScreen.setSettingsHost(new PartyPanelView.SettingsHost() {
+            @Override public void requestRomImport() {
+                launchRomPicker();
+            }
+        });
         controllerInput.ensureConnected();
         // Physical hat-axis d-pad left/right (see GameControllerInput.
         // handleMotionEvent) offers to the panel's command-row navigation
@@ -630,6 +656,359 @@ public class AppActivity extends Cocos2dxActivity {
             Log.w(TAG, "failed to read monster flag table: " + f, e);
             return null;
         }
+    }
+
+    /**
+     * Launches the Storage Access Framework document picker so the user can
+     * pick their own Chrono Trigger DS ROM file (never bundled or fetched by
+     * this app -- see PartyPanelView's settings-screen explanatory text).
+     * Called from the {@link PartyPanelView.SettingsHost} wired onto
+     * SecondScreenManager in {@link #onCreate}, i.e. from a tap on the
+     * bottom-screen panel's "Import DS ROM..." button. The game keeps running
+     * on the top screen while the picker activity is up (it simply covers
+     * this activity, same as any other launched activity) -- nothing in
+     * onPause/onResume below is picker-specific, so that path is unaffected.
+     */
+    private void launchRomPicker() {
+        android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(android.content.Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.putExtra(android.content.Intent.EXTRA_MIME_TYPES,
+                new String[]{"application/octet-stream", "*/*"});
+        try {
+            startActivityForResult(intent, REQUEST_ROM_IMPORT);
+        } catch (android.content.ActivityNotFoundException e) {
+            Log.w(TAG, "no document picker available", e);
+            postImportError("no file picker available on this device");
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, android.content.Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQUEST_ROM_IMPORT) return;
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        importRomFromUri(data.getData());
+    }
+
+    /**
+     * Opens {@code uri} (a user-picked ROM file from {@link #launchRomPicker})
+     * read-only via a ParcelFileDescriptor, wraps it in a {@link
+     * com.kalenjohnson.chronoduo.dsimport.SeekableSource} backed by
+     * positional {@link java.nio.channels.FileChannel} reads, and runs {@link
+     * com.kalenjohnson.chronoduo.dsimport.DsMapImporter#importRom} on a
+     * background thread. Output is written to a temp directory first and
+     * only renamed over {@code <filesDir>/ds_maps} on success, so a failed or
+     * interrupted import leaves whatever maps were already there intact.
+     * Progress and the final result are posted back to the bottom-screen
+     * panel (if one is currently showing -- see {@link #updateImportStatus})
+     * on the main thread throughout. The picked file descriptor is kept open
+     * for the whole import and closed in a finally block.
+     */
+    private void importRomFromUri(android.net.Uri uri) {
+        updateImportStatus(true, 0, 0, "opening", null);
+        new Thread(() -> {
+            android.os.ParcelFileDescriptor pfd = null;
+            File unzippedTemp = null;
+            java.io.RandomAccessFile unzippedRaf = null;
+            File tempOut = null;
+            try {
+                pfd = getContentResolver().openFileDescriptor(uri, "r");
+                if (pfd == null) {
+                    postImportError("could not open the selected file");
+                    return;
+                }
+                final java.nio.channels.FileChannel channel =
+                        new java.io.FileInputStream(pfd.getFileDescriptor()).getChannel();
+                final long pfdLength = channel.size();
+
+                com.kalenjohnson.chronoduo.dsimport.SeekableSource pfdSource = channelSource(channel, pfdLength);
+
+                // Peek the first few bytes to tell a raw .nds apart from a zip (or an
+                // unsupported archive format) before doing anything else with it -- this is
+                // what a user picking a .zip full of a ROM used to skip, letting NitroRom read
+                // garbage header offsets/sizes straight out of whatever bytes came first.
+                byte[] sig = new byte[8];
+                int sigGot = 0;
+                while (sigGot < sig.length) {
+                    int n = pfdSource.read(sigGot, sig, sigGot, sig.length - sigGot);
+                    if (n <= 0) break;
+                    sigGot += n;
+                }
+
+                com.kalenjohnson.chronoduo.dsimport.SeekableSource source;
+                if (startsWith(sig, sigGot, ZIP_SIGNATURE)) {
+                    updateImportStatus(true, 0, 0, "unzipping", null);
+                    String entryName = findRomEntryInZip(uri);
+                    if (entryName == null) {
+                        postImportError("no .nds file found inside the zip");
+                        return;
+                    }
+                    unzippedTemp = extractZipEntry(uri, entryName, getCacheDir());
+                    unzippedRaf = new java.io.RandomAccessFile(unzippedTemp, "r");
+                    source = randomAccessFileSource(unzippedRaf);
+                } else if (startsWith(sig, sigGot, SEVENZ_SIGNATURE) || startsWith(sig, sigGot, RAR_SIGNATURE)) {
+                    postImportError("only .nds or .zip is supported");
+                    return;
+                } else {
+                    source = pfdSource;
+                }
+
+                long romLength = source.length();
+                if (romLength < MIN_ROM_BYTES || romLength > MAX_ROM_BYTES) {
+                    postImportError("file is " + (romLength / (1024 * 1024))
+                            + " MB -- expected a Chrono Trigger DS ROM between 16 and 512 MB");
+                    return;
+                }
+
+                File filesDir = getFilesDir();
+                tempOut = new File(filesDir, "ds_maps_tmp");
+                deleteRecursive(tempOut);
+                if (!tempOut.mkdirs()) {
+                    postImportError("could not create a working directory");
+                    return;
+                }
+
+                com.kalenjohnson.chronoduo.dsimport.DsMapImporter.Progress progress =
+                        new com.kalenjohnson.chronoduo.dsimport.DsMapImporter.Progress() {
+                            @Override public void onMinimap(String base, int index, int total, boolean ok) {
+                                updateImportStatus(true, index + 1, total, "maps", null);
+                            }
+                            @Override public void onCalibStatus(String message) {
+                                updateImportStatus(true, 0, 0, message, null);
+                            }
+                        };
+
+                com.kalenjohnson.chronoduo.dsimport.DsMapImporter.Result result =
+                        com.kalenjohnson.chronoduo.dsimport.DsMapImporter.importRom(source, tempOut, progress);
+
+                // importRom throws on hard failures; a result with no maps means
+                // the file wasn't a usable Chrono Trigger DS ROM.
+                if (result == null || result.minimapOk == 0) {
+                    deleteRecursive(tempOut);
+                    postImportError("no maps found -- is this the Chrono Trigger DS ROM?");
+                    return;
+                }
+
+                File finalOut = new File(filesDir, "ds_maps");
+                File backupOut = new File(filesDir, "ds_maps_prev");
+                deleteRecursive(backupOut);
+                boolean hadExisting = finalOut.exists();
+                if (hadExisting && !finalOut.renameTo(backupOut)) {
+                    deleteRecursive(tempOut);
+                    postImportError("could not replace the existing maps");
+                    return;
+                }
+                if (!tempOut.renameTo(finalOut)) {
+                    if (hadExisting) backupOut.renameTo(finalOut); // best-effort restore
+                    deleteRecursive(tempOut);
+                    postImportError("could not install the new maps");
+                    return;
+                }
+                deleteRecursive(backupOut);
+
+                final com.kalenjohnson.chronoduo.dsimport.DsMapImporter.Result finalResult = result;
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                    com.kalenjohnson.chronoduo.AreaMapCalib.load(new File(finalOut, "area_calib.json"));
+                    com.kalenjohnson.chronoduo.ChronoAssets.clearAreaMapCache();
+                    updateImportStatus(false, finalResult.minimapOk, finalResult.minimapOk, null, null);
+                });
+            } catch (Throwable t) {
+                // Catches Throwable, not just Exception: a corrupt/garbage-header ROM (e.g. a
+                // zip that slipped past the checks above) can otherwise drive an allocation
+                // request big enough to throw OutOfMemoryError, which an Exception-only catch
+                // lets straight through -- and an uncaught Error on this background thread
+                // kills the whole process instead of just failing the import.
+                Log.e(TAG, "ROM import failed", t);
+                postImportError(t.getMessage() != null ? t.getMessage() : t.toString());
+            } finally {
+                // No-op if importRom already renamed tempOut to finalOut (deleteRecursive
+                // returns immediately when the path doesn't exist) -- but on any exception
+                // path (including the new header-validation IOExceptions and the OOM catch
+                // above) tempOut can still hold partial output, and this is the only place
+                // that's guaranteed to run for all of them.
+                if (tempOut != null) {
+                    deleteRecursive(tempOut);
+                }
+                if (unzippedRaf != null) {
+                    try {
+                        unzippedRaf.close();
+                    } catch (java.io.IOException e) {
+                        Log.w(TAG, "failed to close unzipped ROM temp file", e);
+                    }
+                }
+                if (unzippedTemp != null && !unzippedTemp.delete()) {
+                    Log.w(TAG, "failed to delete unzipped ROM temp file: " + unzippedTemp);
+                }
+                if (pfd != null) {
+                    try {
+                        pfd.close();
+                    } catch (java.io.IOException e) {
+                        Log.w(TAG, "failed to close ROM file descriptor", e);
+                    }
+                }
+            }
+        }, "DsMapImport").start();
+    }
+
+    private static final byte[] ZIP_SIGNATURE = {0x50, 0x4B, 0x03, 0x04};
+    private static final byte[] SEVENZ_SIGNATURE = {0x37, 0x7A, (byte) 0xBC, (byte) 0xAF, 0x27, 0x1C};
+    private static final byte[] RAR_SIGNATURE = {'R', 'a', 'r', '!'};
+    private static final long MIN_ROM_BYTES = 16L * 1024 * 1024;
+    private static final long MAX_ROM_BYTES = 512L * 1024 * 1024;
+    private static final long UNZIP_PROGRESS_STEP_BYTES = 4L * 1024 * 1024;
+
+    private static boolean startsWith(byte[] buf, int bufLen, byte[] sig) {
+        if (bufLen < sig.length) return false;
+        for (int i = 0; i < sig.length; i++) {
+            if (buf[i] != sig[i]) return false;
+        }
+        return true;
+    }
+
+    /** Wraps a {@link java.nio.channels.FileChannel} (backing the picked file's own
+     * ParcelFileDescriptor) as a {@link com.kalenjohnson.chronoduo.dsimport.SeekableSource}
+     * doing positional reads -- shared by the raw-.nds path and the zip signature peek. */
+    private static com.kalenjohnson.chronoduo.dsimport.SeekableSource channelSource(
+            java.nio.channels.FileChannel channel, long length) {
+        return new com.kalenjohnson.chronoduo.dsimport.SeekableSource() {
+            @Override
+            public int read(long pos, byte[] dst, int off, int len) {
+                try {
+                    java.nio.ByteBuffer buf = java.nio.ByteBuffer.wrap(dst, off, len);
+                    int total = 0;
+                    while (buf.hasRemaining()) {
+                        int n = channel.read(buf, pos + total);
+                        if (n < 0) break;
+                        total += n;
+                    }
+                    return total > 0 ? total : -1;
+                } catch (java.io.IOException e) {
+                    return -1;
+                }
+            }
+
+            @Override
+            public long length() {
+                return length;
+            }
+        };
+    }
+
+    /** Wraps an already-open {@link java.io.RandomAccessFile} (over the unzipped temp file) as
+     * a {@link com.kalenjohnson.chronoduo.dsimport.SeekableSource}. Synchronized because
+     * RandomAccessFile's seek+read pair isn't atomic and NitroRom otherwise only ever reads
+     * from a single thread, but this keeps the wrapper safe regardless. */
+    private static com.kalenjohnson.chronoduo.dsimport.SeekableSource randomAccessFileSource(
+            java.io.RandomAccessFile raf) throws java.io.IOException {
+        final long length = raf.length();
+        return new com.kalenjohnson.chronoduo.dsimport.SeekableSource() {
+            @Override
+            public synchronized int read(long pos, byte[] dst, int off, int len) {
+                try {
+                    raf.seek(pos);
+                    return raf.read(dst, off, len);
+                } catch (java.io.IOException e) {
+                    return -1;
+                }
+            }
+
+            @Override
+            public long length() {
+                return length;
+            }
+        };
+    }
+
+    /**
+     * First streaming pass over the zip at {@code uri}: returns the name of the first entry
+     * whose name ends with ".nds" (case-insensitive), or -- if there isn't one -- the first
+     * non-directory entry over 8 MB, or null if neither is found. Doesn't extract anything;
+     * {@link #extractZipEntry} does a second pass to copy out whichever name this returns.
+     */
+    private String findRomEntryInZip(android.net.Uri uri) throws java.io.IOException {
+        try (java.io.InputStream in = getContentResolver().openInputStream(uri);
+             java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(in)) {
+            String fallbackName = null;
+            java.util.zip.ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (entry.isDirectory()) continue;
+                String name = entry.getName();
+                if (name != null && name.toLowerCase(java.util.Locale.US).endsWith(".nds")) {
+                    return name;
+                }
+                if (fallbackName == null && entry.getSize() > 8L * 1024 * 1024) {
+                    fallbackName = name;
+                }
+            }
+            return fallbackName;
+        }
+    }
+
+    /**
+     * Second streaming pass over the zip at {@code uri}: copies the entry named
+     * {@code entryName} (found by {@link #findRomEntryInZip}) out to a fresh temp file under
+     * {@code destDir}, reporting progress via {@code updateImportStatus} roughly every 4 MB.
+     * Caller owns the returned file (and must delete it once done with it).
+     */
+    private File extractZipEntry(android.net.Uri uri, String entryName, File destDir) throws java.io.IOException {
+        File out = File.createTempFile("rom_import_", ".nds", destDir);
+        try (java.io.InputStream in = getContentResolver().openInputStream(uri);
+             java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(in);
+             java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
+            java.util.zip.ZipEntry entry;
+            boolean found = false;
+            while ((entry = zis.getNextEntry()) != null) {
+                if (!entryName.equals(entry.getName())) continue;
+                found = true;
+
+                long totalBytes = entry.getSize(); // -1 if unknown (streamed entry)
+                int totalMB = totalBytes > 0 ? (int) ((totalBytes + 1024 * 1024 - 1) / (1024 * 1024)) : 0;
+
+                byte[] buf = new byte[64 * 1024];
+                long copied = 0;
+                long nextReportAt = UNZIP_PROGRESS_STEP_BYTES;
+                int n;
+                while ((n = zis.read(buf)) != -1) {
+                    fos.write(buf, 0, n);
+                    copied += n;
+                    if (copied >= nextReportAt) {
+                        updateImportStatus(true, (int) (copied / (1024 * 1024)), totalMB, "unzipping", null);
+                        nextReportAt += UNZIP_PROGRESS_STEP_BYTES;
+                    }
+                }
+                updateImportStatus(true, (int) (copied / (1024 * 1024)),
+                        totalMB > 0 ? totalMB : (int) (copied / (1024 * 1024)), "unzipping", null);
+                break;
+            }
+            if (!found) {
+                throw new java.io.IOException("could not find " + entryName + " in the zip on the second pass");
+            }
+        }
+        return out;
+    }
+
+    private void postImportError(String message) {
+        updateImportStatus(false, 0, 0, null, message != null ? message : "unknown error");
+    }
+
+    /** Posts import progress/result to the bottom-screen panel's settings view, if one is currently showing -- a no-op otherwise. Safe from any thread. */
+    private void updateImportStatus(boolean importing, int done, int total, String stage, String error) {
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+            PartyPanelView panel = secondScreen != null ? secondScreen.getPanel() : null;
+            if (panel != null) panel.setImportStatus(importing, done, total, stage, error);
+        });
+    }
+
+    private static void deleteRecursive(File f) {
+        if (f == null || !f.exists()) return;
+        if (f.isDirectory()) {
+            File[] kids = f.listFiles();
+            if (kids != null) {
+                for (File k : kids) deleteRecursive(k);
+            }
+        }
+        f.delete();
     }
 
     private void showBootstrapError(Exception e) {

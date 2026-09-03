@@ -80,8 +80,14 @@ public final class ChronoAssets {
     // pattern used to find worldmap_hd.png -- see AppActivity#extractCompanionAssets),
     // so getAreaMap() below can locate <externalFilesDir>/ds_maps/*.png.
     private static File externalFilesDir;
+    // App's private files dir (context.getFilesDir()), set once from
+    // AppActivity. DS-derived maps decoded on-device by DsMapImporter land
+    // here (never shipped, never pushed externally) -- checked before
+    // externalFilesDir in getAreaMap() below, which stays as a dev-push
+    // fallback.
+    private static File filesDir;
 
-    /** DS-style per-map minimap PNGs (rendered offline, pushed via adb -- never shipped): {@code <externalFilesDir>/ds_maps/area_minimap_%03d.png}, 256x192. */
+    /** DS-style per-map minimap PNGs (rendered on-device from a user-provided ROM, or dev-pushed via adb -- never shipped): {@code <filesDir or externalFilesDir>/ds_maps/area_minimap_%03d.png}, 256x192. */
     private static final String AREA_MAP_SUBDIR = "ds_maps";
     private static final String AREA_MAP_FILENAME = "area_minimap_%03d.png";
     private static final int AREA_MAP_CACHE_CAP = 12;
@@ -188,29 +194,64 @@ public final class ChronoAssets {
     public static void setExternalFilesDir(File dir) { externalFilesDir = dir; }
 
     /**
+     * Records the app's private files dir (context.getFilesDir()), so {@link
+     * #getAreaMap(int)} can find {@code <dir>/ds_maps/area_minimap_%03d.png}
+     * written there by DsMapImporter. Checked before {@link
+     * #externalFilesDir}. Set once from AppActivity.
+     */
+    public static void setFilesDir(File dir) { filesDir = dir; }
+
+    /**
      * Lazily decodes and caches the rendered DS-style area minimap for field
-     * map {@code id} (256x192 PNG at {@code <externalFilesDir>/ds_maps/
-     * area_minimap_%03d.png}, pushed by the user via adb -- never shipped
-     * with the app). Returns null when the external files dir isn't set yet,
-     * {@code id} is negative, or no PNG exists for this id (a known-missing
-     * id is remembered so repeated calls -- e.g. once per frame from
-     * PartyPanelView -- don't re-hit the filesystem). Main thread only, like
-     * the rest of ChronoAssets.
+     * map {@code id} (256x192 PNG at {@code area_minimap_%03d.png} under
+     * either {@link #filesDir}/ds_maps -- the on-device DsMapImporter output
+     * -- or, as a dev-push fallback, {@link #externalFilesDir}/ds_maps;
+     * whichever has the file wins, filesDir checked first). Returns null when
+     * neither dir is set yet, {@code id} is negative, or no PNG exists for
+     * this id in either location (a known-missing id is remembered so
+     * repeated calls -- e.g. once per frame from PartyPanelView -- don't
+     * re-hit the filesystem). Main thread only, like the rest of ChronoAssets.
      */
     public static Bitmap getAreaMap(int id) {
-        if (id < 0 || externalFilesDir == null) return null;
+        if (id < 0) return null;
         Bitmap cached = areaMapCache.get(id);
         if (cached != null) return cached;
         if (areaMapMisses.contains(id)) return null;
-        File f = new File(new File(externalFilesDir, AREA_MAP_SUBDIR),
-                String.format(Locale.US, AREA_MAP_FILENAME, id));
-        Bitmap b = f.isFile() ? BitmapFactory.decodeFile(f.getAbsolutePath()) : null;
+        File f = resolveAreaMapFile(id);
+        Bitmap b = f != null ? BitmapFactory.decodeFile(f.getAbsolutePath()) : null;
         if (b == null) {
             areaMapMisses.add(id);
             return null;
         }
         areaMapCache.put(id, b);
         return b;
+    }
+
+    /** Resolves the on-disk file for area map {@code id}, filesDir first, externalFilesDir as fallback -- see {@link #getAreaMap(int)}. */
+    private static File resolveAreaMapFile(int id) {
+        String name = String.format(Locale.US, AREA_MAP_FILENAME, id);
+        if (filesDir != null) {
+            File f = new File(new File(filesDir, AREA_MAP_SUBDIR), name);
+            if (f.isFile()) return f;
+        }
+        if (externalFilesDir != null) {
+            File f = new File(new File(externalFilesDir, AREA_MAP_SUBDIR), name);
+            if (f.isFile()) return f;
+        }
+        return null;
+    }
+
+    /**
+     * Drops the area-minimap decode cache and known-missing set, so the next
+     * {@link #getAreaMap(int)} call re-hits the filesystem instead of
+     * returning a stale miss/hit from before an import wrote new files.
+     * Called after a successful DS ROM import. Notifies listeners so a panel
+     * already showing a (now stale) map or its "no map yet" fallback repaints.
+     */
+    public static void clearAreaMapCache() {
+        areaMapCache.clear();
+        areaMapMisses.clear();
+        notifyListeners();
     }
 
     /** Registers a listener; if any asset is already loaded, fires immediately so late attachers (e.g. a Presentation created after the background load finished) don't miss it. */

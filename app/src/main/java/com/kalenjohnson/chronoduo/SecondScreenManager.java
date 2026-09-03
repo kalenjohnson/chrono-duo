@@ -45,6 +45,13 @@ public final class SecondScreenManager {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private SecondScreenPresentation presentation;
     private boolean resumed;
+    // Set once from AppActivity (a different package -- PartyPanelView.
+    // SettingsHost is public for exactly that reason) and re-applied to every
+    // panel this manager creates, since a fresh SecondScreenPresentation (and
+    // therefore a fresh PartyPanelView) can be built at any time -- system-
+    // initiated dismiss/recreate, sleep/wake, display churn -- see show()
+    // below and the class doc's recovery notes.
+    private PartyPanelView.SettingsHost settingsHost;
 
     private final DisplayManager.DisplayListener listener = new DisplayManager.DisplayListener() {
         @Override public void onDisplayAdded(int displayId) { update(); }
@@ -79,6 +86,18 @@ public final class SecondScreenManager {
      */
     public PartyPanelView getPanel() {
         return presentation != null ? presentation.getPanel() : null;
+    }
+
+    /**
+     * Sets (or clears, with null) the host wired onto every panel this
+     * manager creates -- see {@link PartyPanelView.SettingsHost} and the
+     * {@link #settingsHost} field doc. Applied immediately to the current
+     * panel too, if one is showing.
+     */
+    public void setSettingsHost(PartyPanelView.SettingsHost host) {
+        settingsHost = host;
+        PartyPanelView panel = getPanel();
+        if (panel != null) panel.setSettingsHost(host);
     }
 
     public void onDestroy() {
@@ -156,6 +175,10 @@ public final class SecondScreenManager {
         try {
             p.show();
             presentation = p;
+            if (settingsHost != null) {
+                PartyPanelView panel = p.getPanel();
+                if (panel != null) panel.setSettingsHost(settingsHost);
+            }
             Log.i(TAG, "presentation shown on display " + display.getDisplayId());
         } catch (WindowManager.InvalidDisplayException | SecurityException e) {
             Log.w(TAG, "cannot show presentation on display " + display.getDisplayId(), e);
