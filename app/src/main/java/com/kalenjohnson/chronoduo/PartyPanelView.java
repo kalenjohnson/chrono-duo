@@ -121,10 +121,11 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // battle ending).
     private static final long TARGETING_DURATION_NANOS = 8_000_000_000L;
     private long targetingUntil = -1L;
-    // Left-/right-triangle glyphs written as \u escapes rather than raw
+    // Left-/right-triangle glyphs written as unicode escapes rather than raw
     // UTF-8 bytes -- this file has had no non-ASCII characters until now, so
     // there's no evidence javac's source encoding is set to UTF-8 for this
-    // module; escapes sidestep the question entirely.
+    // module; escapes sidestep the question entirely. (And a literal
+    // backslash-u may not appear even in comments: javac decodes it anywhere.)
     private static final String[] TARGET_LABELS = {"\u25C0", "Confirm", "\u25B6"};
     // Hit rects for the three targeting buttons: 0=left, 1=confirm, 2=right.
     private final RectF[] targetHitBoxes = {new RectF(), new RectF(), new RectF()};
