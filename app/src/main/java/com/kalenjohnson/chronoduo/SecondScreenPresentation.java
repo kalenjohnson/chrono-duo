@@ -59,6 +59,16 @@ public final class SecondScreenPresentation extends Presentation {
         hideSystemUi();
     }
 
+    /**
+     * The live panel view, or null before {@link #onCreate} has run. Lets
+     * physical-controller routing (see {@code AppActivity#dispatchKeyEvent},
+     * {@link GameControllerInput}) offer d-pad-left/-right/A to the panel's
+     * own command-row navigation before the game sees it.
+     */
+    public PartyPanelView getPanel() {
+        return panel;
+    }
+
     @Override
     protected void onStart() {
         super.onStart();

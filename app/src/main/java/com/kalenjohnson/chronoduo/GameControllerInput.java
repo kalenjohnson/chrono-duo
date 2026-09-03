@@ -21,8 +21,33 @@ public final class GameControllerInput {
     private static final int CONTROLLER = 0;
     private static final float HAT_THRESHOLD = 0.5f;
 
+    /**
+     * Lets the panel's own command-row navigation (see
+     * {@code PartyPanelView#onControllerLeft/Right/Confirm}) intercept a
+     * physical d-pad-left/-right press before it reaches the game, for the
+     * hat-axis d-pad path (see {@link #handleMotionEvent}). Set (or cleared,
+     * with null) by {@link org.cocos2dx.cpp.AppActivity}; left null-safe here
+     * so a controller connected before the panel exists still works.
+     */
+    public interface CommandNavSink {
+        boolean left();
+        boolean right();
+        boolean confirm();
+    }
+
+    private CommandNavSink navSink;
+
+    /** Installs (or clears, with null) the command-nav interception target -- see {@link CommandNavSink}. */
+    public void setCommandNavSink(CommandNavSink sink) {
+        navSink = sink;
+    }
+
     private boolean connected;
     private boolean hatLeft, hatRight, hatUp, hatDown;
+    // Set when a hat-axis left/right press was consumed by navSink, so the
+    // matching release is swallowed too instead of reaching the game as a
+    // half-press it never saw the down half of.
+    private boolean hatLeftConsumed, hatRightConsumed;
 
     public void ensureConnected() {
         if (!connected) {
@@ -58,11 +83,51 @@ public final class GameControllerInput {
         GameControllerAdapter.onAxisEvent(VENDOR, CONTROLLER,
                 GameControllerDelegate.THUMBSTICK_RIGHT_Y, event.getAxisValue(MotionEvent.AXIS_RZ), true);
 
-        // d-pads that report as hat axes -> synthesize dpad button events
+        // d-pads that report as hat axes -> synthesize dpad button events.
+        // Left/right first offer the press (on the pressed-edge transition
+        // only) to the panel's CommandNavSink, if one is installed -- when it
+        // consumes, neither the synthetic press nor its later release is
+        // emitted to the game (see hatLeftConsumed/hatRightConsumed). Up/down
+        // have no panel meaning and keep the plain hatButton path.
         float hx = event.getAxisValue(MotionEvent.AXIS_HAT_X);
         float hy = event.getAxisValue(MotionEvent.AXIS_HAT_Y);
-        hatLeft = hatButton(hatLeft, hx < -HAT_THRESHOLD, GameControllerDelegate.BUTTON_DPAD_LEFT);
-        hatRight = hatButton(hatRight, hx > HAT_THRESHOLD, GameControllerDelegate.BUTTON_DPAD_RIGHT);
+
+        boolean isLeft = hx < -HAT_THRESHOLD;
+        if (!hatLeft && isLeft) {
+            if (navSink != null && navSink.left()) {
+                hatLeftConsumed = true;
+            } else {
+                GameControllerAdapter.onButtonEvent(VENDOR, CONTROLLER,
+                        GameControllerDelegate.BUTTON_DPAD_LEFT, true, 1f, false);
+            }
+        } else if (hatLeft && !isLeft) {
+            if (hatLeftConsumed) {
+                hatLeftConsumed = false;
+            } else {
+                GameControllerAdapter.onButtonEvent(VENDOR, CONTROLLER,
+                        GameControllerDelegate.BUTTON_DPAD_LEFT, false, 0f, false);
+            }
+        }
+        hatLeft = isLeft;
+
+        boolean isRight = hx > HAT_THRESHOLD;
+        if (!hatRight && isRight) {
+            if (navSink != null && navSink.right()) {
+                hatRightConsumed = true;
+            } else {
+                GameControllerAdapter.onButtonEvent(VENDOR, CONTROLLER,
+                        GameControllerDelegate.BUTTON_DPAD_RIGHT, true, 1f, false);
+            }
+        } else if (hatRight && !isRight) {
+            if (hatRightConsumed) {
+                hatRightConsumed = false;
+            } else {
+                GameControllerAdapter.onButtonEvent(VENDOR, CONTROLLER,
+                        GameControllerDelegate.BUTTON_DPAD_RIGHT, false, 0f, false);
+            }
+        }
+        hatRight = isRight;
+
         hatUp = hatButton(hatUp, hy < -HAT_THRESHOLD, GameControllerDelegate.BUTTON_DPAD_UP);
         hatDown = hatButton(hatDown, hy > HAT_THRESHOLD, GameControllerDelegate.BUTTON_DPAD_DOWN);
         return true;

@@ -11,12 +11,15 @@ import android.view.MotionEvent;
 
 import com.kalenjohnson.chronoduo.ChronoRuntime;
 import com.kalenjohnson.chronoduo.GameControllerInput;
+import com.kalenjohnson.chronoduo.PartyPanelView;
 import com.kalenjohnson.chronoduo.SecondScreenManager;
 
 import org.cocos2dx.lib.Cocos2dxActivity;
 import org.cocos2dx.lib.Cocos2dxHelper;
 
 import java.io.File;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * Host activity for libchrono.so (Chrono Trigger "Upgrade Ver.", cocos2d-x 3.14.1).
@@ -39,6 +42,11 @@ public class AppActivity extends Cocos2dxActivity {
     private ChronoRuntime runtime;
     private SecondScreenManager secondScreen;
     private final GameControllerInput controllerInput = new GameControllerInput();
+    // Keycodes whose ACTION_DOWN was consumed by the panel's own command-row
+    // navigation (see offerToPanel/dispatchKeyEvent) -- the matching
+    // ACTION_UP must be swallowed too, or the game sees a bare release with
+    // no press it knows about (a "stuck key" style half-press).
+    private final Set<Integer> swallowedKeys = new HashSet<>();
 
     public static native void setAssetManager(Context context, AssetManager assetManager);
     public static native void setExternalStorageInfo(String path1, String path2, String packageName);
@@ -90,6 +98,24 @@ public class AppActivity extends Cocos2dxActivity {
 
         secondScreen = new SecondScreenManager(this);
         controllerInput.ensureConnected();
+        // Physical hat-axis d-pad left/right (see GameControllerInput.
+        // handleMotionEvent) offers to the panel's command-row navigation
+        // through this sink, same target as dispatchKeyEvent's key-event
+        // path below (offerToPanel).
+        controllerInput.setCommandNavSink(new GameControllerInput.CommandNavSink() {
+            @Override public boolean left() {
+                PartyPanelView panel = secondScreen.getPanel();
+                return panel != null && panel.onControllerLeft();
+            }
+            @Override public boolean right() {
+                PartyPanelView panel = secondScreen.getPanel();
+                return panel != null && panel.onControllerRight();
+            }
+            @Override public boolean confirm() {
+                PartyPanelView panel = secondScreen.getPanel();
+                return panel != null && panel.onControllerConfirm();
+            }
+        });
         extractCompanionAssets();
 
         com.kalenjohnson.chronoduo.GameState.attach();
@@ -181,8 +207,54 @@ public class AppActivity extends Cocos2dxActivity {
         }
     }
 
+    /**
+     * Offers keycode {@code kc} to the second screen's panel via the
+     * matching {@code PartyPanelView.onController*} method, returning false
+     * (never touching the game) when no presentation/panel is currently
+     * showing. Shared by {@link #dispatchKeyEvent} and the
+     * {@link GameControllerInput.CommandNavSink} registered in
+     * {@link #onCreate} so both physical-input paths (raw key events and
+     * hat-axis-synthesized dpad events) agree on where left/right/confirm go.
+     */
+    private boolean offerToPanel(int kc) {
+        if (secondScreen == null) return false;
+        PartyPanelView panel = secondScreen.getPanel();
+        if (panel == null) return false;
+        switch (kc) {
+            case KeyEvent.KEYCODE_DPAD_LEFT: return panel.onControllerLeft();
+            case KeyEvent.KEYCODE_DPAD_RIGHT: return panel.onControllerRight();
+            case KeyEvent.KEYCODE_BUTTON_A: return panel.onControllerConfirm();
+            default: return false;
+        }
+    }
+
+    /**
+     * Before forwarding to the game (via {@link #controllerInput}), gives the
+     * second screen's own command-row navigation first crack at a fresh
+     * (repeatCount == 0) DOWN of d-pad-left/-right or the A button -- see
+     * {@link #offerToPanel}. When the panel consumes it, the matching UP is
+     * also swallowed here (via {@link #swallowedKeys}) so the game never sees
+     * a release with no press it knows about. A DOWN the panel does NOT
+     * consume clears any stale entry for that keycode first, bounding the
+     * damage if some earlier consumed DOWN's UP never arrived (window/focus
+     * churn) -- otherwise the next unrelated UP for that keycode would be
+     * swallowed while its own DOWN went to the game.
+     */
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        int kc = event.getKeyCode();
+        if (event.getAction() == KeyEvent.ACTION_UP && swallowedKeys.remove((Integer) kc)) {
+            return true;
+        }
+        if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0
+                && (kc == KeyEvent.KEYCODE_DPAD_LEFT || kc == KeyEvent.KEYCODE_DPAD_RIGHT
+                        || kc == KeyEvent.KEYCODE_BUTTON_A)) {
+            if (offerToPanel(kc)) {
+                swallowedKeys.add(kc);
+                return true;
+            }
+            swallowedKeys.remove((Integer) kc);
+        }
         if (runtime != null && controllerInput.handleKeyEvent(event)) return true;
         return super.dispatchKeyEvent(event);
     }

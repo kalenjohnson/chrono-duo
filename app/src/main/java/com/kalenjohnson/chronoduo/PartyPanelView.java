@@ -102,6 +102,13 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private static final String[] COMMAND_LABELS = {"Attack", "Tech", "Item"};
     private final RectF[] commandHitBoxes = {new RectF(), new RectF(), new RectF()};
     private int commandCount;
+    // Panel-owned command-row selection (0..commandCount-1), independent of
+    // the game's own cursor (see PartySnapshot.CommandTarget.selected, which
+    // is no longer used for the highlight). Persists across snapshots and is
+    // reset to 0 only when the command menu newly opens -- see update()'s
+    // menuOpen-transition check. Driven by onControllerLeft/Right/Confirm and
+    // by a direct tap (onTouchEvent sets it to the tapped index).
+    private int commandSel;
     // Brief pressed-state visual feedback on the tapped button.
     private int pressedCommand = -1;
     private long pressedAt = -1L;
@@ -224,6 +231,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         if (snap.inBattle && snap.menuOpen && commandCount > 0) {
             for (int i = 0; i < commandCount; i++) {
                 if (commandHitBoxes[i].contains(event.getX(), event.getY())) {
+                    commandSel = i;
                     injectCommand(i);
                     return true;
                 }
@@ -360,6 +368,60 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         invalidate();
     }
 
+    /**
+     * True exactly when the panel-owned command row is the thing that should
+     * react to left/right/confirm navigation -- in battle, with the command
+     * menu open, and at least one command button currently drawn. Shared by
+     * {@link #onControllerLeft}, {@link #onControllerRight} and {@link
+     * #onControllerConfirm} so all three agree on when input is theirs to
+     * consume versus the game's.
+     */
+    private boolean commandNavActive() {
+        return snap.inBattle && snap.menuOpen && commandCount > 0;
+    }
+
+    /**
+     * Moves the panel-owned command selection one slot left, clamped at 0
+     * (no wrap). Called from the main thread by physical-controller routing
+     * (see {@link org.cocos2dx.cpp.AppActivity#dispatchKeyEvent} and {@link
+     * GameControllerInput}) before the event would otherwise reach the game.
+     *
+     * @return true iff this consumed the input (see {@link #commandNavActive}) --
+     * callers must forward the event to the game unchanged when false.
+     */
+    public boolean onControllerLeft() {
+        if (!commandNavActive()) return false;
+        if (commandSel > 0) {
+            commandSel--;
+            invalidate();
+        }
+        return true;
+    }
+
+    /** Same as {@link #onControllerLeft}, moving right and clamping at {@code commandCount - 1}. */
+    public boolean onControllerRight() {
+        if (!commandNavActive()) return false;
+        if (commandSel < commandCount - 1) {
+            commandSel++;
+            invalidate();
+        }
+        return true;
+    }
+
+    /**
+     * Confirms the panel-owned command selection, injecting a tap for it via
+     * {@link #injectCommand} exactly as a direct button tap would. Consumption
+     * is reported from {@link #commandNavActive} rather than
+     * {@code injectCommand}'s own return value -- {@code injectCommand} is
+     * cooldown-guarded and can silently no-op, and a false return here would
+     * make the caller forward the same press on to the game as a real button.
+     */
+    public boolean onControllerConfirm() {
+        if (!commandNavActive()) return false;
+        injectCommand(commandSel);
+        return true;
+    }
+
     // The three parchment content modes drawContent() dispatches on: live
     // battle, the overworld map, or a field location title. Any change
     // between these three -- not just a BATTLE flip -- is a hard content
@@ -398,6 +460,11 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         if (listUntil > 0 && (!s.inBattle || s.menuOpen)) {
             // same two early-exit conditions as targeting, above.
             listUntil = -1L;
+        }
+        if (!snap.menuOpen && s.menuOpen) {
+            // command menu just opened: start the panel-owned selection back
+            // at Attack, matching the game's own default highlight.
+            commandSel = 0;
         }
         snap = s;
         invalidate();
@@ -713,18 +780,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         int count = Math.min(commandHitBoxes.length, s.commandTargets.size());
         if (count == 0) return;
 
-        // Mirror the game's own cursor: highlight whichever command target
-        // reports selected == true (see PartySnapshot.CommandTarget), falling
-        // back to index 0 (the old hardcoded default) when none does -- e.g.
-        // the read raced a transition, or the selection offsets ever prove
-        // unreliable.
-        int highlightIdx = 0;
-        for (int i = 0; i < count; i++) {
-            if (s.commandTargets.get(i).selected) {
-                highlightIdx = i;
-                break;
-            }
-        }
+        // Panel-owned selection (commandSel), independent of the game's own
+        // cursor -- see the field's javadoc. Clamped defensively in case
+        // commandCount shrank since the last left/right/tap.
+        int highlightIdx = Math.max(0, Math.min(commandSel, count - 1));
 
         float bandTop = parchment.bottom - h * 0.235f;
         float bandBottom = parchment.bottom - h * 0.115f;
@@ -738,11 +797,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             RectF box = new RectF(x, bandTop, x + btnW, bandBottom);
             boolean pressed = live && pressedCommand == i
                     && pressedAt >= 0 && System.nanoTime() - pressedAt < PRESS_FEEDBACK_NANOS;
-            // The live-selected command (falling back to Attack/index 0 when
-            // none reports selected) gets a subtle highlight treatment,
-            // matching the game's own touchscreen default highlighting --
-            // purely cosmetic, suppressed while the pressed-feedback flash
-            // is showing so the two don't visually compete.
+            // The panel-owned selection (commandSel) gets a subtle highlight
+            // treatment -- purely cosmetic, suppressed while the
+            // pressed-feedback flash is showing so the two don't visually
+            // compete.
             drawCommandButton(c, box, COMMAND_LABELS[i], winTex, pressed, i == highlightIdx);
             if (live) commandHitBoxes[i].set(box);
             x += btnW + gap;
@@ -764,9 +822,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     /**
      * Same as the 4-arg overload, plus {@code highlighted}: a subtle
      * brighter border + faint tint applied when true (and {@code pressed} is
-     * false, so it never fights the pressed flash), matching the game's own
-     * touchscreen default highlighting -- purely cosmetic, carries no
-     * targeting/injection meaning.
+     * false, so it never fights the pressed flash) -- purely cosmetic, carries
+     * no targeting/injection meaning. Highlight source is the panel's own
+     * {@link #commandSel}, not the game's cursor.
      */
     private void drawCommandButton(Canvas c, RectF box, String label, Bitmap winTex, boolean pressed, boolean highlighted) {
         if (winTex != null) {

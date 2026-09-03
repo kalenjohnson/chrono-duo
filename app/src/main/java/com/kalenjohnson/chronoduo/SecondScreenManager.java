@@ -71,6 +71,16 @@ public final class SecondScreenManager {
                 new android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_OFF));
     }
 
+    /**
+     * The current presentation's live panel view, or null when no
+     * presentation is showing (or its own view isn't created yet) -- see
+     * {@link SecondScreenPresentation#getPanel()}. Null-safe at both hops so
+     * callers never need to check {@code isShowing()} themselves.
+     */
+    public PartyPanelView getPanel() {
+        return presentation != null ? presentation.getPanel() : null;
+    }
+
     public void onDestroy() {
         try {
             activity.unregisterReceiver(screenOffReceiver);
