@@ -29,6 +29,12 @@ public final class ChronoAssets {
     // 0-based line index into Localize/en/msg/monster.txt == monster id
     // (line 146 = "Gato", verified live). Null until extraction finishes.
     private static String[] monsterNames;
+    // Game/battle/tblb/MonsterNameData.dat: per-monster byte, index == monster
+    // id (same ids as monsterNames / the battle actor block's +0x00 field).
+    // 0 = normal enemy; 255 = the game hides this enemy's info in its own UI
+    // (bosses/event enemies -- Gato id 146 is 255; all common early enemies
+    // are 0). Null until extraction finishes.
+    private static byte[] monsterFlags;
     private static final List<Listener> listeners = new ArrayList<>();
 
     /**
@@ -47,6 +53,7 @@ public final class ChronoAssets {
     public static Bitmap getMinimapMark() { return minimapMark; }
     public static Bitmap getWindowTex() { return windowTex; }
     public static String[] getMonsterNames() { return monsterNames; }
+    public static byte[] getMonsterFlags() { return monsterFlags; }
 
     // Public (not package-private): populated from AppActivity, which lives
     // in org.cocos2dx.cpp — a different package — because the game binary
@@ -73,11 +80,14 @@ public final class ChronoAssets {
     /** Stores the monster name table (line index == monster id) and notifies listeners, so a battle panel already open when extraction finishes repaints with real names. */
     public static void setMonsterNames(String[] names) { monsterNames = names; notifyListeners(); }
 
+    /** Stores the monster flag table (byte index == monster id; 255 = hide info) and notifies listeners. */
+    public static void setMonsterFlags(byte[] flags) { monsterFlags = flags; notifyListeners(); }
+
     /** Registers a listener; if any asset is already loaded, fires immediately so late attachers (e.g. a Presentation created after the background load finished) don't miss it. */
     public static void addListener(Listener l) {
         listeners.add(l);
         if (facePng != null || worldMap != null || minimapMark != null || windowTex != null
-                || monsterNames != null) {
+                || monsterNames != null || monsterFlags != null) {
             l.onChronoAssetsChanged();
         }
     }

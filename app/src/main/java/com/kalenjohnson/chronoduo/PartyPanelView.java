@@ -1,6 +1,7 @@
 package com.kalenjohnson.chronoduo;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -11,6 +12,7 @@ import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Shader;
 import android.graphics.Typeface;
+import android.view.MotionEvent;
 import android.view.View;
 
 import java.util.HashMap;
@@ -74,6 +76,23 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private static final int PAPER_EDGE = Color.rgb(94, 74, 44);
     private static final int INK = Color.rgb(96, 72, 40);
 
+    // Enemy hidden-HP display setting: HONOR (default) hides cur/max numbers
+    // and shows a neutral full-width bar for any enemy the game itself
+    // marks as hidden-info (MonsterNameData.dat flag byte == 255, bosses/
+    // event enemies); FULL always shows real numbers, as today. Persisted
+    // across sessions and toggled by tapping the eye glyph during battle.
+    private static final String PREFS_NAME = "chronoduo_prefs";
+    private static final String KEY_ENEMY_HP_MODE = "enemy_hp_mode";
+    private static final String MODE_HONOR = "HONOR";
+    private static final String MODE_FULL = "FULL";
+    private boolean honorHiddenHp = true;
+    // Hit box (screen px) for the battle-mode "eye" toggle glyph, updated
+    // each frame it's drawn; empty (and therefore never touch-hit) outside
+    // battle mode -- see drawEyeToggle / onTouchEvent.
+    private final RectF eyeHitBox = new RectF();
+    private static final float EYE_GLYPH_RADIUS = 12f; // ~24px diameter
+    private static final float EYE_HIT_HALF = 24f;     // ~48px hit box
+
     private static final int[] PORTRAIT_COLORS = {
             Color.rgb(196, 84, 40), Color.rgb(120, 180, 230), Color.rgb(120, 200, 120),
             Color.rgb(190, 160, 70), Color.rgb(80, 160, 90), Color.rgb(230, 200, 140),
@@ -110,6 +129,36 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         mapPaint.setAlpha(225);
         markerPaint.setFilterBitmap(false);
         markerPaint.setDither(false);
+        SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        honorHiddenHp = !MODE_FULL.equals(prefs.getString(KEY_ENEMY_HP_MODE, MODE_HONOR));
+    }
+
+    /** Toggles and persists the enemy hidden-HP display setting; called from the eye-glyph tap handler in {@link #onTouchEvent}. */
+    private void toggleHiddenHpMode() {
+        honorHiddenHp = !honorHiddenHp;
+        getContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putString(KEY_ENEMY_HP_MODE, honorHiddenHp ? MODE_HONOR : MODE_FULL)
+                .apply();
+        invalidate();
+    }
+
+    /**
+     * Touch surface is otherwise fully inert (controller/touch input stays
+     * with the game -- see {@link SecondScreenPresentation}'s
+     * FLAG_NOT_FOCUSABLE window). The only interactive element is the eye
+     * glyph drawn in the parchment's top-right corner during battle; a tap
+     * inside its hit box toggles the hidden-HP display mode. Everything else
+     * returns false so no other touch behavior is ever implied.
+     */
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        if (event.getAction() == MotionEvent.ACTION_DOWN
+                && snap.inBattle && !eyeHitBox.isEmpty()
+                && eyeHitBox.contains(event.getX(), event.getY())) {
+            toggleHiddenHpMode();
+            return true;
+        }
+        return false;
     }
 
     public void update(PartySnapshot s) {
@@ -460,14 +509,40 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         return "Enemy " + (index + 1);
     }
 
-    /** One CT-style enemy HP bar: label above, colored fill bar with numeric readout. Numbers are instant; only the fill bar (frac) eases. */
+    // Neutral/muted bar color for a hidden-info enemy in HONOR mode -- drawn
+    // at full width regardless of actual HP, but visibly distinct from the
+    // green "healthy" bar color so it reads as "unknown," not "full health."
+    private static final int HIDDEN_HP_BAR_COLOR = Color.rgb(140, 130, 110);
+
+    /**
+     * True when this enemy's info should be hidden per the game's own
+     * MonsterNameData.dat flag table (byte 255 == hidden; bosses/event
+     * enemies) and the current display setting honors that (HONOR mode).
+     * FULL mode, or a missing/out-of-range flag table, always returns false.
+     */
+    private boolean isHiddenInfo(PartySnapshot.Enemy e) {
+        if (!honorHiddenHp) return false;
+        byte[] flags = ChronoAssets.getMonsterFlags();
+        if (flags == null || e.id < 0 || e.id >= flags.length) return false;
+        return (flags[e.id] & 0xff) == 255;
+    }
+
+    /**
+     * One CT-style enemy HP bar: label above, colored fill bar with numeric
+     * readout. Numbers are instant; only the fill bar (frac) eases. When the
+     * enemy's info is hidden (see {@link #isHiddenInfo}) and HONOR mode is
+     * active, the numeric readout is replaced with "???" and the bar is
+     * drawn full-width in a muted neutral color instead of the real
+     * fraction -- the name is still shown, matching the game's own bosses.
+     */
     private void drawEnemyBar(Canvas c, PartySnapshot.Enemy e, int index, float l, float t, float w, float h, float frac) {
+        boolean hidden = isHiddenInfo(e);
         setText(h * 0.62f, INK, true, Paint.Align.LEFT, false);
         text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         c.drawText(enemyLabel(e, index), l, t, text);
         setText(h * 0.62f, INK, false, Paint.Align.RIGHT, false);
         text.setTypeface(Typeface.MONOSPACE);
-        c.drawText(e.curHp + "/" + e.maxHp, l + w, t, text);
+        c.drawText(hidden ? "???" : (e.curHp + "/" + e.maxHp), l + w, t, text);
 
         float barTop = t + h * 0.28f;
         float barH = h * 0.6f;
@@ -476,19 +551,45 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         fill.setColor(Color.argb(160, 40, 30, 15));
         c.drawRoundRect(track, barH * 0.4f, barH * 0.4f, fill);
 
-        frac = clamp01(frac);
-        if (frac > 0f) {
-            RectF fillRect = new RectF(track);
-            fillRect.right = track.left + track.width() * frac;
-            int barColor = frac > 0.5f ? Color.rgb(70, 190, 90)
-                    : frac > 0.2f ? Color.rgb(230, 200, 60)
-                    : Color.rgb(210, 60, 60);
-            fill.setColor(barColor);
-            c.drawRoundRect(fillRect, barH * 0.4f, barH * 0.4f, fill);
+        if (hidden) {
+            fill.setColor(HIDDEN_HP_BAR_COLOR);
+            c.drawRoundRect(track, barH * 0.4f, barH * 0.4f, fill);
+        } else {
+            frac = clamp01(frac);
+            if (frac > 0f) {
+                RectF fillRect = new RectF(track);
+                fillRect.right = track.left + track.width() * frac;
+                int barColor = frac > 0.5f ? Color.rgb(70, 190, 90)
+                        : frac > 0.2f ? Color.rgb(230, 200, 60)
+                        : Color.rgb(210, 60, 60);
+                fill.setColor(barColor);
+                c.drawRoundRect(fillRect, barH * 0.4f, barH * 0.4f, fill);
+            }
         }
         stroke.setStrokeWidth(1.5f);
         stroke.setColor(Color.argb(150, 96, 72, 40));
         c.drawRoundRect(track, barH * 0.4f, barH * 0.4f, stroke);
+    }
+
+    /**
+     * Small "eye" toggle glyph (circle + dot, INK color, ~24px) in the
+     * parchment's top-right corner, drawn only while in battle mode. Tapping
+     * within its ~48px hit box (see {@link #onTouchEvent}) toggles the
+     * hidden-HP display setting. Updates {@link #eyeHitBox} every call so
+     * the hit-test always matches the glyph's current on-screen position.
+     */
+    private void drawEyeToggle(Canvas c, RectF parchment) {
+        float cx = parchment.right - EYE_GLYPH_RADIUS - 14f;
+        float cy = parchment.top + EYE_GLYPH_RADIUS + 14f;
+        eyeHitBox.set(cx - EYE_HIT_HALF, cy - EYE_HIT_HALF, cx + EYE_HIT_HALF, cy + EYE_HIT_HALF);
+
+        int inkA = Color.argb(210, Color.red(INK), Color.green(INK), Color.blue(INK));
+        stroke.setStrokeWidth(2f);
+        stroke.setColor(inkA);
+        c.drawCircle(cx, cy, EYE_GLYPH_RADIUS, stroke);
+        fill.setShader(null);
+        fill.setColor(inkA);
+        c.drawCircle(cx, cy, EYE_GLYPH_RADIUS * 0.35f, fill);
     }
 
     /**
@@ -664,6 +765,16 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // aged-paper vignette/speckles/frame ON TOP of the map so it reads
         // as ink on old parchment rather than a clean printed minimap
         drawParchmentOverlay(c, parchment);
+
+        // battle-only hidden-HP mode toggle glyph; drawn on the current
+        // (possibly still-fading-in) mode only, never during the crossfade
+        // itself, and its hit box is cleared outside battle mode so a stray
+        // touch never toggles anything.
+        if (snap.inBattle) {
+            drawEyeToggle(c, parchment);
+        } else {
+            eyeHitBox.setEmpty();
+        }
 
         // DS-style status boxes along the top, one per party member (n > 0
         // here — onDraw returns early via drawWordmark() otherwise)

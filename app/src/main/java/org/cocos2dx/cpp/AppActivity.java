@@ -206,6 +206,7 @@ public class AppActivity extends Cocos2dxActivity {
                         "Game/common/minimap_mark.png",
                         "Extension/menu_win.png",
                         "Localize/en/msg/monster.txt",
+                        "Game/battle/tblb/MonsterNameData.dat",
                 };
                 java.util.Map<String, File> files =
                         com.kalenjohnson.chronoduo.ChronoResources.extractAll(appCtx, gameAssets, names);
@@ -221,6 +222,7 @@ public class AppActivity extends Cocos2dxActivity {
                 final android.graphics.Bitmap mark = cropMarkerTile(files.get("Game/common/minimap_mark.png"));
                 final android.graphics.Bitmap windowTex = cropWindowTexture(files.get("Extension/menu_win.png"));
                 final String[] monsterNames = readMonsterNames(files.get("Localize/en/msg/monster.txt"));
+                final byte[] monsterFlags = readRawBytes(files.get("Game/battle/tblb/MonsterNameData.dat"));
 
                 new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                     if (face != null) com.kalenjohnson.chronoduo.ChronoAssets.setFace(face);
@@ -232,6 +234,7 @@ public class AppActivity extends Cocos2dxActivity {
                     if (mark != null) com.kalenjohnson.chronoduo.ChronoAssets.setMinimapMark(mark);
                     if (windowTex != null) com.kalenjohnson.chronoduo.ChronoAssets.setWindowTex(windowTex);
                     if (monsterNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setMonsterNames(monsterNames);
+                    if (monsterFlags != null) com.kalenjohnson.chronoduo.ChronoAssets.setMonsterFlags(monsterFlags);
                 });
             } catch (Exception e) {
                 Log.w(TAG, "companion asset extraction failed", e);
@@ -345,6 +348,24 @@ public class AppActivity extends Cocos2dxActivity {
             return text.split("\r\n|\n");
         } catch (Exception e) {
             Log.w(TAG, "failed to read monster name table: " + f, e);
+            return null;
+        }
+    }
+
+    /**
+     * Reads Game/battle/tblb/MonsterNameData.dat as a raw byte table: index
+     * (0-based) == monster id, same ids as the actor block's +0x00 field and
+     * monster.txt's line index. 0 = normal enemy; 255 = the game hides this
+     * enemy's info in its own UI (bosses/event enemies -- Gato id 146 is
+     * 255; all common early enemies are 0). Best-effort: any failure is
+     * logged and returns null, leaving the hidden-HP feature disabled.
+     */
+    private static byte[] readRawBytes(File f) {
+        if (f == null) return null;
+        try {
+            return java.nio.file.Files.readAllBytes(f.toPath());
+        } catch (Exception e) {
+            Log.w(TAG, "failed to read monster flag table: " + f, e);
             return null;
         }
     }

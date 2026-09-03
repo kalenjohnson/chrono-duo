@@ -34,6 +34,62 @@ static void *(*p_node_getChildren)(void *);  // returns cocos2d::Vector<Node*>&
 static int   (*p_node_isVisible)(void *);
 static void  (*p_node_setVisible)(void *, int);
 
+// cocos2d::Size/Vec2 are HFAs (two floats) -- returned in s0/s1 per the arm64
+// AAPCS, so plain C struct-by-value declarations match the real ABI.
+typedef struct { float w, h; } CCSize;
+typedef struct { float x, y; } CCVec2;
+static int safe_read(const void *addr, void *out, size_t len);
+
+// cocos2d::Node member offsets (3.14.1 arm64, from accessor disassembly):
+// getPosition->this+0x50, getAnchorPoint->+0x78, getContentSize->+0x80,
+// getParent->ldr [this,#0x190], isVisible->ldrb [this,#0x1f9]
+#define NODE_POSITION 0x50
+#define NODE_ANCHOR   0x78
+#define NODE_CONTENT  0x80
+#define NODE_PARENT   0x190
+#define NODE_VISIBLE  0x1f9
+
+// World-space center of a node via pure safe_read parent-chain walk (ignores
+// scale/rotation — fine for the unscaled battle menu). Engine transform calls
+// (convertToWorldSpace) crashed on mid-destruction toggles; this cannot.
+static int node_world_center(void *node, float *ox, float *oy) {
+    float pt[2], cs0[2];
+    if (!safe_read((uint8_t *)node + NODE_CONTENT, cs0, 8)) return 0;
+    pt[0] = cs0[0] * 0.5f;
+    pt[1] = cs0[1] * 0.5f;
+    void *n = node;
+    for (int i = 0; i < 12 && n; i++) {
+        float pos[2], anc[2], csz[2];
+        void *parent;
+        if (!safe_read((uint8_t *)n + NODE_POSITION, pos, 8)) return 0;
+        if (!safe_read((uint8_t *)n + NODE_ANCHOR, anc, 8)) return 0;
+        if (!safe_read((uint8_t *)n + NODE_CONTENT, csz, 8)) return 0;
+        if (!safe_read((uint8_t *)n + NODE_PARENT, &parent, 8)) return 0;
+        pt[0] = pos[0] + (pt[0] - anc[0] * csz[0]);
+        pt[1] = pos[1] + (pt[1] - anc[1] * csz[1]);
+        n = parent;
+    }
+    *ox = pt[0];
+    *oy = pt[1];
+    return 1;
+}
+
+// cocos2d-x 3.14.1: virtual const Size& getContentSize() const — returns a
+// REFERENCE (pointer in x0), not a by-value HFA; read the floats through it.
+static const void *(*p_node_getContentSize)(void *);
+static uint8_t *g_lib_base;
+
+// A live cocos object's vtable must point into libchrono.so's mapping; stale
+// or reused heap can pass the RTTI readability checks with a garbage vtable
+// whose virtual dispatch (inside convertToWorldSpace) jumps to junk.
+static int vtable_in_libchrono(void *obj) {
+    void *vt;
+    if (!g_lib_base || !safe_read(obj, &vt, 8)) return 0;
+    uintptr_t delta = (uintptr_t)vt - (uintptr_t)g_lib_base;
+    return delta < 0x1000000;
+}
+static CCVec2 (*p_node_convertToWorldSpace)(void *, const CCVec2 *);
+
 // std::string returned by value (sret) from ChronoCanvas::getFieldMapName()
 typedef struct { uint8_t raw[24]; } CppStr;
 static CppStr (*p_getFieldMapName)(void *);
@@ -64,7 +120,8 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeAttach(JNIEnv *env, jclass cls) 
     if (p_getInstance) {
         Dl_info info;
         if (dladdr((void *)p_getInstance, &info) && info.dli_fbase) {
-            g_asm_mem_slot = (uint8_t **)((uint8_t *)info.dli_fbase + ASM_MEM_GLOBAL);
+            g_lib_base = (uint8_t *)info.dli_fbase;
+            g_asm_mem_slot = (uint8_t **)(g_lib_base + ASM_MEM_GLOBAL);
         }
     }
     p_getFieldMapName = (CppStr (*)(void *)) dlsym(h, "_ZNK12ChronoCanvas15getFieldMapNameEv");
@@ -73,6 +130,9 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeAttach(JNIEnv *env, jclass cls) 
     p_node_getChildren = (void *(*)(void *)) dlsym(h, "_ZN7cocos2d4Node11getChildrenEv");
     p_node_isVisible = (int (*)(void *)) dlsym(h, "_ZNK7cocos2d4Node9isVisibleEv");
     p_node_setVisible = (void (*)(void *, int)) dlsym(h, "_ZN7cocos2d4Node10setVisibleEb");
+    p_node_getContentSize = (const void *(*)(void *)) dlsym(h, "_ZNK7cocos2d4Node14getContentSizeEv");
+    p_node_convertToWorldSpace = (CCVec2 (*)(void *, const CCVec2 *))
+        dlsym(h, "_ZNK7cocos2d4Node19convertToWorldSpaceERKNS_4Vec2E");
     LOGI("attach: getInstance=%p canvas=%p asm_slot=%p director=%p", (void *)p_getInstance,
          p_getInstance ? p_getInstance() : NULL, (void *)g_asm_mem_slot,
          (void *)p_dir_getInstance);
@@ -342,6 +402,53 @@ static void *find_node_by_type(void *root, const char *pat, int max_depth) {
     return find_node_by_type_rec(root, pat, 0, max_depth);
 }
 
+// ---------------------------------------------------------------------------
+// Battle command toggles: the Battle node's cocos2d::Menu contains ~17
+// MenuItemToggle children (Attack/Tech/Item/etc.), a handful visible at any
+// time. For each, cache its on-screen center (worldspace, via
+// convertToWorldSpace on {contentSize/2}) and effective visibility (its own
+// isVisible AND every ancestor's, down to the Battle node) so a later phase
+// can mirror the buttons on the second screen and forward taps. GL thread
+// only -- called from nativeUpdateBattleFlag, which already runs there.
+// ---------------------------------------------------------------------------
+
+#define MAX_BATTLE_TOGGLES 24
+typedef struct { float x, y; int visible; } BattleToggle;
+static BattleToggle g_battle_toggles[MAX_BATTLE_TOGGLES];
+static int g_battle_toggle_count;
+
+static void collect_toggles_rec(void *node, int depth, int max_depth, int ancestors_visible) {
+    if (g_battle_toggle_count >= MAX_BATTLE_TOGGLES) return;
+    char tb[96];
+    const char *tn = type_name(node, tb, sizeof(tb));
+    if (!tn) return;
+    uint8_t visb = 0;
+    int vis = safe_read((uint8_t *)node + NODE_VISIBLE, &visb, 1) && visb;
+    int this_visible = ancestors_visible && vis;
+    if (strstr(tn, "MenuItemToggle")) {
+        float wx, wy;
+        if (node_world_center(node, &wx, &wy)) {
+            g_battle_toggles[g_battle_toggle_count].x = wx;
+            g_battle_toggles[g_battle_toggle_count].y = wy;
+            g_battle_toggles[g_battle_toggle_count].visible = this_visible ? 1 : 0;
+            g_battle_toggle_count++;
+        }
+        return; // toggles have no meaningful children to recurse into
+    }
+    if (depth >= max_depth || !p_node_getChildren) return;
+    void *vecp = p_node_getChildren(node);
+    void *ptrs[2];
+    if (!safe_read(vecp, ptrs, 16)) return;
+    void **begin = (void **)ptrs[0], **end = (void **)ptrs[1];
+    if (!plausible_any(begin) || !plausible_any(end) || end < begin
+            || (end - begin) > 512) return;
+    for (void **c = begin; c < end; c++) {
+        void *child;
+        if (safe_read(c, &child, 8) && g_battle_toggle_count < MAX_BATTLE_TOGGLES)
+            collect_toggles_rec(child, depth + 1, max_depth, this_visible);
+    }
+}
+
 // Live battle HP/state lives behind a pointer at SceneBattle+0x8 (getwork8/
 // getwork16 both do `x8 = *(this+0x8); return *(this_type*)(x8+idx)`), and
 // SceneBattle::getNChara16 reads a second pointer at +0x68. CT battles are
@@ -356,10 +463,18 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeUpdateBattleFlag(JNIEnv *env, jc
     void *node = scene ? find_node_by_type(scene, "Battle", 2) : NULL;
     g_battle_node = node;
     g_in_battle = (node != NULL);
+    g_battle_toggle_count = 0;
     if (node) {
         char tb[96];
         const char *tn = type_name(node, tb, sizeof(tb));
         LOGI("battle node: %p type=%s", node, tn ? tn : "?");
+        collect_toggles_rec(node, 0, 3, 1);
+        for (int i = 0; i < g_battle_toggle_count; i++) {
+            if (g_battle_toggles[i].visible) {
+                LOGI("battle toggle[%d]: x=%.1f y=%.1f vis=1", i,
+                     g_battle_toggles[i].x, g_battle_toggles[i].y);
+            }
+        }
     }
     if (g_in_battle != g_battle_was) {
         LOGI("battle %s", g_in_battle ? "started" : "ended");
@@ -370,6 +485,27 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeUpdateBattleFlag(JNIEnv *env, jc
 JNIEXPORT jboolean JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleFlag(JNIEnv *env, jclass cls) {
     return g_in_battle ? JNI_TRUE : JNI_FALSE;
+}
+
+// Cached battle command toggles, as flat [x0,y0,vis0, x1,y1,vis1, ...] triples
+// (vis is 0.0/1.0). Empty array when not in battle. Populated on the GL
+// thread by nativeUpdateBattleFlag; safe to call from any thread (plain read
+// of the cached array, single-writer/racy-reader like the rest of this file).
+JNIEXPORT jfloatArray JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleToggles(JNIEnv *env, jclass cls) {
+    int count = g_battle_toggle_count;
+    jfloatArray arr = (*env)->NewFloatArray(env, count * 3);
+    if (!arr) return NULL;
+    if (count > 0) {
+        float buf[MAX_BATTLE_TOGGLES * 3];
+        for (int i = 0; i < count; i++) {
+            buf[i * 3 + 0] = g_battle_toggles[i].x;
+            buf[i * 3 + 1] = g_battle_toggles[i].y;
+            buf[i * 3 + 2] = g_battle_toggles[i].visible ? 1.0f : 0.0f;
+        }
+        (*env)->SetFloatArrayRegion(env, arr, 0, count * 3, buf);
+    }
+    return arr;
 }
 
 static int g_walk_count;

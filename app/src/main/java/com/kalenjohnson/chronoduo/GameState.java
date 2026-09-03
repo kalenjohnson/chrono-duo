@@ -34,6 +34,11 @@ public final class GameState {
     // Live battle actor array (10 * 0x80-byte slots), or null if not in battle
     // or any pointer in the chase is bad. Any thread; uses cached node ptr.
     public static native byte[] nativeReadBattleActors();
+    // Battle command button (MenuItemToggle) positions/visibility, cached by
+    // nativeUpdateBattleFlag: flat [x0,y0,vis0, x1,y1,vis1, ...] triples in
+    // worldspace pixels, vis 0.0/1.0. Empty array when not in battle. Any
+    // thread; uses the cached array populated on the GL thread.
+    public static native float[] nativeGetBattleToggles();
 
     /** Scene-graph node type/name patterns hidden by the "clean UI" tick. */
     public static final String[] HIDDEN_UI_PATTERNS = {"FieldMenu", "WorldMenu"};
