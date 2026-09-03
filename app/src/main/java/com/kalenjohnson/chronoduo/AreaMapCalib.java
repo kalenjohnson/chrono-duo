@@ -30,6 +30,13 @@ final class AreaMapCalib {
     // Per-map overrides, keyed by mapId. Empty until real transforms are
     // derived; entries here take priority over DEFAULT.
     private static final SparseArray<float[]> OVERRIDES = new SparseArray<>();
+    static {
+        // Leene Square: calibrated live 2026-09-04 from three landmarks
+        // (north stairs (24.5,23.0)->(128,40), fountain (24.2,34.9)->(128,97),
+        // south exit (24.5,46.6)->(123,150)); ~4.66 px/tile, the minimap is
+        // a crop of the room. X scale assumed equal to Y (unverified).
+        OVERRIDES.put(5, new float[] {4.04f, 4.66f, 29f, -67f}); // X from west wall: tile 2.49 -> px 39
+    }
 
     /**
      * Maps a live field-tile position ({@code tileX}, {@code tileY} -- see
