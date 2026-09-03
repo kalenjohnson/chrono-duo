@@ -93,6 +93,24 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private static final float EYE_GLYPH_RADIUS = 12f; // ~24px diameter
     private static final float EYE_HIT_HALF = 24f;     // ~48px hit box
 
+    // Battle command buttons (Attack/Tech/Item) -- on-panel hit rects (panel
+    // px, not game-screen px) for the up to 3 currently visible command
+    // targets in snap.commandTargets, same order. commandCount is how many
+    // of commandHitBoxes[0..2] are live this frame; touches outside that
+    // range never hit-test. Updated only while drawing the LIVE snapshot
+    // (never the fading-out one) so a stale rect can't outlive its target.
+    private static final String[] COMMAND_LABELS = {"Attack", "Tech", "Item"};
+    private final RectF[] commandHitBoxes = {new RectF(), new RectF(), new RectF()};
+    private int commandCount;
+    // Brief pressed-state visual feedback on the tapped button.
+    private int pressedCommand = -1;
+    private long pressedAt = -1L;
+    private static final long PRESS_FEEDBACK_NANOS = 150_000_000L;
+    // Safety: at most one in-flight injected tap -- a DOWN inside a command
+    // button's rect within this cooldown of the last injection is ignored.
+    private long lastInjectAt = -1L;
+    private static final long INJECT_COOLDOWN_NANOS = 250_000_000L;
+
     private static final int[] PORTRAIT_COLORS = {
             Color.rgb(196, 84, 40), Color.rgb(120, 180, 230), Color.rgb(120, 200, 120),
             Color.rgb(190, 160, 70), Color.rgb(80, 160, 90), Color.rgb(230, 200, 140),
@@ -145,38 +163,83 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     /**
      * Touch surface is otherwise fully inert (controller/touch input stays
      * with the game -- see {@link SecondScreenPresentation}'s
-     * FLAG_NOT_FOCUSABLE window). The only interactive element is the eye
-     * glyph drawn in the parchment's top-right corner during battle; a tap
-     * inside its hit box toggles the hidden-HP display mode. Everything else
-     * returns false so no other touch behavior is ever implied.
+     * FLAG_NOT_FOCUSABLE window). Two interactive elements exist, both
+     * battle-only: the eye glyph (toggles hidden-HP display) and, when the
+     * live command menu is open, the Attack/Tech/Item buttons -- a tap
+     * inside one injects a touch into the real game at that command's
+     * stored game-screen coordinates (see {@link #injectCommand}).
+     * Everything else returns false so no other touch behavior is ever
+     * implied.
      */
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        if (event.getAction() == MotionEvent.ACTION_DOWN
-                && snap.inBattle && !eyeHitBox.isEmpty()
+        if (event.getAction() != MotionEvent.ACTION_DOWN) return false;
+        if (snap.inBattle && !eyeHitBox.isEmpty()
                 && eyeHitBox.contains(event.getX(), event.getY())) {
             toggleHiddenHpMode();
             return true;
         }
+        if (snap.inBattle && snap.menuOpen && commandCount > 0) {
+            for (int i = 0; i < commandCount; i++) {
+                if (commandHitBoxes[i].contains(event.getX(), event.getY())) {
+                    injectCommand(i);
+                    return true;
+                }
+            }
+        }
         return false;
+    }
+
+    /**
+     * Injects a tap for command button {@code idx} (0=Attack, 1=Tech,
+     * 2=Item) at its live game-screen coordinates via {@link BattleInput},
+     * guarded so an injection never fires outside battle/menuOpen, never
+     * fires when the underlying command list is stale/shorter than idx, and
+     * never fires more than once per {@link #INJECT_COOLDOWN_NANOS} (one
+     * in-flight tap at a time). Also arms the brief pressed-button visual
+     * feedback.
+     */
+    private void injectCommand(int idx) {
+        if (!snap.inBattle || !snap.menuOpen) return;
+        if (idx < 0 || idx >= snap.commandTargets.size()) return;
+        long now = System.nanoTime();
+        if (lastInjectAt >= 0 && now - lastInjectAt < INJECT_COOLDOWN_NANOS) return;
+        lastInjectAt = now;
+        pressedCommand = idx;
+        pressedAt = now;
+        PartySnapshot.CommandTarget t = snap.commandTargets.get(idx);
+        BattleInput.tap(t.x, t.y);
+        invalidate();
+    }
+
+    // The three parchment content modes drawContent() dispatches on: live
+    // battle, the overworld map, or a field location title. Any change
+    // between these three -- not just a BATTLE flip -- is a hard content
+    // cut and should use the mode crossfade, not a jump.
+    private enum ContentMode {BATTLE, OVERWORLD, FIELD}
+
+    private static ContentMode modeOf(PartySnapshot s) {
+        if (s.inBattle) return ContentMode.BATTLE;
+        return (s.mapName == null || s.mapName.isEmpty()) ? ContentMode.OVERWORLD : ContentMode.FIELD;
     }
 
     public void update(PartySnapshot s) {
         boolean hadContent = !snap.members.isEmpty();
-        if (hadContent && s.inBattle != snap.inBattle) {
-            // parchment content mode is flipping (map/field <-> battle):
-            // keep the outgoing snapshot around so it can fade out with its
-            // own data while the incoming one fades in.
+        ContentMode oldMode = modeOf(snap);
+        ContentMode newMode = modeOf(s);
+        if (hadContent && newMode != oldMode) {
+            // parchment content mode is changing (battle <-> overworld <->
+            // field, in any direction): keep the outgoing snapshot around
+            // so it can fade out with its own data while the incoming one
+            // fades in.
             fadeSnap = snap;
             modeFadeStart = System.nanoTime();
-        }
-        if (hadContent && !s.inBattle && !snap.inBattle) {
-            boolean overworldOld = snap.mapName == null || snap.mapName.isEmpty();
-            boolean overworldNew = s.mapName == null || s.mapName.isEmpty();
-            if (!overworldOld && !overworldNew && !snap.mapName.equals(s.mapName)) {
-                fadingOutTitle = snap.mapName;
-                titleFadeStart = System.nanoTime();
-            }
+        } else if (hadContent && oldMode == ContentMode.FIELD && newMode == ContentMode.FIELD
+                && !snap.mapName.equals(s.mapName)) {
+            // staying in FIELD mode but the location name itself changed:
+            // the smaller title-only micro-fade, not the full mode crossfade.
+            fadingOutTitle = snap.mapName;
+            titleFadeStart = System.nanoTime();
         }
         snap = s;
         invalidate();
@@ -444,7 +507,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         int n = s.enemies.size();
         if (n == 0) return;
         float areaTop = parchment.top + h * 0.13f;
-        float areaBottom = parchment.bottom - h * 0.09f;
+        // Leave room for the command-button band (see drawCommandButtons)
+        // when it's showing, so a long enemy list compresses instead of
+        // drawing through the buttons.
+        float areaBottom = s.menuOpen
+                ? parchment.bottom - h * 0.26f
+                : parchment.bottom - h * 0.09f;
         float rowH = Math.min(h * 0.075f, (areaBottom - areaTop) / n);
         float barLeft = parchment.left + w * 0.09f;
         float barRight = parchment.right - w * 0.09f;
@@ -456,6 +524,71 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             drawEnemyBar(c, e, i, barLeft, rowTop, barRight - barLeft, rowH * 0.62f,
                     eased != null ? eased : rawFrac);
         }
+    }
+
+    /**
+     * When the live battle command menu is open ({@code s.menuOpen}), draws
+     * up to 3 CT-style buttons (Attack/Tech/Item, horizontally spread) in a
+     * band near the bottom of the parchment, below the enemy bars and above
+     * the gold/time corner text. Called from {@link #onDraw} <em>after</em>
+     * {@link #drawParchmentOverlay} (like {@link #drawEyeToggle}) so the
+     * vignette/ink-frame chrome never darkens or strikes through the
+     * buttons; {@code live} is always {@code true} at that call site since
+     * only the current snapshot's buttons are ever interactive. Only updates
+     * {@link #commandHitBoxes} / {@link #commandCount} when {@code live} --
+     * kept as a parameter (mirroring the rest of this file's draw*(..., live)
+     * methods) so a stale hit rect can never outlive its target.
+     */
+    private void drawCommandButtons(Canvas c, RectF parchment, PartySnapshot s, boolean live) {
+        if (live) commandCount = 0;
+        if (!s.menuOpen) return;
+        int w = getWidth(), h = getHeight();
+        int count = Math.min(commandHitBoxes.length, s.commandTargets.size());
+        if (count == 0) return;
+
+        float bandTop = parchment.bottom - h * 0.235f;
+        float bandBottom = parchment.bottom - h * 0.115f;
+        float gap = w * 0.02f;
+        float totalW = parchment.width() - w * 0.09f * 2f;
+        float btnW = (totalW - gap * (count - 1)) / count;
+        float x = parchment.left + w * 0.09f;
+
+        Bitmap winTex = ChronoAssets.getWindowTex();
+        for (int i = 0; i < count; i++) {
+            RectF box = new RectF(x, bandTop, x + btnW, bandBottom);
+            boolean pressed = live && pressedCommand == i
+                    && pressedAt >= 0 && System.nanoTime() - pressedAt < PRESS_FEEDBACK_NANOS;
+            drawCommandButton(c, box, COMMAND_LABELS[i], winTex, pressed);
+            if (live) commandHitBoxes[i].set(box);
+            x += btnW + gap;
+        }
+        if (live) commandCount = count;
+    }
+
+    /** One command button: 9-sliced window texture (fallback: hand-drawn navy box), centered label, optional pressed-state overlay. */
+    private void drawCommandButton(Canvas c, RectF box, String label, Bitmap winTex, boolean pressed) {
+        if (winTex != null) {
+            float destInset = Math.min(box.width(), box.height()) * 0.16f;
+            drawNinePatch(c, winTex, ChronoAssets.WINDOW_TEX_INSET, box, destInset);
+        } else {
+            fill.setShader(null);
+            fill.setColor(BOX_BORDER_OUT);
+            c.drawRect(box, fill);
+            RectF inner = new RectF(box);
+            inner.inset(3, 3);
+            fill.setColor(BOX_BORDER_IN);
+            c.drawRect(inner, fill);
+            inner.inset(2, 2);
+            fill.setColor(BOX_BG);
+            c.drawRect(inner, fill);
+        }
+        if (pressed) {
+            fill.setShader(null);
+            fill.setColor(Color.argb(100, 255, 255, 255));
+            c.drawRect(box, fill);
+        }
+        setText(box.height() * 0.42f, Color.WHITE, true, Paint.Align.CENTER, true);
+        c.drawText(label, box.centerX(), box.centerY() + box.height() * 0.15f, text);
     }
 
     private static float clamp01(float v) {
@@ -761,6 +894,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         c.restore();
 
         if (titleFadeStart >= 0) animating = true;
+        if (pressedCommand >= 0 && pressedAt >= 0
+                && System.nanoTime() - pressedAt < PRESS_FEEDBACK_NANOS) {
+            animating = true;
+        }
 
         // aged-paper vignette/speckles/frame ON TOP of the map so it reads
         // as ink on old parchment rather than a clean printed minimap
@@ -770,10 +907,17 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // (possibly still-fading-in) mode only, never during the crossfade
         // itself, and its hit box is cleared outside battle mode so a stray
         // touch never toggles anything.
+        // battle-only command buttons, drawn (like the eye toggle) on top of
+        // the aged-paper overlay -- inside drawContent()/drawBattleContent()
+        // they'd sit under the vignette and the inner ink-frame stroke,
+        // which is why the eye toggle is placed here too. Only ever drawn/
+        // hit-testable against the live snapshot, never the fading-out one.
         if (snap.inBattle) {
             drawEyeToggle(c, parchment);
+            drawCommandButtons(c, parchment, snap, true);
         } else {
             eyeHitBox.setEmpty();
+            commandCount = 0;
         }
 
         // DS-style status boxes along the top, one per party member (n > 0

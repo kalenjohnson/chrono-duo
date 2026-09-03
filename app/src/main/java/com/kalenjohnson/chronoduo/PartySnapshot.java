@@ -55,9 +55,42 @@ public final class PartySnapshot {
         public int id; // monster id, actor block +0x00 (u8); index into monster.txt name table
     }
 
+    /**
+     * One live battle command menu toggle (Attack/Tech/Item), already
+     * transformed from cocos worldspace into game-view screen pixels (see
+     * {@link GameState#nativeGetBattleToggles()} and the affine in
+     * {@link #read()}). Order within {@link #commandTargets} is always
+     * Attack, Tech, Item (sorted by screenY ascending, per the calibrated
+     * column layout).
+     */
+    public static final class CommandTarget {
+        public final float x, y;
+        public CommandTarget(float x, float y) {
+            this.x = x;
+            this.y = y;
+        }
+    }
+
+    // Command-menu affine (worldspace -> 1920x1080 game-view screen pixels),
+    // calibrated +-2px against the real menu.
+    private static final float CMD_SX_A = 3714.0f, CMD_SX_B = 3.20f;
+    private static final float CMD_SY_A = -1090.0f, CMD_SY_B = -3.39f;
+    // Command-toggle column band: right-side x, and y >= this cutoff (the
+    // two character-tab toggles sit above this at similar x and must be
+    // excluded).
+    private static final float CMD_MIN_X = 1200f;
+    private static final float CMD_MIN_Y = 700f;
+    private static final float CMD_MAX_Y = 1080f;
+    private static final int CMD_MAX_TARGETS = 3;
+
     public final List<Member> members = new ArrayList<>();
     public boolean inBattle;
     public final List<Enemy> enemies = new ArrayList<>();
+    // Up to 3 live command-menu targets (Attack, Tech, Item), in that order;
+    // empty when the command menu isn't currently open (ATB not ready, or a
+    // sub-menu is showing instead). See CommandTarget.
+    public final List<CommandTarget> commandTargets = new ArrayList<>();
+    public boolean menuOpen; // == !commandTargets.isEmpty()
     public int gold;        // cSfcWork+0x1a04 (u32), found by differential dump
     public int playSeconds; // cSfcWork+0x1a10 (u32), monotonically rising
     public String mapName = ""; // cached from ChronoCanvas::getFieldMapName()
@@ -139,6 +172,32 @@ public final class PartySnapshot {
                 e.id = u8(btl, base + 0x00);
                 snap.enemies.add(e);
             }
+
+            float[] toggles = GameState.nativeGetBattleToggles();
+            if (toggles != null && toggles.length >= 3) {
+                List<float[]> candidates = new ArrayList<>();
+                for (int i = 0; i + 2 < toggles.length; i += 3) {
+                    float vis = toggles[i + 2];
+                    if (vis < 0.5f) continue;
+                    float sx = CMD_SX_A + CMD_SX_B * toggles[i];
+                    float sy = CMD_SY_A + CMD_SY_B * toggles[i + 1];
+                    if (sx > CMD_MIN_X && sy >= CMD_MIN_Y && sy <= CMD_MAX_Y) {
+                        candidates.add(new float[]{sx, sy});
+                    }
+                }
+                // Only trust the band when it holds exactly the 3 command
+                // toggles the calibration promises (Attack/Tech/Item); a
+                // partial read (sub-menu open, mid-transition, 1-2 visible)
+                // would otherwise get labeled from index 0 and mis-inject
+                // (e.g. "Attack" firing Tech). Treat that as menu-closed.
+                candidates.sort((a, b) -> Float.compare(a[1], b[1]));
+                if (candidates.size() == CMD_MAX_TARGETS) {
+                    for (float[] p : candidates) {
+                        snap.commandTargets.add(new CommandTarget(p[0], p[1]));
+                    }
+                }
+            }
+            snap.menuOpen = snap.commandTargets.size() == CMD_MAX_TARGETS;
         }
         return snap;
     }
@@ -160,6 +219,7 @@ public final class PartySnapshot {
                 || !mapName.equals(o.mapName)
                 || worldX != o.worldX || worldY != o.worldY) return false;
         if (inBattle != o.inBattle || enemies.size() != o.enemies.size()) return false;
+        if (menuOpen != o.menuOpen || commandTargets.size() != o.commandTargets.size()) return false;
         for (int i = 0; i < members.size(); i++) {
             Member a = members.get(i), b = o.members.get(i);
             if (!a.name.equals(b.name) || a.level != b.level
@@ -170,6 +230,10 @@ public final class PartySnapshot {
         for (int i = 0; i < enemies.size(); i++) {
             Enemy a = enemies.get(i), b = o.enemies.get(i);
             if (a.curHp != b.curHp || a.maxHp != b.maxHp || a.id != b.id) return false;
+        }
+        for (int i = 0; i < commandTargets.size(); i++) {
+            CommandTarget a = commandTargets.get(i), b = o.commandTargets.get(i);
+            if (a.x != b.x || a.y != b.y) return false;
         }
         return true;
     }

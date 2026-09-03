@@ -20,6 +20,9 @@ public final class SecondScreenPresentation extends Presentation {
         @Override public void run() {
             if (GameState.isAttached()) {
                 org.cocos2dx.lib.Cocos2dxHelper.runOnGLThread(GameState::nativeUpdateMapName);
+                // refresh battle flag + toggle positions at panel cadence, not
+                // just the 4s dump tick — command buttons must track the menu
+                org.cocos2dx.lib.Cocos2dxHelper.runOnGLThread(GameState::nativeUpdateBattleFlag);
             }
             PartySnapshot snap = PartySnapshot.read();
             if (last == null || !snap.sameAs(last)) {
