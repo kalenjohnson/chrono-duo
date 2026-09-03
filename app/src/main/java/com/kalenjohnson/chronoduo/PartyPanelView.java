@@ -495,15 +495,14 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         int hpMax = snap.inBattle ? m.battleMaxHp : m.maxHp;
         setText(fs, Color.WHITE, false, Paint.Align.RIGHT, true);
         c.drawText(hpCur + "/" + hpMax, valRight, row1, text);
-        if (snap.inBattle) {
-            // MP offsets inside the battle actor block aren't calibrated
-            // (see PartySnapshot) -- show only HP, live, during battle.
-        } else {
-            setText(fs, Color.rgb(190, 200, 255), true, Paint.Align.LEFT, true);
-            c.drawText("MP", tx, row2, text);
-            setText(fs, Color.WHITE, false, Paint.Align.RIGHT, true);
-            c.drawText(m.curMp + "/" + m.maxMp, valRight, row2, text);
-        }
+        // battle MP calibrated live (u8 pair at actor +0x07/+0x08) — the MP
+        // row now shows in both modes, tracking combat spending in battle
+        int mpCur = snap.inBattle ? m.battleCurMp : m.curMp;
+        int mpMax = snap.inBattle ? m.battleMaxMp : m.maxMp;
+        setText(fs, Color.rgb(190, 200, 255), true, Paint.Align.LEFT, true);
+        c.drawText("MP", tx, row2, text);
+        setText(fs, Color.WHITE, false, Paint.Align.RIGHT, true);
+        c.drawText(mpCur + "/" + mpMax, valRight, row2, text);
     }
 
     /**

@@ -779,9 +779,17 @@ static void enforce_battle_ui_hide(void) {
         const char *tn = type_name(child, tb, sizeof(tb));
         if (!tn || !strstr(tn, "Menu")) continue;
         if (!vtable_in_libchrono(child)) continue;
-        if (p_setCascadeOpacityEnabledRecursive && !already_cascade_set(child)) {
+        // Cascade must be (re)enabled EVERY tick, not once per node: the
+        // toggles swap in freshly created child sprites each time the menu
+        // opens, and children born after a one-shot cascade call render at
+        // full opacity (observed live: window frames and labels stayed
+        // visible while interiors faded). The recursive call is cheap at
+        // this subtree size; the ring now only gates the log line.
+        if (p_setCascadeOpacityEnabledRecursive) {
             p_setCascadeOpacityEnabledRecursive(child, 1);
-            LOGI("battle-ui: cascade-opacity enabled on %s (%p)", tn, child);
+            if (!already_cascade_set(child)) {
+                LOGI("battle-ui: cascade-opacity enabled on %s (%p)", tn, child);
+            }
         }
         if (p_node_setOpacity) p_node_setOpacity(child, 0);
     }

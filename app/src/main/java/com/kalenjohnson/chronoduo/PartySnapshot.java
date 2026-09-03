@@ -39,6 +39,10 @@ public final class PartySnapshot {
     private static final int BTL_PARTY_SLOTS = 3;
     private static final int BTL_HP_OFF = 0x03;
     private static final int BTL_MAXHP_OFF = 0x05;
+    // Battle MP: u8 pair right after the HP fields — calibrated live with
+    // Crono 0/14 and Marle 8/18 showing on the game's own battle HUD.
+    private static final int BTL_MP_OFF = 0x07;
+    private static final int BTL_MAXMP_OFF = 0x08;
     private static final int BTL_MAX_PLAUSIBLE_HP = 9999;
 
     public static final class Member {
@@ -48,6 +52,7 @@ public final class PartySnapshot {
         // Live battle HP, when inBattle -- overrides curHp/maxHp for display
         // purposes while a fight is active (see PartyPanelView).
         public int battleCurHp, battleMaxHp;
+        public int battleCurMp, battleMaxMp;
     }
 
     public static final class Enemy {
@@ -166,6 +171,8 @@ public final class PartySnapshot {
                 Member m = snap.members.get(i);
                 m.battleCurHp = curHp;
                 m.battleMaxHp = maxHp;
+                m.battleCurMp = btl[base + BTL_MP_OFF] & 0xff;
+                m.battleMaxMp = btl[base + BTL_MAXMP_OFF] & 0xff;
             }
             for (int i = BTL_PARTY_SLOTS; i < BTL_SLOTS; i++) {
                 int base = i * BTL_STRIDE;
@@ -191,7 +198,13 @@ public final class PartySnapshot {
                     float sx = CMD_SX_A + CMD_SX_B * toggles[i];
                     float sy = CMD_SY_A + CMD_SY_B * toggles[i + 1];
                     if (sx > CMD_MIN_X && sy >= CMD_MIN_Y && sy <= CMD_MAX_Y) {
-                        candidates.add(new float[]{sx, sy, toggles[i + 3]});
+                        // Selection signal: the game's visible highlight is the
+                        // toggle's IMAGE SWAP (selectedIndex >= 1), not the
+                        // transient _selected press flag (which only pulses for
+                        // ~150ms during a tap — observed live). Treat either as
+                        // selected so a mid-press still highlights.
+                        float sel = (toggles[i + 4] >= 1f || toggles[i + 3] >= 0.5f) ? 1f : 0f;
+                        candidates.add(new float[]{sx, sy, sel});
                     }
                 }
                 // Only trust the band when it holds exactly the 3 command
@@ -234,7 +247,8 @@ public final class PartySnapshot {
             if (!a.name.equals(b.name) || a.level != b.level
                     || a.curHp != b.curHp || a.maxHp != b.maxHp
                     || a.curMp != b.curMp || a.maxMp != b.maxMp
-                    || a.battleCurHp != b.battleCurHp || a.battleMaxHp != b.battleMaxHp) return false;
+                    || a.battleCurHp != b.battleCurHp || a.battleMaxHp != b.battleMaxHp
+                    || a.battleCurMp != b.battleCurMp || a.battleMaxMp != b.battleMaxMp) return false;
         }
         for (int i = 0; i < enemies.size(); i++) {
             Enemy a = enemies.get(i), b = o.enemies.get(i);
