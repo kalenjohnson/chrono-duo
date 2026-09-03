@@ -46,7 +46,8 @@ See `NOTES.md` for the research and design record.
 
 ## License
 
-ChronoDuo is released under the [MIT License](LICENSE).
+ChronoDuo is released under the [MIT License](LICENSE). See
+`THIRD_PARTY_NOTICES.md` for bundled third-party code.
 
 The vendored `org.cocos2dx.lib` Java classes are from cocos2d-x 3.14.1
 (MIT). No Square Enix assets or code are included: the app loads the
