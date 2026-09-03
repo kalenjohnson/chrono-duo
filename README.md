@@ -7,13 +7,14 @@ bottom screen.
 
 ChronoDuo ships **no game code or assets**. It requires the official
 [CHRONO TRIGGER (Upgrade Ver.)](https://play.google.com/store/apps/details?id=com.square_enix.android_googleplay.chrono)
-app (arm64 build, v2.1.5+) installed on the same device. At startup ChronoDuo
-locates that install, extracts its `libchrono.so`/`libc++_shared.so` into
-ChronoDuo's private storage, points the engine's asset loading at the game's own
+app (arm64 build, v2.1.5+) installed on the same device. The DS ROM is optional —
+import it from the settings page to enable indoor area maps on the companion screen.
+At startup ChronoDuo locates the game install, extracts its `libchrono.so`/`libc++_shared.so`
+into ChronoDuo's private storage, points the engine's asset loading at the game's own
 APK, and boots the engine inside ChronoDuo's process — where we control the second
 screen via Android's standard `Presentation` API.
 
-## Status (2026-09-03 — one very long day)
+## Status (2026-09-04)
 
 - [x] Game boots and plays full-widescreen inside ChronoDuo (Ayn Thor Lite)
 - [x] DS-style second screen: real portraits in the game's own window chrome,
@@ -21,14 +22,13 @@ screen via Android's standard `Presentation` API.
       live location name, gold and play time
 - [x] Live battle mode: real-time party HP, named enemy bars (honoring the
       game's hidden-info flags by default, eye-toggle to reveal), fades
-- [x] Bottom-screen battle CONTROLS: Attack/Tech/Item buttons synced to the
-      real command menu, tap-injected into the game; targeting and submenu
-      navigation rows; selection highlight mirrors the game's cursor, so
-      controller and touch drive one shared menu
-- [x] Top-screen cleanup: field/world menu buttons parked off-screen every
-      frame; battle command UI faded to zero opacity (inputs unaffected)
-- [ ] Someday: tech names on the list buttons, ATB gauges, battle MP,
-      per-era DS maps, optional cheats via the game's own ExperiencePlus
+- [x] Full battle mirroring: command menu (Attack/Tech/Item) + Tech/Item lists
+      on the bottom screen, top screen HUD-free
+- [x] DS-style room maps: indoor area floor plans with live position marker
+      when the user imports their own Chrono Trigger DS ROM from the settings
+      page (.nds or .zip; nothing from the ROM is shipped)
+- [ ] Someday: ATB gauges, overworld era maps, optional cheats via the
+      game's own ExperiencePlus
 
 ## Build
 

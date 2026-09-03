@@ -263,3 +263,55 @@ Entry point: `onButtonPressed(int rowIdx)` (BattleTechMenu 0x6e44b4, 520B). Read
 - `BATTLE_HIDE_MASK --ei mask N`: blanks Battle's direct children by bitmask (bit i hides child i). Live what-draws-what debug.
 
 **Command selection model (shipped).** Panel owns d-pad left/right + A while command menu is open (`_isOpen` byte check at this+0x380). Left/right update panel index (no game cursor sync); A injects touch on highlighted command + swallows key-up so game sees no keypress. Outside menu, all controller input passes through. On-panel direct tap updates index and fires selection callback.
+
+## DS area maps and the room marker (2026-09-04)
+
+**DS ROM files and format.** 522 unique dungeon/room maps stored as triplets
+`menu/bg/minimap_<ID>[_<n>]_{ncg,ncl,nsc}.bin` in the DS ROM. NCG (LZ10-compressed
+tile graphics): magic "NCG\0", count u16, 4bpp/8bpp flag, then tile data (32 or 64 bytes
+per 8×8 tile). NCL (palette, uncompressed): magic "NCL\0", count u32, then BGR555 colors
+(2 bytes each). NSC (screen/tilemap, uncompressed): magic "NSC\0", count u16, width u8,
+height u8 (always 32×24 = 256×192 px), then 2-byte entries (tile index bits 0-9, hflip
+bit 10, vflip bit 11, palette index bits 12-15 for 4bpp). 520 of 521 decode correctly
+as clean tan/brown floor-plan icons with transparent background. See `tools/ds_maps/REPORT.md`
+for format details and `tools/ds_maps/decode_map.py` for the Python reference decoder.
+
+**Field map ID match.** Mobile port's `ChronoCanvas::getFieldMapName()` reads an int32 from
+**ChronoCanvas + 0x12300** (field map location id). This id matches the DS minimap file id
+exactly: Leene Square = 5 (verified live). The id also doubles as the room/event ID throughout
+the DS ROM (MapTable/EvtNNNN structures), reducing to a hand-built name→PNG lookup table once
+the ~500 canonical CT location names are enumerated.
+
+**Leader position in field maps.** CHARACTER_DATa records at `cSfcWork + 0x6924 + i*0x154`
+(i = 0 for party leader). Within each record: X tile = int32 @ +0x80, X×256 (sub-tile) @ +0x84;
+Y tile @ +0x8c, Y×256 @ +0x90. Y grows downward. Verified by differential dumps while walking.
+Multi-floor dungeons need a separate floor index (not yet located in gamestate.c).
+
+**Marker transform: model v4.** Per-room rect from ARM9 0x02059e04 (20 B/room) defines a tile
+bounding box [X0,Y0,X1,Y1]. Scale ladder {4,2,1} per box class (both fit tx×sy ≤ box dims),
+global 8/7 vertical stretch (sy = sx * 8/7), rect centred in a fixed pixel-space centre
+(small box: (127.5, 98.2), large box: (126.0, 88.14...)). Formula: `px = ox + sx*tileX`,
+`py = oy + sy*tileY` where `ox = centre_x - (X0+X1+1)/2*sx`, `oy = centre_y - (Y0+Y1+1)/2*sy`.
+Calibration: Leene Square (room 5, stairs (24.5,23.0)→(128,40), fountain (24.2,34.9)→(128,97),
+south exit (24.5,46.6)→(123,150), west wall x=2.49 → px 39); room 434 (walls x=2.5/13.5 →
+px 103/152, counter/exit y=4.5/11.6 → px 83/120, sx=4, sy≈4.571). See `tools/ds_maps/gen_calib.py`
+module docstring (lines 10-99) for the full v3→v4 derivation and confidence caveats.
+
+**On-device importer.** Settings gear icon → SAF picker → .nds or .zip (NitroFS entry streamed
+to temp cache). Validation: Nitro logo CRC, game codes {YQUE, YQUP, YQUJ}, ARM9 table bounds.
+Imports to `<filesDir>/ds_maps/` with area_calib.json (per-room rects from the ARM9 table).
+Maps and calib reload on completion. Desktop verification: `tools/ds_maps/JavaImportCheck.java`
+matches the Python decoder pixel-for-pixel on all 520 maps; used for testing the
+`app/src/main/java/com/kalenjohnson/chronoduo/dsimport/` Java port.
+
+**Tech and item names.** `Localize/en/msg/tech.txt` (117 CRLF lines) and `Localize/en/msg/item.txt`
+(347 lines), 0-based line index == id, extracted from resources.bin. Tech descriptions at
+`tec_mes.txt` (same indexing). Battle item ids encode category<<14 | index; consumables are
+category 1 (USEITEM_nnn). See `tech_item_names_report.md` for sample indices and file locations.
+
+**MP formula.** TechnicMpTable.dat (header u32 count, then count single-byte values) holds solo
+tech costs indexed by tech id. TechnicBaseDataTable.dat (header u32 count, then count 15-byte
+records) has bytes 11-13 listing up to 3 component tech ids (0xFF = unused). **MP cost = sum of
+TechnicMpTable.mp[c] for each non-0xFF component id c** — uniform for solo/dual/triple techs.
+Verified: Cyclone 2, Aura 1, Aura Whirl (1+2) = 3, Luminaire 20, Delta Force (triple 8+8+8) = 24.
+See `tech_mp_report.md` for the full calibration table and Java snippet.
