@@ -18,21 +18,31 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.zip.Deflater;
 
 /**
  * Disk-backed cache of user-supplied "original 1x pixel art" texture
  * replacements (see AppActivity#scanOrigArtReplacements). Rather than
  * holding every replacement decoded in native RAM (512x512x4 bytes each,
  * >600MB across hundreds of sheets), each sheet's decoded pixels live on
- * disk as a raw ".rgba" file, and the native side (gamestate.c) freads one
- * lazily on a texture-upload match instead of keeping any of them resident.
+ * disk as a zlib-compressed ".rgbz" file, and the native side (gamestate.c)
+ * freads and inflates one lazily on a texture-upload match instead of
+ * keeping any of them resident.
  *
  * On-disk format, under {@code <filesDir>/orig_art_cache/}:
- *   - "&lt;name&gt;.rgba": raw premultiplied RGBA8888 bytes for that sheet,
- *     {@code w*h*4}, row-major, tightly packed (R,G,B,A per texel) -- the
+ *   - "&lt;name&gt;.rgbz": zlib-compressed premultiplied RGBA8888 bytes for
+ *     that sheet -- a 16-byte header {@code "RGBZ"} (4 bytes) + width (u32
+ *     LE) + height (u32 LE) + rawLen (u32 LE, the uncompressed size, always
+ *     {@code w*h*4}), followed by a standard zlib stream ({@link
+ *     java.util.zip.Deflater}'s default RFC-1950 wrapper) of the row-major,
+ *     tightly packed (R,G,B,A per texel) premultiplied RGBA8888 bytes -- the
  *     exact bytes {@link com.kalenjohnson.chronoduo.GameState
- *     #nativeLoadTextureReplacementIndex}'s registry uploads via
- *     glTexImage2D on a match.
+ *     #nativeLoadTextureReplacementIndex}'s registry inflates and uploads
+ *     via glTexImage2D on a match. Sprite sheets are mostly transparent and
+ *     deflate well, so this is substantially smaller than the raw RGBA on
+ *     disk at the cost of a native zlib inflate (a few ms/sheet) on each
+ *     match; any leftover "&lt;name&gt;.rgba" from a pre-compression build
+ *     of this cache is stale and deleted by {@link #refresh}.
  *   - "index.txt": one line per cached sheet, "&lt;name&gt; &lt;w&gt;
  *     &lt;h&gt; &lt;alphaFp hex16&gt; &lt;redFp hex16&gt; &lt;pngMtime&gt;"
  *     -- name is the replacement's basename (e.g. "c000_0.png", including
@@ -46,7 +56,7 @@ import java.util.Map;
  *     exactly the 5 fields before it and ignores the rest of the line.
  *
  * {@link #refresh} is the only entry point: it rebuilds only what changed
- * since the last run (a missing/stale ".rgba", or a source PNG with no
+ * since the last run (a missing/stale ".rgbz", or a source PNG with no
  * cache entry at all -- everything else is reused, so a 629-sheet boot scan
  * with nothing changed costs one directory listing and one index parse
  * instead of 629 PNG decodes plus 629 resources.bin extractions), writes
@@ -88,7 +98,7 @@ public final class OrigArtCache {
      * matching ChronoAssets's own convention), then loads the result into
      * the native registry. Synchronized (like {@link ChronoResources#extract})
      * since this can run from both the boot thread and the settings-toggle
-     * thread, and both write index.txt/*.rgba. Safe to call on a background
+     * thread, and both write index.txt/*.rgbz. Safe to call on a background
      * thread only (file IO, PNG decode, resources.bin extraction). Returns
      * the number of entries loaded natively (0 on a hard failure, e.g. the
      * cache directory can't be created).
@@ -120,22 +130,22 @@ public final class OrigArtCache {
         for (Map.Entry<String, File> se : sources.entrySet()) {
             String name = se.getKey();
             File pngFile = se.getValue();
-            File rgbaFile = new File(cacheDir, name + ".rgba");
+            File rgbzFile = new File(cacheDir, name + ".rgbz");
             Entry old = oldIndex.get(name);
             // Reuse only when the cached entry was built from this exact
-            // PNG content-timestamp: comparing rgbaFile's own write time
+            // PNG content-timestamp: comparing rgbzFile's own write time
             // against the PNG's current mtime (the naive approach) breaks
             // whenever a PNG's mtime moves backward or is preserved by the
             // tool that wrote it (cp -p, unzip, rsync) -- restoring an
             // older PNG over a newer cached one would then silently keep
-            // serving the stale cache forever, since the .rgba write time
+            // serving the stale cache forever, since the .rgbz write time
             // stays newer than the restored (older) PNG's mtime.
-            boolean reuse = old != null && rgbaFile.isFile()
+            boolean reuse = old != null && rgbzFile.isFile()
                     && old.pngMtime == pngFile.lastModified();
             if (reuse) {
                 newIndex.put(name, old);
             } else {
-                Entry built = buildEntry(ctx, gameAssets, name, pngFile, rgbaFile);
+                Entry built = buildEntry(ctx, gameAssets, name, pngFile, rgbzFile);
                 if (built != null) {
                     newIndex.put(name, built);
                     rebuilt++;
@@ -159,11 +169,30 @@ public final class OrigArtCache {
         } else {
             for (String staleName : oldIndex.keySet()) {
                 if (!newIndex.containsKey(staleName)) {
-                    File stale = new File(cacheDir, staleName + ".rgba");
+                    File stale = new File(cacheDir, staleName + ".rgbz");
                     if (stale.delete()) {
                         Log.i(TAG, "orig_art_cache: removed stale " + stale.getName());
                     }
                 }
+            }
+        }
+
+        // Migration: delete any leftover ".rgba" files from a pre-
+        // compression build of this cache -- every entry now lives in the
+        // matching ".rgbz" (built above, either freshly or reused), so a
+        // ".rgba" with no live purpose left on disk is always safe to
+        // remove. Cheap (one directory listing) and a no-op once migrated.
+        File[] leftovers = cacheDir.listFiles();
+        if (leftovers != null) {
+            int removedRgba = 0;
+            for (File f : leftovers) {
+                if (f.getName().toLowerCase(Locale.ROOT).endsWith(".rgba") && f.delete()) {
+                    removedRgba++;
+                }
+            }
+            if (removedRgba > 0) {
+                Log.i(TAG, "orig_art_cache: migration -- removed " + removedRgba
+                        + " leftover .rgba file(s)");
             }
         }
 
@@ -219,8 +248,9 @@ public final class OrigArtCache {
      * (confirmed: android.graphics.Bitmap's native pixel format for
      * ARGB_8888 is kRGBA_8888_SkColorType) -- i.e. this returns exactly the
      * R,G,B,A byte layout the game uploads via glTexImage2D(..., GL_RGBA,
-     * GL_UNSIGNED_BYTE, ...) and exactly what the ".rgba" cache file stores,
-     * so no channel reordering is needed here or in {@link #buildEntry}.
+     * GL_UNSIGNED_BYTE, ...) and exactly what the ".rgbz" cache file stores
+     * (compressed), so no channel reordering is needed here or in
+     * {@link #buildEntry}.
      * Deliberately NOT {@code getPixels}/{@code getPixel}: those
      * un-premultiply on read, which would change what the red-channel
      * fingerprint (and the cached bytes themselves) mean.
@@ -230,6 +260,52 @@ public final class OrigArtCache {
         byte[] bytes = new byte[w * h * 4];
         bmp.copyPixelsToBuffer(ByteBuffer.wrap(bytes));
         return bytes;
+    }
+
+    private static final byte[] RGBZ_MAGIC = {'R', 'G', 'B', 'Z'};
+
+    /**
+     * Builds the on-disk ".rgbz" payload for one sheet: a 16-byte header
+     * ({@code "RGBZ"} + width/height/rawLen, each u32 little-endian) followed
+     * by a zlib (RFC 1950, default-wrapper) deflate of {@code rawRgba} at
+     * level 6 -- must stay byte-compatible with what gamestate.c's
+     * {@code uncompress()} expects (see nativeLoadTextureReplacementIndex /
+     * hooked_glTexImage2D). {@code rawRgba.length} must equal {@code w*h*4}.
+     */
+    private static byte[] compressRgbz(int w, int h, byte[] rawRgba) {
+        Deflater deflater = new Deflater(6); // level 6, default zlib (RFC 1950) wrapper
+        deflater.setInput(rawRgba);
+        deflater.finish();
+        // Deflate output is never larger than input + a small fixed overhead
+        // in the worst (incompressible) case; size the buffer generously and
+        // rely on Deflater to report the actual bytes produced.
+        byte[] tmp = new byte[rawRgba.length + 64];
+        int total = 0;
+        while (!deflater.finished()) {
+            if (total == tmp.length) {
+                byte[] grown = new byte[tmp.length * 2];
+                System.arraycopy(tmp, 0, grown, 0, total);
+                tmp = grown;
+            }
+            int n = deflater.deflate(tmp, total, tmp.length - total);
+            total += n;
+        }
+        deflater.end();
+
+        byte[] out = new byte[16 + total];
+        System.arraycopy(RGBZ_MAGIC, 0, out, 0, 4);
+        writeU32LE(out, 4, w);
+        writeU32LE(out, 8, h);
+        writeU32LE(out, 12, rawRgba.length);
+        System.arraycopy(tmp, 0, out, 16, total);
+        return out;
+    }
+
+    private static void writeU32LE(byte[] buf, int off, int v) {
+        buf[off] = (byte) (v & 0xff);
+        buf[off + 1] = (byte) ((v >>> 8) & 0xff);
+        buf[off + 2] = (byte) ((v >>> 16) & 0xff);
+        buf[off + 3] = (byte) ((v >>> 24) & 0xff);
     }
 
     /**
@@ -271,14 +347,14 @@ public final class OrigArtCache {
      * premultiplied (for the red fingerprint, matching what the game's own
      * premultiply step produces at upload) -- to compute alphaFp/redFp;
      * then decodes the replacement itself PREMULTIPLIED (matching the
-     * game's upload order), writes its raw R,G,B,A bytes to {@code
-     * rgbaFile} (atomically: temp file + rename), and returns the index
-     * line. w/h come from the ORIGINAL; a replacement whose decoded size
-     * doesn't match is skipped (returns null) with a log rather than cached
-     * mismatched.
+     * game's upload order), zlib-deflates its raw R,G,B,A bytes and writes
+     * the RGBZ header + compressed stream to {@code rgbzFile} (atomically:
+     * temp file + rename), and returns the index line. w/h come from the
+     * ORIGINAL; a replacement whose decoded size doesn't match is skipped
+     * (returns null) with a log rather than cached mismatched.
      */
     private static Entry buildEntry(Context ctx, AssetManager gameAssets, String name,
-                                     File pngFile, File rgbaFile) {
+                                     File pngFile, File rgbzFile) {
         // Captured before any decode work so the stored mtime reflects the
         // exact PNG content this entry was built from, for #refresh's reuse
         // check.
@@ -345,8 +421,9 @@ public final class OrigArtCache {
             }
 
             byte[] rgba = bitmapRgbaBytes(replacement);
-            if (!writeAtomic(rgbaFile, rgba)) {
-                Log.w(TAG, "orig_art_cache: failed to write " + rgbaFile);
+            byte[] rgbz = compressRgbz(w, h, rgba);
+            if (!writeAtomic(rgbzFile, rgbz)) {
+                Log.w(TAG, "orig_art_cache: failed to write " + rgbzFile);
                 return null;
             }
 

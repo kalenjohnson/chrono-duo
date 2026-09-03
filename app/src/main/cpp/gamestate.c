@@ -22,6 +22,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #include <android/log.h>
+#include <zlib.h>
 
 #define TAG "ChronoDuoNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -555,6 +556,25 @@ static uint8_t *pixel_decimate_scratch(size_t needed) {
     return g_pixel_decimate_buf;
 }
 
+// Heap scratch buffer for the compressed ".rgbz" file's raw bytes (header +
+// zlib stream), read whole into RAM before inflating into
+// g_pixel_decimate_buf above -- grown as needed and kept between calls, same
+// rationale as g_pixel_decimate_buf. GL-thread-only (mechanism 5, below), so
+// no locking needed for the buffer itself (g_tex_repl_mutex still guards the
+// registry it reads paths from).
+static uint8_t *g_pixel_repl_read_buf;
+static size_t   g_pixel_repl_read_buf_cap;
+
+static uint8_t *pixel_repl_read_scratch(size_t needed) {
+    if (needed > g_pixel_repl_read_buf_cap) {
+        uint8_t *grown = (uint8_t *) realloc(g_pixel_repl_read_buf, needed);
+        if (!grown) return NULL;
+        g_pixel_repl_read_buf = grown;
+        g_pixel_repl_read_buf_cap = needed;
+    }
+    return g_pixel_repl_read_buf;
+}
+
 // Fills `dst` (width/2 * height/2 RGBA texels, tightly packed) from `src`
 // (width * height RGBA texels, tightly packed -- true for RGBA/
 // UNSIGNED_BYTE regardless of GL_UNPACK_ALIGNMENT since 4-byte texels are
@@ -626,11 +646,16 @@ static void pixel_decimate_log_once(GLsizei width, GLsizei height) {
 // com.kalenjohnson.chronoduo.OrigArtCache#refresh from
 // <externalFilesDir|filesDir>/orig_art/*.png at boot (and from the
 // pixel-graphics settings toggle) -- see AppActivity.scanOrigArtReplacements.
-// On a match, hooked_glTexImage2D freads the matched entry's "<name>.rgba"
-// file (raw premultiplied RGBA8 bytes, w*h*4, tightly packed) straight into
-// the decimation scratch buffer and uploads that -- nothing is held decoded
-// in RAM between matches. This keeps steady-state native RAM to one
-// scratch buffer regardless of how many sheets (up to TEX_REPL_MAX) are
+// On a match, hooked_glTexImage2D freads the matched entry's "<name>.rgbz"
+// file -- a 16-byte header {"RGBZ", u32 LE w, u32 LE h, u32 LE rawLen}
+// followed by a zlib (RFC 1950) stream of the tightly packed premultiplied
+// RGBA8 bytes (w*h*4 == rawLen) -- into a compressed-read buffer, validates
+// the header, and inflates (zlib's uncompress()) straight into the
+// decimation scratch buffer before uploading that -- nothing is held
+// decoded in RAM between matches, and on any read/header/inflate failure
+// this falls through to uploading the game's own (unreplaced) pixels. This
+// keeps steady-state native RAM to two scratch buffers (compressed read +
+// decoded) regardless of how many sheets (up to TEX_REPL_MAX) are
 // registered, instead of holding all of them malloc'd and decoded at once.
 // ---------------------------------------------------------------------------
 
@@ -703,7 +728,7 @@ typedef struct {
     int      w, h;
     uint64_t alpha_fp;       // FNV-1a over a 64x64 alpha-channel sample grid of the ORIGINAL asset (see tex_fingerprint)
     uint64_t red_fp;         // same grid, red channel -- tiebreaker when alpha_fp collides across entries
-    char     rgba_path[300]; // "<rgbaDir>/<name>.rgba", tightly packed PREMULTIPLIED RGBA8888, w*h*4 bytes
+    char     rgba_path[300]; // "<rgbaDir>/<name>.rgbz", RGBZ-header + zlib-compressed PREMULTIPLIED RGBA8888, w*h*4 bytes raw
     int      replaced_logged;
     int      mismatch_logged;
 } tex_replacement_t;
@@ -1194,9 +1219,10 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeLogPixelStats(JNIEnv *env, jclas
 // -- see mechanism 5 above -- or, failing that, by content fingerprint
 // against alphaFp/redFp -- see mechanism 5b / tex_fingerprint above; fps are
 // zero-padded lowercase 16-hex-digit, e.g. via Java's "%016x" on a long).
-// `rgbaDir` is the directory holding "<name>.rgba" (tightly packed
-// PREMULTIPLIED RGBA8888, w*h*4 bytes each) -- each entry's rgba_path is
-// built as "<rgbaDir>/<name>.rgba" and read lazily (fread) on a match inside
+// `rgbaDir` is the directory holding "<name>.rgbz" (RGBZ-header + zlib
+// stream of tightly packed PREMULTIPLIED RGBA8888, w*h*4 bytes each once
+// inflated) -- each entry's rgba_path is built as "<rgbaDir>/<name>.rgbz"
+// and read lazily (fread) and inflated on a match inside
 // hooked_glTexImage2D, never held decoded here. Replaces the registry
 // wholesale (resets g_tex_repl_count first), so this is idempotent and safe
 // to call again from the settings toggle. A malformed line (wrong field
@@ -1244,7 +1270,7 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeLoadTextureReplacementIndex(
                 slot->h = h;
                 slot->alpha_fp = (uint64_t) afp;
                 slot->red_fp = (uint64_t) rfp;
-                snprintf(slot->rgba_path, sizeof(slot->rgba_path), "%s/%s.rgba", cdir, name);
+                snprintf(slot->rgba_path, sizeof(slot->rgba_path), "%s/%s.rgbz", cdir, name);
             }
             count = g_tex_repl_count;
             pthread_mutex_unlock(&g_tex_repl_mutex);

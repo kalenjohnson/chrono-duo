@@ -21,12 +21,16 @@ screen via Android's standard `Presentation` API.
       HD sepia world map (torn-paper parchment) with a live position marker,
       live location name, gold and play time
 - [x] Live battle mode: real-time party HP, named enemy bars (honoring the
-      game's hidden-info flags by default, eye-toggle to reveal), fades
+      game's hidden-info flags by default, eye-toggle to reveal), fades and
+      results window on the bottom screen
 - [x] Full battle mirroring: command menu (Attack/Tech/Item) + Tech/Item lists
       on the bottom screen, top screen HUD-free
 - [x] DS-style room maps: indoor area floor plans with live position marker
       when the user imports their own Chrono Trigger DS ROM from the settings
       page (.nds or .zip; nothing from the ROM is shipped)
+- [x] Original pixel-art sprites: a settings toggle restores the unfiltered
+      SNES-style character sprites, rebuilt on-device from art the game itself
+      ships (no ROM needed); field tiles remain the port's smoothed versions
 - [ ] Someday: ATB gauges, overworld era maps, optional cheats via the
       game's own ExperiencePlus
 

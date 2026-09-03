@@ -8,8 +8,8 @@ import java.io.IOException;
  *
  * The samples this was built against are BITMAPV4HEADER (biSize=108), 4bpp,
  * BI_RGB, bottom-up, with a 16-entry BGRx palette immediately following the
- * info header. 8bpp is also supported (same layout, 256-entry palette) since
- * some titles ship 8bpp chara art; anything else (RLE compression, 1/2/16/24/
+ * info header. 8bpp and 1bpp are also supported (same layout, 256- / 2-entry
+ * palettes); anything else (RLE compression, 2/16/24/
  * 32bpp, palette sizes that don't fit) is rejected with IOException rather
  * than silently mis-decoded.
  *
@@ -52,8 +52,8 @@ public final class BmpIndexed {
         if (planes != 1) {
             throw new IOException("unsupported BMP planes=" + planes);
         }
-        if (bpp != 4 && bpp != 8) {
-            throw new IOException("unsupported BMP bit depth=" + bpp + " (only 4/8bpp indexed supported)");
+        if (bpp != 1 && bpp != 4 && bpp != 8) {
+            throw new IOException("unsupported BMP bit depth=" + bpp + " (only 1/4/8bpp indexed supported)");
         }
         if (compression != 0) {
             throw new IOException("unsupported BMP compression=" + compression + " (only BI_RGB supported)");
@@ -103,11 +103,16 @@ public final class BmpIndexed {
                 for (int x = 0; x < width; x++) {
                     indices[outRowBase + x] = data[rowOff + x];
                 }
-            } else { // bpp == 4
+            } else if (bpp == 4) {
                 for (int x = 0; x < width; x++) {
                     int b = data[rowOff + (x >> 1)] & 0xFF;
                     int idx = (x & 1) == 0 ? (b >> 4) & 0xF : b & 0xF;
                     indices[outRowBase + x] = (byte) idx;
+                }
+            } else { // bpp == 1 (two sheets in the game, e.g. c127_0/c157_0: single-colour silhouettes)
+                for (int x = 0; x < width; x++) {
+                    int b = data[rowOff + (x >> 3)] & 0xFF;
+                    indices[outRowBase + x] = (byte) ((b >> (7 - (x & 7))) & 1);
                 }
             }
         }

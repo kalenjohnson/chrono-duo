@@ -315,3 +315,19 @@ records) has bytes 11-13 listing up to 3 component tech ids (0xFF = unused). **M
 TechnicMpTable.mp[c] for each non-0xFF component id c** — uniform for solo/dual/triple techs.
 Verified: Cyclone 2, Aura 1, Aura Whirl (1+2) = 3, Luminaire 20, Delta Force (triple 8+8+8) = 24.
 See `tech_mp_report.md` for the full calibration table and Java snippet.
+
+## Graphics filter and original sprites (2026-09-04)
+
+**No in-game option; GL filtering forced to NEAREST.** GoT-patched redirect of `Texture2D::setAntiAliasTexParameters` + `glTexParameteri` hook (mechanism 1/2) changed nothing on-screen because the port ships 2x pre-smoothed art: 512×512 RGBA sprite sheets, 32×32 map chips (SNES 16×16 upscaled), and CPU-composited 768×448 field index texture rendered through `Shaders/ShaderDrawPalettedTexture.fsh` with 16×1 palette textures. GL_NEAREST stops *further* blur but cannot undo baked-in smoothing.
+
+**Decimation experiment kept behind `nativeSetPixelDecimate` (off).** Halving RGBA uploads on the fly would undo one layer of upscaling, but the field sampler runs in texel space — texel lookups break when texture dimensions change, tiles misalign and UV wraps fail.
+
+**Original 1x pixel art ships with the game.** `Game/chara/bmp/*.bmp` (629 sheets, 4bpp indexed BITMAPV4, 1x original art, differently packed) alongside `Game/chara/png` (2x atlases). Battle/world art at `Game/battle/oef` and `Game/world/gif` bmps; field tiles have no 1x source.
+
+**Rebuild pipeline.** `tools/orig_art/rebuild_sheet.py` / `SheetRebuilder`: 4-connected segmentation of both sides, masked SAD match (RGB, flips considered), pixel-doubled paste of matched 1x frames into 2x rects, fallback to original. Desktop check (`JavaRebuildCheck.java`): 100% on Crono. Batch over 629 sheets: 97% matched (610 frames), 0 failures.
+
+**Runtime swap mechanism.** Replacement sheets registered with FNV-1a fingerprint of ORIGINAL upload's alpha (64×64 sample grid, red premultiplied as tiebreaker). The glTexImage2D hook fingerprints uploads of registered size and substitutes the replacement's premultiplied RGBA bytes — sheets bypass `TextureCache::addImage` / `ResourceManager::createTexture` so path-matching alone is insufficient (mechanism 5b: fingerprint match as fallback). Disk cache `<filesDir>/orig_art_cache/`: raw `.rgba` per sheet (row-major premultiplied RGBA8888, w×h×4 bytes) + `index.txt` (name, w, h, alphaFp/redFp hex16, pngMtime; native freads one sheet at a time on match).
+
+**Settings.** "Original sprites" row with Build action and progress. Refresh (~6 s on-device over 629 sheets) rebuilds only changed/missing `.rgba` files (inode-backed cache reuse).
+
+**Battle results window.** Keyed on `SceneBattle+0x22f4` step counter: step 0 = waiting for death animations, step 1 = first results window. Work struct at `*(SceneBattle+0x60)`: EXP @ +0x1640, gold @ +0x1694, TP @ +0x1758, items @ +0x16b0. Results phase unhides cell layer so game's windows re-appear; bottom-screen panel mirrors the results via live message crossfade.
