@@ -103,12 +103,55 @@ public final class PartySnapshot {
     // sub-menu is showing instead). See CommandTarget.
     public final List<CommandTarget> commandTargets = new ArrayList<>();
     public boolean menuOpen; // == !commandTargets.isEmpty()
+
+    /**
+     * One row of the live battle Tech/Item submenu (see
+     * {@link GameState#nativeGetBattleList()}). {@code x}/{@code y} are
+     * already transformed into 1920x1080 game-view screen pixels via the
+     * same {@link #CMD_SX_A}/{@link #CMD_SY_A} affine as {@link
+     * CommandTarget}; either may be {@link Float#NaN} when the native side
+     * doesn't know the row's on-screen position yet, in which case it must
+     * not be tapped -- see PartyPanelView's confirm handling.
+     */
+    public static final class ListRow {
+        public final int id;
+        public final boolean usable;
+        public final int extra; // tech: MP param; item: held count
+        public final float x, y;
+
+        public ListRow(int id, boolean usable, int extra, float x, float y) {
+            this.id = id;
+            this.usable = usable;
+            this.extra = extra;
+            this.x = x;
+            this.y = y;
+        }
+    }
+
+    // Live battle Tech/Item submenu, when open: kind 0 = tech, 1 = item; -1
+    // = no submenu open (listRows then empty). Filled from
+    // GameState.nativeGetBattleList() in read(), only while inBattle -- see
+    // there. listOpen is always exactly (listKind >= 0).
+    public int listKind = -1;
+    public final List<ListRow> listRows = new ArrayList<>();
+    public boolean listOpen;
     public int gold;        // cSfcWork+0x1a04 (u32), found by differential dump
     public int playSeconds; // cSfcWork+0x1a10 (u32), monotonically rising
     public String mapName = ""; // cached from ChronoCanvas::getFieldMapName()
     // Overworld tile position (Asm mem 0x2E102/0x2E103, u8 each; world is
     // 256x256 tiles). Valid only when on the overworld (mapName empty).
     public int worldX = -1, worldY = -1;
+    // Current field-map/location id, from GameState.nativeGetFieldMapId()
+    // (ChronoCanvas+0x12300). -1 when unknown/unattached. Used by
+    // PartyPanelView to look up a rendered DS-style area map bitmap for
+    // indoor/dungeon maps (see ChronoAssets.getAreaMap).
+    public int fieldMapId = -1;
+    // Party leader's in-field tile position, from GameState.nativeGetFieldPos()
+    // (CHARACTER_DATa record for party slot 1). NaN when unavailable/not read
+    // (e.g. not attached, or the record wasn't readable) -- only meaningful
+    // in field maps, not on the overworld (see worldX/worldY above). Cheap to
+    // read (plain safe_read), so filled every snapshot regardless of mode.
+    public float fieldX = Float.NaN, fieldY = Float.NaN;
 
     private static int u32(byte[] b, int off) {
         if (b == null || off + 4 > b.length) return 0;
@@ -134,6 +177,12 @@ public final class PartySnapshot {
         snap.playSeconds = u32(misc, 0x10);
         String mn = GameState.nativeGetMapName();
         snap.mapName = mn != null ? mn : "";
+        snap.fieldMapId = GameState.nativeGetFieldMapId();
+        float[] fieldPos = GameState.nativeGetFieldPos();
+        if (fieldPos != null && fieldPos.length >= 2) {
+            snap.fieldX = fieldPos[0];
+            snap.fieldY = fieldPos[1];
+        }
         if (snap.mapName.isEmpty()) {
             byte[] pos = GameState.nativeReadAsmMem(0x2E102, 2);
             if (pos != null) {
@@ -221,6 +270,29 @@ public final class PartySnapshot {
                 }
             }
             snap.menuOpen = snap.commandTargets.size() == CMD_MAX_TARGETS;
+
+            // Live Tech/Item submenu list, when one of those is open --
+            // format: [kind, count, then per row: id, usable(0/1), extra,
+            // x, y] in the same worldspace as the command toggles above, so
+            // the same affine applies. Null (or too short to hold even the
+            // 2-float header) means no submenu is currently open.
+            float[] list = GameState.nativeGetBattleList();
+            if (list != null && list.length >= 2) {
+                int kind = (int) list[0];
+                int count = (int) list[1];
+                int idx = 2;
+                for (int i = 0; i < count && idx + 5 <= list.length; i++, idx += 5) {
+                    int id = (int) list[idx];
+                    boolean usable = list[idx + 1] >= 0.5f;
+                    int extra = (int) list[idx + 2];
+                    float wx = list[idx + 3], wy = list[idx + 4];
+                    float sx = Float.isNaN(wx) ? Float.NaN : CMD_SX_A + CMD_SX_B * wx;
+                    float sy = Float.isNaN(wy) ? Float.NaN : CMD_SY_A + CMD_SY_B * wy;
+                    snap.listRows.add(new ListRow(id, usable, extra, sx, sy));
+                }
+                snap.listKind = kind;
+            }
+            snap.listOpen = snap.listKind >= 0;
         }
         return snap;
     }
@@ -240,9 +312,12 @@ public final class PartySnapshot {
         if (o == null || o.members.size() != members.size()) return false;
         if (gold != o.gold || playSeconds != o.playSeconds
                 || !mapName.equals(o.mapName)
-                || worldX != o.worldX || worldY != o.worldY) return false;
+                || worldX != o.worldX || worldY != o.worldY
+                || fieldMapId != o.fieldMapId
+                || !feq(fieldX, o.fieldX) || !feq(fieldY, o.fieldY)) return false;
         if (inBattle != o.inBattle || enemies.size() != o.enemies.size()) return false;
         if (menuOpen != o.menuOpen || commandTargets.size() != o.commandTargets.size()) return false;
+        if (listKind != o.listKind || listRows.size() != o.listRows.size()) return false;
         for (int i = 0; i < members.size(); i++) {
             Member a = members.get(i), b = o.members.get(i);
             if (!a.name.equals(b.name) || a.level != b.level
@@ -259,6 +334,21 @@ public final class PartySnapshot {
             CommandTarget a = commandTargets.get(i), b = o.commandTargets.get(i);
             if (a.x != b.x || a.y != b.y || a.selected != b.selected) return false;
         }
+        for (int i = 0; i < listRows.size(); i++) {
+            ListRow a = listRows.get(i), b = o.listRows.get(i);
+            if (a.id != b.id || a.usable != b.usable || a.extra != b.extra
+                    || !feq(a.x, b.x) || !feq(a.y, b.y)) return false;
+        }
         return true;
+    }
+
+    // Plain != would treat NaN as "always different," even against another
+    // NaN -- ListRow.x/y are legitimately NaN when the row's on-screen
+    // position isn't known yet (see ListRow), and that state is often
+    // stable frame to frame, so without this sameAs() would report a
+    // difference (and PartyPanelView would redraw) every single frame while
+    // such a row is visible.
+    private static boolean feq(float a, float b) {
+        return a == b || (Float.isNaN(a) && Float.isNaN(b));
     }
 }

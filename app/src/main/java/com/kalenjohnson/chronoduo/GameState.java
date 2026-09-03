@@ -28,6 +28,34 @@ public final class GameState {
     public static native void nativeUpdateMapName();              // GL thread only
     public static native String nativeGetMapName();
 
+    /**
+     * Current field-map/location id -- a plain int32 read of
+     * ChronoCanvas::getInstance()+0x12300 (== the embedded FIELD_MAp struct's
+     * +0x1018), the exact field ChronoCanvas::getFieldMapName() itself loads
+     * (via {@code ldrsw x11, [x9, #0x98c]} where x9 = this+0x11974) to pick
+     * which localized name variant to show -- see NOTES.md /
+     * fieldmap_id_report.md for the disassembly. Unlike nativeUpdateMapName
+     * this is a plain safe_read (no scene-graph/std::string sret call), so it
+     * is safe to call from any thread. Returns -1 if the canvas or the read
+     * is unavailable.
+     */
+    public static native int nativeGetFieldMapId();
+
+    /**
+     * Party leader's in-field tile position: [x, y] as floats, read from the
+     * CHARACTER_DATa record for party slot 1 (record index 1 -- cSfcWork +
+     * 0x6924 + 1*0x154, the same base/stride nativeReadChara uses). Verified
+     * live by differential dumps: int32 X tile at record+0x80, int32 X*256
+     * sub-tile at +0x84, int32 Y tile at +0x8c, int32 Y*256 sub-tile at +0x90
+     * (Y grows downward); the native side prefers the sub-tile values divided
+     * by 256.0f and falls back to the plain tile ints only if that read
+     * fails. Only meaningful in field maps, not on the overworld (use
+     * worldX/worldY there instead -- see PartySnapshot). Plain safe_read, so
+     * safe to call from any thread. Returns null if the record is
+     * unreadable.
+     */
+    public static native float[] nativeGetFieldPos();
+
     public static native void nativeUpdateBattleFlag();           // GL thread only
     public static native boolean nativeGetBattleFlag();
     public static native void nativeDumpBattleBuffers(String dir); // any thread; uses cached node ptr
@@ -40,6 +68,23 @@ public final class GameState {
     // toggle's raw _selectedIndex cast to float. Empty array when not in
     // battle. Any thread; uses the cached array populated on the GL thread.
     public static native float[] nativeGetBattleToggles();
+    // Cached open battle list submenu (Tech or Item), populated by
+    // nativeUpdateBattleFlag right after the toggle scan above -- same
+    // thread/cadence. Returns null when no submenu is open. Otherwise a
+    // flat float array: [kind, count, id0, usable0, extra0, x0, y0, id1,
+    // usable1, extra1, x1, y1, ...]. kind is 0 (Tech) or 1 (Item); usable is
+    // 0.0/1.0; extra is the tech's param/cost or the item's count, cast to
+    // float; x/y are worldspace pixels in the same space as
+    // nativeGetBattleToggles, or NaN when the row's on-screen button node
+    // couldn't be resolved (skip tapping that row). Any thread; uses the
+    // cached array populated on the GL thread.
+    public static native float[] nativeGetBattleList();
+    // Opts the BattleTechMenu/BattleItemMenu submenu nodes into the same
+    // opacity hiding nativeEnforceUiTick applies to the rest of the battle
+    // chrome (see nativeSetHideBattleUi) -- only meaningful once the caller
+    // is mirroring nativeGetBattleList's rows on the second screen. Default
+    // false. Any thread (plain flag write).
+    public static native void nativeSetHideBattleSubmenus(boolean hide);
 
     // --- frame-perfect UI enforcer -----------------------------------------
     // Idempotent start gate (native side) for the per-rendered-frame GL tick

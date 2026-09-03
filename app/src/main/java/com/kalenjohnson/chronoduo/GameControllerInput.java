@@ -32,6 +32,8 @@ public final class GameControllerInput {
     public interface CommandNavSink {
         boolean left();
         boolean right();
+        boolean up();
+        boolean down();
         boolean confirm();
     }
 
@@ -44,10 +46,10 @@ public final class GameControllerInput {
 
     private boolean connected;
     private boolean hatLeft, hatRight, hatUp, hatDown;
-    // Set when a hat-axis left/right press was consumed by navSink, so the
-    // matching release is swallowed too instead of reaching the game as a
-    // half-press it never saw the down half of.
-    private boolean hatLeftConsumed, hatRightConsumed;
+    // Set when a hat-axis left/right/up/down press was consumed by navSink,
+    // so the matching release is swallowed too instead of reaching the game
+    // as a half-press it never saw the down half of.
+    private boolean hatLeftConsumed, hatRightConsumed, hatUpConsumed, hatDownConsumed;
 
     public void ensureConnected() {
         if (!connected) {
@@ -84,11 +86,11 @@ public final class GameControllerInput {
                 GameControllerDelegate.THUMBSTICK_RIGHT_Y, event.getAxisValue(MotionEvent.AXIS_RZ), true);
 
         // d-pads that report as hat axes -> synthesize dpad button events.
-        // Left/right first offer the press (on the pressed-edge transition
-        // only) to the panel's CommandNavSink, if one is installed -- when it
-        // consumes, neither the synthetic press nor its later release is
-        // emitted to the game (see hatLeftConsumed/hatRightConsumed). Up/down
-        // have no panel meaning and keep the plain hatButton path.
+        // All four directions first offer the press (on the pressed-edge
+        // transition only) to the panel's CommandNavSink, if one is
+        // installed -- when it consumes, neither the synthetic press nor its
+        // later release is emitted to the game (see hatLeftConsumed/
+        // hatRightConsumed/hatUpConsumed/hatDownConsumed).
         float hx = event.getAxisValue(MotionEvent.AXIS_HAT_X);
         float hy = event.getAxisValue(MotionEvent.AXIS_HAT_Y);
 
@@ -128,16 +130,42 @@ public final class GameControllerInput {
         }
         hatRight = isRight;
 
-        hatUp = hatButton(hatUp, hy < -HAT_THRESHOLD, GameControllerDelegate.BUTTON_DPAD_UP);
-        hatDown = hatButton(hatDown, hy > HAT_THRESHOLD, GameControllerDelegate.BUTTON_DPAD_DOWN);
-        return true;
-    }
-
-    private boolean hatButton(boolean was, boolean is, int cc) {
-        if (was != is) {
-            GameControllerAdapter.onButtonEvent(VENDOR, CONTROLLER, cc, is, is ? 1f : 0f, false);
+        boolean isUp = hy < -HAT_THRESHOLD;
+        if (!hatUp && isUp) {
+            if (navSink != null && navSink.up()) {
+                hatUpConsumed = true;
+            } else {
+                GameControllerAdapter.onButtonEvent(VENDOR, CONTROLLER,
+                        GameControllerDelegate.BUTTON_DPAD_UP, true, 1f, false);
+            }
+        } else if (hatUp && !isUp) {
+            if (hatUpConsumed) {
+                hatUpConsumed = false;
+            } else {
+                GameControllerAdapter.onButtonEvent(VENDOR, CONTROLLER,
+                        GameControllerDelegate.BUTTON_DPAD_UP, false, 0f, false);
+            }
         }
-        return is;
+        hatUp = isUp;
+
+        boolean isDown = hy > HAT_THRESHOLD;
+        if (!hatDown && isDown) {
+            if (navSink != null && navSink.down()) {
+                hatDownConsumed = true;
+            } else {
+                GameControllerAdapter.onButtonEvent(VENDOR, CONTROLLER,
+                        GameControllerDelegate.BUTTON_DPAD_DOWN, true, 1f, false);
+            }
+        } else if (hatDown && !isDown) {
+            if (hatDownConsumed) {
+                hatDownConsumed = false;
+            } else {
+                GameControllerAdapter.onButtonEvent(VENDOR, CONTROLLER,
+                        GameControllerDelegate.BUTTON_DPAD_DOWN, false, 0f, false);
+            }
+        }
+        hatDown = isDown;
+        return true;
     }
 
     private static int mapKeyCode(int keyCode) {

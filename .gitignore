@@ -7,3 +7,6 @@ reference/
 .claude/
 *.nds
 app/.cxx/
+
+# decoded DS-ROM maps (derived from the user-owned ROM; never committed)
+ds_maps_out/

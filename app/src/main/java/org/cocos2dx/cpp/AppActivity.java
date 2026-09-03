@@ -95,6 +95,10 @@ public class AppActivity extends Cocos2dxActivity {
         String extPath = (ext != null ? ext : getFilesDir()).getAbsolutePath();
         setExternalStorageInfo(extPath, extPath, ChronoRuntime.CHRONO_PACKAGE);
         Log.i(TAG, "boot calls done, external storage: " + extPath);
+        // So ChronoAssets.getAreaMap() can find <externalFilesDir>/ds_maps/*.png
+        // (user-pushed DS-style area minimaps -- same "external files dir"
+        // used below for worldmap_hd.png).
+        com.kalenjohnson.chronoduo.ChronoAssets.setExternalFilesDir(ext != null ? ext : getFilesDir());
 
         secondScreen = new SecondScreenManager(this);
         controllerInput.ensureConnected();
@@ -111,6 +115,14 @@ public class AppActivity extends Cocos2dxActivity {
                 PartyPanelView panel = secondScreen.getPanel();
                 return panel != null && panel.onControllerRight();
             }
+            @Override public boolean up() {
+                PartyPanelView panel = secondScreen.getPanel();
+                return panel != null && panel.onControllerUp();
+            }
+            @Override public boolean down() {
+                PartyPanelView panel = secondScreen.getPanel();
+                return panel != null && panel.onControllerDown();
+            }
             @Override public boolean confirm() {
                 PartyPanelView panel = secondScreen.getPanel();
                 return panel != null && panel.onControllerConfirm();
@@ -124,6 +136,15 @@ public class AppActivity extends Cocos2dxActivity {
         // still miss between its own runs, plus opacity-hides the battle
         // top-UI. Started once; safe before the GL surface exists.
         com.kalenjohnson.chronoduo.GameState.startFrameEnforcer();
+        // Blanks the top-screen Tech/Item submenu lists too (the bottom-
+        // screen panel mirrors them instead -- see PartyPanelView's
+        // submenu-list band). Gated behind PartyPanelView.HIDE_SUBMENUS so
+        // this can be flipped off in one place if it ever misbehaves; must
+        // run on the GL thread, like the rest of the native UI-hiding calls.
+        if (PartyPanelView.HIDE_SUBMENUS) {
+            Cocos2dxHelper.runOnGLThread(
+                    () -> com.kalenjohnson.chronoduo.GameState.nativeSetHideBattleSubmenus(true));
+        }
         // periodic full-memory dumps for offline layout analysis (dev only)
         File dumpDir = getExternalFilesDir(null);
         if (dumpDir != null) {
@@ -214,7 +235,8 @@ public class AppActivity extends Cocos2dxActivity {
      * showing. Shared by {@link #dispatchKeyEvent} and the
      * {@link GameControllerInput.CommandNavSink} registered in
      * {@link #onCreate} so both physical-input paths (raw key events and
-     * hat-axis-synthesized dpad events) agree on where left/right/confirm go.
+     * hat-axis-synthesized dpad events) agree on where left/right/up/down/
+     * confirm go.
      */
     private boolean offerToPanel(int kc) {
         if (secondScreen == null) return false;
@@ -223,6 +245,8 @@ public class AppActivity extends Cocos2dxActivity {
         switch (kc) {
             case KeyEvent.KEYCODE_DPAD_LEFT: return panel.onControllerLeft();
             case KeyEvent.KEYCODE_DPAD_RIGHT: return panel.onControllerRight();
+            case KeyEvent.KEYCODE_DPAD_UP: return panel.onControllerUp();
+            case KeyEvent.KEYCODE_DPAD_DOWN: return panel.onControllerDown();
             case KeyEvent.KEYCODE_BUTTON_A: return panel.onControllerConfirm();
             default: return false;
         }
@@ -230,9 +254,9 @@ public class AppActivity extends Cocos2dxActivity {
 
     /**
      * Before forwarding to the game (via {@link #controllerInput}), gives the
-     * second screen's own command-row navigation first crack at a fresh
-     * (repeatCount == 0) DOWN of d-pad-left/-right or the A button -- see
-     * {@link #offerToPanel}. When the panel consumes it, the matching UP is
+     * second screen's own command-row/list-row navigation first crack at a
+     * fresh (repeatCount == 0) DOWN of d-pad-left/-right/-up/-down or the A
+     * button -- see {@link #offerToPanel}. When the panel consumes it, the matching UP is
      * also swallowed here (via {@link #swallowedKeys}) so the game never sees
      * a release with no press it knows about. A DOWN the panel does NOT
      * consume clears any stale entry for that keycode first, bounding the
@@ -248,6 +272,7 @@ public class AppActivity extends Cocos2dxActivity {
         }
         if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0
                 && (kc == KeyEvent.KEYCODE_DPAD_LEFT || kc == KeyEvent.KEYCODE_DPAD_RIGHT
+                        || kc == KeyEvent.KEYCODE_DPAD_UP || kc == KeyEvent.KEYCODE_DPAD_DOWN
                         || kc == KeyEvent.KEYCODE_BUTTON_A)) {
             if (offerToPanel(kc)) {
                 swallowedKeys.add(kc);
@@ -312,7 +337,12 @@ public class AppActivity extends Cocos2dxActivity {
                         "Game/common/minimap_mark.png",
                         "Extension/menu_win.png",
                         "Localize/en/msg/monster.txt",
+                        "Localize/en/msg/tech.txt",
+                        "Localize/en/msg/item.txt",
+                        "Localize/en/msg/sfc_item.txt",
                         "Game/battle/tblb/MonsterNameData.dat",
+                        "Game/common/TechnicMpTable.dat",
+                        "Game/common/TechnicBaseDataTable.dat",
                 };
                 java.util.Map<String, File> files =
                         com.kalenjohnson.chronoduo.ChronoResources.extractAll(appCtx, gameAssets, names);
@@ -327,8 +357,15 @@ public class AppActivity extends Cocos2dxActivity {
                         hdMap != null ? null : cropWorldMap(files.get("Game/common/wb_mini.png"));
                 final android.graphics.Bitmap mark = cropMarkerTile(files.get("Game/common/minimap_mark.png"));
                 final android.graphics.Bitmap windowTex = cropWindowTexture(files.get("Extension/menu_win.png"));
-                final String[] monsterNames = readMonsterNames(files.get("Localize/en/msg/monster.txt"));
+                final String[] monsterNames = readNameTable(files.get("Localize/en/msg/monster.txt"));
+                final String[] techNames = readNameTable(files.get("Localize/en/msg/tech.txt"));
+                final String[] itemNames = readNameTable(files.get("Localize/en/msg/item.txt"));
+                final java.util.Map<String, String> itemCategoryNames =
+                        readSfcItemTable(files.get("Localize/en/msg/sfc_item.txt"));
                 final byte[] monsterFlags = readRawBytes(files.get("Game/battle/tblb/MonsterNameData.dat"));
+                final int[] techMp = readTechMpTable(
+                        files.get("Game/common/TechnicMpTable.dat"),
+                        files.get("Game/common/TechnicBaseDataTable.dat"));
 
                 new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                     if (face != null) com.kalenjohnson.chronoduo.ChronoAssets.setFace(face);
@@ -340,7 +377,11 @@ public class AppActivity extends Cocos2dxActivity {
                     if (mark != null) com.kalenjohnson.chronoduo.ChronoAssets.setMinimapMark(mark);
                     if (windowTex != null) com.kalenjohnson.chronoduo.ChronoAssets.setWindowTex(windowTex);
                     if (monsterNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setMonsterNames(monsterNames);
+                    if (techNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setTechNames(techNames);
+                    if (itemNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setItemNames(itemNames);
+                    if (itemCategoryNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setItemCategoryNames(itemCategoryNames);
                     if (monsterFlags != null) com.kalenjohnson.chronoduo.ChronoAssets.setMonsterFlags(monsterFlags);
+                    if (techMp != null) com.kalenjohnson.chronoduo.ChronoAssets.setTechMpTable(techMp);
                 });
             } catch (Exception e) {
                 Log.w(TAG, "companion asset extraction failed", e);
@@ -441,21 +482,136 @@ public class AppActivity extends Cocos2dxActivity {
     }
 
     /**
-     * Reads Localize/en/msg/monster.txt as UTF-8, CRLF-delimited (a lone LF is
-     * tolerated too); line index (0-based) == monster id, e.g. line 146 =
-     * "Gato". Best-effort: any failure is logged and returns null, leaving
-     * PartyPanelView's "Enemy N" fallback in place.
+     * Reads a Localize/en/msg/*.txt name table as UTF-8, CRLF-delimited (a
+     * lone LF is tolerated too); line index (0-based) == the table's own id
+     * space -- monster.txt line 146 = "Gato", tech.txt/item.txt line index ==
+     * tech/item id (same ids as PartySnapshot.ListRow.id). Best-effort: any
+     * failure is logged and returns null, leaving the caller's numeric-id
+     * fallback ("Enemy N", "#id") in place.
      */
-    private static String[] readMonsterNames(File f) {
+    private static String[] readNameTable(File f) {
         if (f == null) return null;
         try {
             byte[] raw = java.nio.file.Files.readAllBytes(f.toPath());
             String text = new String(raw, java.nio.charset.StandardCharsets.UTF_8);
             return text.split("\r\n|\n");
         } catch (Exception e) {
-            Log.w(TAG, "failed to read monster name table: " + f, e);
+            Log.w(TAG, "failed to read name table: " + f, e);
             return null;
         }
+    }
+
+    /**
+     * Reads Localize/en/msg/sfc_item.txt: a CSV of
+     * {@code MSG_SFC_ITEM_<CATEGORY>_<NNN>,<name>} lines (category names in
+     * file order: WEAPON, ARMOR, HELMET, ACCSESARY, USEITEM, IMPORTANT --
+     * sic on ACCSESARY), one line per item, and returns it as a map keyed
+     * {@code "<CATEGORY>_<NNN>"} -> name. Used by
+     * {@link com.kalenjohnson.chronoduo.ChronoAssets#getItemName(int)} to
+     * resolve the battle item-list's encoded row id
+     * ({@code (category << 14) | indexWithinCategory}), which item.txt's
+     * flat line-index table doesn't cover. Best-effort, like
+     * {@link #readNameTable}: any failure is logged and returns null.
+     */
+    private static java.util.Map<String, String> readSfcItemTable(File f) {
+        if (f == null) return null;
+        try {
+            byte[] raw = java.nio.file.Files.readAllBytes(f.toPath());
+            String text = new String(raw, java.nio.charset.StandardCharsets.UTF_8);
+            String[] lines = text.split("\r\n|\n");
+            final String prefix = "MSG_SFC_ITEM_";
+            java.util.Map<String, String> map = new java.util.HashMap<>();
+            for (String line : lines) {
+                if (line.isEmpty()) continue;
+                int comma = line.indexOf(',');
+                if (comma < 0) continue;
+                String key = line.substring(0, comma);
+                if (!key.startsWith(prefix)) continue;
+                String name = line.substring(comma + 1);
+                map.put(key.substring(prefix.length()), name);
+            }
+            return map;
+        } catch (Exception e) {
+            Log.w(TAG, "failed to read sfc_item table: " + f, e);
+            return null;
+        }
+    }
+
+    /**
+     * Builds the tech MP-cost table (index == tech id, same id space as
+     * tech.txt / PartySnapshot.ListRow.id for tech rows) from two data
+     * files, per the calibrated format writeup for this pair:
+     * <p>
+     * {@code Game/common/TechnicMpTable.dat}: u32 LE {@code count} (72)
+     * header, then {@code count} single-byte solo MP values, index == tech
+     * id -- but only meaningful for a tech's own "solo" MP; combo (dual/
+     * triple) tech ids beyond this table's range have no slot here.
+     * <p>
+     * {@code Game/common/TechnicBaseDataTable.dat}: u32 LE {@code count}
+     * (124) header, then {@code count} fixed 15-byte records (record index
+     * == tech id); bytes 11/12/13 of each record hold up to 3 "component"
+     * tech ids (0xFF = unused slot). A tech's real MP cost is the sum of
+     * the solo table's value for each of its non-0xFF components -- this
+     * one rule covers solo (one component), dual (two), and triple (three)
+     * techs uniformly (verified: Delta Force id 102, comps [8,8,8] -> 24;
+     * Aura Whirl id 57, comps [Aura 1, Cyclone 2] -> 3).
+     * <p>
+     * When a record has no valid (non-0xFF, in-range) component -- e.g. the
+     * id-0 dummy row, or reserved padding past id 116 -- falls back to the
+     * solo table entry at that same id when it exists (id &lt; 72), else -1
+     * (unknown; see {@link com.kalenjohnson.chronoduo.ChronoAssets#getTechMp}).
+     * Best-effort like {@link #readSfcItemTable}: any header/size surprise
+     * (files missing, count/record-length arithmetic not exact) logs and
+     * returns null rather than a partial/garbage table.
+     */
+    private static int[] readTechMpTable(File mpFile, File baseFile) {
+        if (mpFile == null || baseFile == null) return null;
+        try {
+            byte[] mpRaw = java.nio.file.Files.readAllBytes(mpFile.toPath());
+            byte[] baseRaw = java.nio.file.Files.readAllBytes(baseFile.toPath());
+            if (mpRaw.length < 4 || baseRaw.length < 4) return null;
+
+            int mpCount = u32le(mpRaw, 0);
+            if (mpCount <= 0 || 4 + mpCount > mpRaw.length) return null;
+            int[] soloMp = new int[mpCount];
+            for (int i = 0; i < mpCount; i++) soloMp[i] = mpRaw[4 + i] & 0xFF;
+
+            int recCount = u32le(baseRaw, 0);
+            int recBytes = baseRaw.length - 4;
+            if (recCount <= 0 || recBytes % recCount != 0) return null;
+            int recLen = recBytes / recCount;
+            if (recLen < 14) return null; // need at least bytes 0..13 of each record
+
+            int[] techMp = new int[recCount];
+            for (int id = 0; id < recCount; id++) {
+                int off = 4 + id * recLen;
+                int sum = 0;
+                boolean any = false;
+                for (int k = 11; k <= 13; k++) {
+                    int c = baseRaw[off + k] & 0xff;
+                    if (c == 0xFF) continue;
+                    if (c >= soloMp.length) continue; // bounds-check: component id must be < 72
+                    sum += soloMp[c];
+                    any = true;
+                }
+                if (any) {
+                    techMp[id] = sum;
+                } else if (id < soloMp.length) {
+                    techMp[id] = soloMp[id];
+                } else {
+                    techMp[id] = -1;
+                }
+            }
+            return techMp;
+        } catch (Exception e) {
+            Log.w(TAG, "failed to read tech MP tables: " + mpFile + ", " + baseFile, e);
+            return null;
+        }
+    }
+
+    private static int u32le(byte[] b, int off) {
+        return (b[off] & 0xff) | (b[off + 1] & 0xff) << 8
+                | (b[off + 2] & 0xff) << 16 | (b[off + 3] & 0xff) << 24;
     }
 
     /**

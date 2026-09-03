@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #include <android/log.h>
@@ -25,6 +26,12 @@
 #define CHARA_STRIDE      0x154
 // cSfcWork::GetSendBtlDataa(): ldr x0, [x0, 0xc0f0]; ret -- heap ptr to battle data.
 #define GETSENDBTLDATA_OFFSET 0xc0f0
+// ChronoCanvas::getFieldMapName() (0x5577a0) loads the current field-map id
+// via `ldrsw x11, [x9, #0x98c]` where x9 = this+0x11974, i.e. the id is a
+// plain sign-extended int32 at ChronoCanvas+0x12300. The ctor independently
+// places this inside the embedded FIELD_MAp struct at canvas+0x112e8, so the
+// id also reads as FIELD_MAp+0x1018 -- see fieldmap_id_report.md.
+#define FIELD_MAP_ID_OFFSET 0x12300
 
 static void *(*p_getInstance)(void);
 static uint8_t **g_asm_mem_slot;  // libchrono base + 0xbeeba8: virtual SNES memory ptr
@@ -40,6 +47,11 @@ static void  (*p_node_setPosition)(void *, const void *); // (this, const Vec2*)
 // instead of only dimming the container itself.
 static void  (*p_setCascadeOpacityEnabledRecursive)(void *, int);
 static void  (*p_node_setOpacity)(void *, uint8_t); // instance: (this, GLubyte)
+// nsBattleListMenu::BattleListMenuBase::getElement(int) const -- bounds-
+// checked accessor into the submenu's row button Node tree (ScrollView's
+// inner container, not exposed via Node::getChildren -- see collect_battle_
+// list). Returns the row's button Node* or NULL if out of range.
+static void  *(*p_list_getElement)(void *, int);
 
 // cocos2d::Size/Vec2 are HFAs (two floats) -- returned in s0/s1 per the arm64
 // AAPCS, so plain C struct-by-value declarations match the real ABI.
@@ -169,6 +181,8 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeAttach(JNIEnv *env, jclass cls) 
     p_setCascadeOpacityEnabledRecursive = (void (*)(void *, int))
         dlsym(h, "_ZN13nsSpriteUtils33setCascadeOpacityEnabledRecursiveEPN7cocos2d4NodeEb");
     p_node_setOpacity = (void (*)(void *, uint8_t)) dlsym(h, "_ZN7cocos2d4Node10setOpacityEh");
+    p_list_getElement = (void *(*)(void *, int))
+        dlsym(h, "_ZNK16nsBattleListMenu18BattleListMenuBase10getElementEi");
     LOGI("attach: getInstance=%p canvas=%p asm_slot=%p director=%p", (void *)p_getInstance,
          p_getInstance ? p_getInstance() : NULL, (void *)g_asm_mem_slot,
          (void *)p_dir_getInstance);
@@ -304,6 +318,63 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeUpdateMapName(JNIEnv *env, jclas
 JNIEXPORT jstring JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeGetMapName(JNIEnv *env, jclass cls) {
     return (*env)->NewStringUTF(env, g_map_name);
+}
+
+// Current field-map/location id, straight off ChronoCanvas -- a plain int32
+// read (no scene-graph walk), so unlike nativeUpdateMapName this is safe to
+// call from any thread. -1 when the canvas or the read is unavailable.
+JNIEXPORT jint JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetFieldMapId(JNIEnv *env, jclass cls) {
+    if (!p_getInstance) return -1;
+    uint8_t *canvas = (uint8_t *)p_getInstance();
+    if (!canvas) return -1;
+    int32_t id;
+    if (!safe_read(canvas + FIELD_MAP_ID_OFFSET, &id, sizeof(id))) return -1;
+    return (jint) id;
+}
+
+// Party leader's in-field tile position, from the CHARACTER_DATa record for
+// party slot 1 (record index 1, i.e. cSfcWork + CHARA_BASE + 1*CHARA_STRIDE
+// -- same base/stride as nativeReadChara). Verified live by differential
+// dumps: int32 X tile @+0x80, int32 X*256 sub-tile @+0x84, int32 Y tile
+// @+0x8c, int32 Y*256 sub-tile @+0x90 (Y grows downward). Only meaningful in
+// field maps, not on the overworld. Plain safe_read, so like
+// nativeGetFieldMapId this is safe to call from any thread. Returns [x, y]
+// as floats (sub-tile / 256.0f, preferred for sub-pixel precision; falls
+// back to the plain tile ints if the sub-tile read fails), or NULL if the
+// record is unreadable.
+#define FIELD_POS_X_TILE_OFFSET  0x80
+#define FIELD_POS_X_SUB_OFFSET   0x84
+#define FIELD_POS_Y_TILE_OFFSET  0x8c
+#define FIELD_POS_Y_SUB_OFFSET   0x90
+
+JNIEXPORT jfloatArray JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetFieldPos(JNIEnv *env, jclass cls) {
+    uint8_t *sfc = sfc_work();
+    if (!sfc) return NULL;
+    uint8_t *rec = sfc + CHARA_BASE + 1 * CHARA_STRIDE;
+
+    int32_t xSub, ySub;
+    int gotXSub = safe_read(rec + FIELD_POS_X_SUB_OFFSET, &xSub, sizeof(xSub));
+    int gotYSub = safe_read(rec + FIELD_POS_Y_SUB_OFFSET, &ySub, sizeof(ySub));
+
+    float x, y;
+    if (gotXSub && gotYSub) {
+        x = xSub / 256.0f;
+        y = ySub / 256.0f;
+    } else {
+        int32_t xTile, yTile;
+        if (!safe_read(rec + FIELD_POS_X_TILE_OFFSET, &xTile, sizeof(xTile))) return NULL;
+        if (!safe_read(rec + FIELD_POS_Y_TILE_OFFSET, &yTile, sizeof(yTile))) return NULL;
+        x = (float) xTile;
+        y = (float) yTile;
+    }
+
+    jfloatArray arr = (*env)->NewFloatArray(env, 2);
+    if (!arr) return NULL;
+    float buf[2] = { x, y };
+    (*env)->SetFloatArrayRegion(env, arr, 0, 2, buf);
+    return arr;
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +576,21 @@ static void collect_toggles_rec(void *node, int depth, int max_depth, int ancest
 // RTTI type name contains "SceneBattle" somewhere under the running scene.
 // (An earlier heuristic read a flag byte at cSfcWork+0x7651; that proved
 // wrong -- it read 0 during a real battle -- and is replaced by this.)
+// Battle list submenu (Tech/Item) cache -- declared here (statics must
+// precede use) so nativeUpdateBattleFlag below can reset it on battle-end;
+// filled by collect_battle_list, defined further down with the rest of the
+// scan (after g_battle_toggles/nativeGetBattleToggles) but called from here
+// so it runs in the same GL-thread scan/cadence that fills g_battle_toggles.
+#define MAX_BATTLE_LIST_ROWS 64
+typedef struct { int32_t id; int usable; int32_t extra; float x, y; } BattleListRow;
+static int g_battle_list_kind = -1; // -1 none, 0 Tech, 1 Item
+static int g_battle_list_count;
+static BattleListRow g_battle_list_rows[MAX_BATTLE_LIST_ROWS];
+// Rate-limit the summary log line to once per kind/count change.
+static int g_last_logged_list_kind = -2;
+static int g_last_logged_list_count = -1;
+static void collect_battle_list(void *battle_node);
+
 JNIEXPORT void JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeUpdateBattleFlag(JNIEnv *env, jclass cls) {
     void *scene = find_running_scene();
@@ -517,6 +603,7 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeUpdateBattleFlag(JNIEnv *env, jc
         const char *tn = type_name(node, tb, sizeof(tb));
         LOGI("battle node: %p type=%s", node, tn ? tn : "?");
         collect_toggles_rec(node, 0, 3, 1);
+        collect_battle_list(node);
         for (int i = 0; i < g_battle_toggle_count; i++) {
             if (g_battle_toggles[i].visible) {
                 LOGI("battle toggle[%d]: x=%.1f y=%.1f vis=1", i,
@@ -537,6 +624,10 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeUpdateBattleFlag(JNIEnv *env, jc
         }
     } else {
         g_last_logged_selected = -1; // battle ended/not found -- reset so re-entry logs fresh
+        g_battle_list_kind = -1;
+        g_battle_list_count = 0;
+        g_last_logged_list_kind = -2;
+        g_last_logged_list_count = -1;
     }
     if (g_in_battle != g_battle_was) {
         LOGI("battle %s", g_in_battle ? "started" : "ended");
@@ -571,6 +662,230 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleToggles(JNIEnv *env, jc
         }
         (*env)->SetFloatArrayRegion(env, arr, 0, count * 5, buf);
     }
+    return arr;
+}
+
+// ---------------------------------------------------------------------------
+// Battle list submenus (Tech/Item): mirror whichever BattleTechMenu/
+// BattleItemMenu is currently open (BattleListMenuBase offsets from NOTES.md
+// "Battle UI hiding, battle MP, list submenus" RE record). Collected in the
+// same GL-thread scan that fills g_battle_toggles above (called from
+// nativeUpdateBattleFlag, right after collect_toggles_rec), so it shares its
+// thread/cadence. GL thread only -- touches the live scene graph.
+// ---------------------------------------------------------------------------
+
+// BattleListMenuBase (this-relative) member offsets, arm64.
+#define BATTLELIST_SCROLLVIEW  0x330
+#define BATTLELIST_ISOPEN      0x380
+#define BATTLELIST_VEC_BEGIN   0x388
+#define BATTLELIST_VEC_END     0x390
+#define BATTLELIST_ROW_STRIDE  12
+
+// MAX_BATTLE_LIST_ROWS, BattleListRow, g_battle_list_kind/count/rows and
+// g_last_logged_list_kind/count are declared earlier, right before
+// nativeUpdateBattleFlag (statics must precede use there too).
+
+// Reads the on-screen row-button node for row `i` and its world center.
+// Preferred path: BattleListMenuBase::getElement(int) const, a bounds-
+// checked accessor the game itself uses (getButton/scrollToChildIfNeeded)
+// to reach the row buttons -- this is required because cocos2d::ui::
+// ScrollView overrides the virtual getChildren() to return its *inner
+// container's* children, so the dlsym'd non-virtual Node::getChildren on
+// the ScrollView object sees an empty vector (confirmed live: children=-1
+// on a depth-9 scene dump with the Tech list open). Only called when
+// `use_getElement` (p_list_getElement resolved AND the submenu's vtable
+// checked in-library) is set. Falls back to a direct ScrollView child-
+// vector walk (rc_begin/rc_end from resolve_row_container) only when
+// getElement isn't available -- kept as a last-resort path, not expected to
+// find real rows given the above (ScrollView's own children are empty; a
+// nested container might still work by luck, so it's not removed outright).
+static void battle_list_row_pos(int use_getElement, void *submenu_node,
+                                 void **rc_begin, void **rc_end, int i, float *ox, float *oy) {
+    *ox = NAN;
+    *oy = NAN;
+    if (use_getElement) {
+        void *rownode = p_list_getElement(submenu_node, i);
+        if (!plausible_ptr(rownode)) return;
+        char tb[96];
+        if (!type_name(rownode, tb, sizeof(tb))) return; // incoherent RTTI -> not a live object
+        node_world_center(rownode, ox, oy); // leaves *ox/*oy untouched (still NaN) on failure
+        return;
+    }
+    if (!rc_begin || (rc_begin + i) >= rc_end) return;
+    void *rownode;
+    if (!safe_read(rc_begin + i, &rownode, 8) || !plausible_ptr(rownode)) return;
+    node_world_center(rownode, ox, oy); // leaves *ox/*oy untouched (still NaN) on failure
+}
+
+// Fallback-only (see battle_list_row_pos): given a resolved node whose
+// direct children vector holds `want_count` or more entries, tries the node
+// itself first, then (cocos2d-x ui::ScrollView wraps an inner container)
+// its first child that has enough children of its own. Returns 1 and fills
+// *out_begin/*out_end on success.
+static int resolve_row_container(void *scrollview, int want_count, void ***out_begin, void ***out_end) {
+    if (!scrollview || !vtable_in_libchrono(scrollview) || !p_node_getChildren) return 0;
+    void *svvecp = p_node_getChildren(scrollview);
+    void *svptrs[2];
+    if (!safe_read(svvecp, svptrs, 16)) return 0;
+    void **sb = (void **)svptrs[0], **se = (void **)svptrs[1];
+    if (!plausible_any(sb) || !plausible_any(se) || se < sb || (se - sb) > 512) return 0;
+    if ((int)(se - sb) >= want_count) {
+        *out_begin = sb;
+        *out_end = se;
+        return 1;
+    }
+    for (void **c = sb; c < se; c++) {
+        void *child;
+        if (!safe_read(c, &child, 8)) continue;
+        if (!vtable_in_libchrono(child) || !p_node_getChildren) continue;
+        void *cvecp = p_node_getChildren(child);
+        void *cptrs[2];
+        if (!safe_read(cvecp, cptrs, 16)) continue;
+        void **cb = (void **)cptrs[0], **ce = (void **)cptrs[1];
+        if (!plausible_any(cb) || !plausible_any(ce) || ce < cb || (ce - cb) > 512) continue;
+        if ((int)(ce - cb) >= want_count) {
+            *out_begin = cb;
+            *out_end = ce;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Populates g_battle_list_kind/count/rows from whichever BattleTechMenu/
+// BattleItemMenu direct child of `battle_node` is currently open. Clears the
+// cache (kind=-1, count=0) when none or more-than-one is open, or on any
+// validation failure -- matches nativeGetBattleList's "NULL when no submenu
+// is open" contract.
+static void collect_battle_list(void *battle_node) {
+    g_battle_list_kind = -1;
+    g_battle_list_count = 0;
+    if (!battle_node || !p_node_getChildren) return;
+    void *vecp = p_node_getChildren(battle_node);
+    void *ptrs[2];
+    if (!safe_read(vecp, ptrs, 16)) return;
+    void **begin = (void **)ptrs[0], **end = (void **)ptrs[1];
+    if (!plausible_any(begin) || !plausible_any(end) || end < begin || (end - begin) > 512) return;
+
+    void *tech_node = NULL, *item_node = NULL;
+    for (void **c = begin; c < end; c++) {
+        void *child;
+        if (!safe_read(c, &child, 8)) continue;
+        char tb[96];
+        const char *tn = type_name(child, tb, sizeof(tb));
+        if (!tn) continue;
+        if (strcmp(tn, "N16nsBattleListMenu14BattleTechMenuE") == 0) tech_node = child;
+        else if (strcmp(tn, "N16nsBattleListMenu14BattleItemMenuE") == 0) item_node = child;
+    }
+
+    int open_kind = -1;
+    void *open_node = NULL;
+    uint8_t isopen;
+    if (tech_node && safe_read((uint8_t *)tech_node + BATTLELIST_ISOPEN, &isopen, 1) && isopen) {
+        open_kind = 0;
+        open_node = tech_node;
+    }
+    if (item_node && safe_read((uint8_t *)item_node + BATTLELIST_ISOPEN, &isopen, 1) && isopen) {
+        if (open_kind != -1) return; // both open -- ambiguous, bail (spec: exactly one)
+        open_kind = 1;
+        open_node = item_node;
+    }
+    if (open_kind == -1 || !open_node) return;
+    // Row reads below (getElement call included) require a live vtable, not
+    // just a coherent-looking one -- see vtable_in_libchrono's comment.
+    if (!vtable_in_libchrono(open_node)) return;
+
+    uint64_t vbegin, vend;
+    if (!safe_read((uint8_t *)open_node + BATTLELIST_VEC_BEGIN, &vbegin, 8)) return;
+    if (!safe_read((uint8_t *)open_node + BATTLELIST_VEC_END, &vend, 8)) return;
+    if (!plausible_any((void *)vbegin) || !plausible_any((void *)vend) || vend < vbegin) return;
+    uint64_t nbytes = vend - vbegin;
+    if (nbytes % BATTLELIST_ROW_STRIDE != 0) return;
+    int count = (int)(nbytes / BATTLELIST_ROW_STRIDE);
+    if (count < 0 || count > MAX_BATTLE_LIST_ROWS) return;
+
+    // Preferred row-position path: BattleListMenuBase::getElement(int) --
+    // already gated on isOpen (open_kind resolved above) and vtable_in_
+    // libchrono(open_node) (checked above). Only fall back to the raw
+    // ScrollView child-vector walk when getElement isn't resolvable, since
+    // ui::ScrollView's overridden getChildren() means that walk normally
+    // finds nothing (see battle_list_row_pos comment).
+    int use_getElement = p_list_getElement != NULL;
+    void **rc_begin = NULL, **rc_end = NULL;
+    if (!use_getElement) {
+        void *scrollview = NULL;
+        safe_read((uint8_t *)open_node + BATTLELIST_SCROLLVIEW, &scrollview, 8);
+        resolve_row_container(scrollview, count, &rc_begin, &rc_end); // leaves both NULL on failure
+    }
+
+    for (int i = 0; i < count; i++) {
+        uint8_t rowbuf[BATTLELIST_ROW_STRIDE];
+        BattleListRow *out = &g_battle_list_rows[i];
+        if (!safe_read((uint8_t *)vbegin + (size_t)i * BATTLELIST_ROW_STRIDE, rowbuf, BATTLELIST_ROW_STRIDE)) {
+            out->id = 0;
+            out->usable = 0;
+            out->extra = 0;
+            out->x = NAN;
+            out->y = NAN;
+            continue;
+        }
+        int32_t id, extra;
+        uint8_t usable;
+        memcpy(&id, rowbuf + 0, 4);
+        if (open_kind == 0) { // Tech: id, param, usable
+            memcpy(&extra, rowbuf + 4, 4);
+            usable = rowbuf[8];
+        } else { // Item: id, usable, pad, count
+            usable = rowbuf[4];
+            memcpy(&extra, rowbuf + 8, 4);
+        }
+        out->id = id;
+        out->usable = usable ? 1 : 0;
+        out->extra = extra;
+        battle_list_row_pos(use_getElement, open_node, rc_begin, rc_end, i, &out->x, &out->y);
+    }
+
+    g_battle_list_kind = open_kind;
+    g_battle_list_count = count;
+
+    if (open_kind != g_last_logged_list_kind || count != g_last_logged_list_count) {
+        LOGI("battle-list: kind=%d count=%d first id=%d usable=%d pos=(%.1f,%.1f)",
+             open_kind, count,
+             count > 0 ? g_battle_list_rows[0].id : 0,
+             count > 0 ? g_battle_list_rows[0].usable : 0,
+             count > 0 ? g_battle_list_rows[0].x : 0.0f,
+             count > 0 ? g_battle_list_rows[0].y : 0.0f);
+        g_last_logged_list_kind = open_kind;
+        g_last_logged_list_count = count;
+    }
+}
+
+// Cached battle list submenu (Tech/Item), populated on the GL thread by
+// nativeUpdateBattleFlag right after the battle toggle scan. Returns NULL
+// when no submenu is open; otherwise a float array laid out as:
+//   [kind, count, id0, usable0, extra0, x0, y0, id1, usable1, extra1, x1, y1, ...]
+// kind is 0 (Tech) or 1 (Item); usable is 0.0/1.0; extra is the tech's param
+// (cost) or the item's count, cast to float; x/y are worldspace pixels in
+// the same space as nativeGetBattleToggles, or NaN when the row's on-screen
+// button node couldn't be resolved (Java should skip tapping that row). Safe
+// to call from any thread -- plain read of the cached array.
+JNIEXPORT jfloatArray JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleList(JNIEnv *env, jclass cls) {
+    if (g_battle_list_kind < 0) return NULL;
+    int count = g_battle_list_count;
+    jfloatArray arr = (*env)->NewFloatArray(env, 2 + count * 5);
+    if (!arr) return NULL;
+    float buf[2 + MAX_BATTLE_LIST_ROWS * 5];
+    buf[0] = (float) g_battle_list_kind;
+    buf[1] = (float) count;
+    for (int i = 0; i < count; i++) {
+        buf[2 + i * 5 + 0] = (float) g_battle_list_rows[i].id;
+        buf[2 + i * 5 + 1] = g_battle_list_rows[i].usable ? 1.0f : 0.0f;
+        buf[2 + i * 5 + 2] = (float) g_battle_list_rows[i].extra;
+        buf[2 + i * 5 + 3] = g_battle_list_rows[i].x;
+        buf[2 + i * 5 + 4] = g_battle_list_rows[i].y;
+    }
+    (*env)->SetFloatArrayRegion(env, arr, 0, 2 + count * 5, buf);
     return arr;
 }
 
@@ -849,16 +1164,37 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetBattleHideMask(JNIEnv *env, j
 //   - cocos2d::Node (exact, plain engine) -- the HP/MP number label group
 //   - cocos2d::Label (exact)              -- the "Attack"/"Tech"/"Item" text
 // The nsBattleListMenu::BattleTechMenu / BattleItemMenu submenus (and
-// anything else with "Battle" in its RTTI name) are deliberately excluded:
-// we don't mirror their list contents on the bottom screen yet, so hiding
-// them would leave tech/item selection invisible everywhere. Damage numbers
-// and the target cursor live outside this set and are unaffected.
+// anything else with "Battle" in its RTTI name) are excluded by default: we
+// don't mirror their list contents on the bottom screen yet, so hiding them
+// would leave tech/item selection invisible everywhere. Damage numbers and
+// the target cursor live outside this set and are unaffected. Once
+// nativeGetBattleList's mirror is wired up on the Java side,
+// nativeSetHideBattleSubmenus(true) opts the two list menus into hiding too
+// (see g_hide_battle_submenus below).
 // The matching node gets cascade-opacity enabled (so setOpacity below
 // actually propagates to children instead of only dimming the container),
 // then setOpacity(0) applied EVERY tick, since the game may reassert its own
 // opacity whenever the menu (re)opens.
+
+// Java-settable opt-in (see nativeSetHideBattleSubmenus) to also hide the
+// BattleTechMenu/BattleItemMenu submenu nodes once their contents are
+// mirrored via nativeGetBattleList. Defaults to disabled -- see comment
+// above should_hide_battle_child.
+static int g_hide_battle_submenus = 0;
+
+JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeSetHideBattleSubmenus(JNIEnv *env, jclass cls,
+                                                                       jboolean hide) {
+    g_hide_battle_submenus = hide ? 1 : 0;
+}
+
 static int should_hide_battle_child(const char *tn) {
     if (!tn) return 0;
+    if (g_hide_battle_submenus &&
+            (strcmp(tn, "N16nsBattleListMenu14BattleTechMenuE") == 0 ||
+             strcmp(tn, "N16nsBattleListMenu14BattleItemMenuE") == 0)) {
+        return 1;
+    }
     if (strstr(tn, "Battle")) return 0;
     if (strstr(tn, "cocos2d") && strstr(tn, "4MenuE")) return 1;
     if (strcmp(tn, "N7cocos2d13RenderTextureE") == 0) return 1;

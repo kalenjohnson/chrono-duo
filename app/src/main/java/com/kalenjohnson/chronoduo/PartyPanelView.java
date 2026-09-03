@@ -17,6 +17,7 @@ import android.view.View;
 
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 
@@ -33,6 +34,13 @@ import java.util.Random;
  * (or at all).
  */
 public final class PartyPanelView extends View implements ChronoAssets.Listener {
+    // Blanks the top-screen Tech/Item submenu lists (see
+    // GameState.nativeSetHideBattleSubmenus) so this panel's own submenu-list
+    // band (drawSubmenuList) is the only place they're shown -- flip off in
+    // one place if the native-side hiding ever misbehaves. Read by
+    // AppActivity at startup.
+    public static boolean HIDE_SUBMENUS = true;
+
     // face.png layout: 4x2 grid of 96x88 tiles, char-id order (Crono..Magus,
     // Epoch); char ids 0..6 line up with PartySnapshot.DEFAULT_NAMES.
     private static final int FACE_TILE_W = 96;
@@ -71,6 +79,17 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private static final int BOX_BORDER_OUT = Color.rgb(222, 222, 230);
     private static final int BOX_BORDER_IN = Color.rgb(90, 96, 150);
     // parchment palette
+    // Dev aid: draws the numeric field-map id next to the location name on
+    // the indoor/area-map panel, for lining up rendered area_minimap_%03d.png
+    // files with live ids while building out the ds_maps/ set. Never shown
+    // once that set is complete -- flip off then.
+    private static final boolean SHOW_MAP_ID = false;
+    // Dev calibration readout: appends the live field-tile position (one
+    // decimal place) to the field-mode location title, so a player can
+    // report on-screen positions to calibrate AreaMapCalib's per-map
+    // transforms. Cheap (a single formatted string per draw) -- see
+    // drawFieldContent.
+    private static final boolean SHOW_FIELD_POS = true;
     private static final int PAPER = Color.rgb(214, 197, 158);
     private static final int PAPER_DARK = Color.rgb(150, 128, 88);
     private static final int PAPER_EDGE = Color.rgb(94, 74, 44);
@@ -128,6 +147,23 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // battle ending).
     private static final long TARGETING_DURATION_NANOS = 8_000_000_000L;
     private long targetingUntil = -1L;
+
+    // Double-A fix: after a successful command or list-row confirm,
+    // snap.menuOpen/listOpen can stay true for up to one poll interval
+    // (the snapshot is one read behind the game), which would otherwise let
+    // a fast second A press get consumed again by this panel's own nav and
+    // dropped -- instead of reaching the game as the native A press that
+    // confirms the just-armed target. While pendingMenuClose is true,
+    // onControllerConfirm() refuses to consume A at all (returns false), so
+    // that second press passes straight through. pendingCloseIsCommand says
+    // which snapshot field to watch for the close: true after a command
+    // confirm (clear on menuOpen == false), false after a list-row confirm
+    // (clear on listOpen == false) -- see update(). pendingMenuCloseAt is a
+    // safety-timeout deadline in case the expected close is never observed.
+    private boolean pendingMenuClose;
+    private boolean pendingCloseIsCommand;
+    private long pendingMenuCloseAt = -1L;
+    private static final long PENDING_CLOSE_TIMEOUT_NANOS = 1_500_000_000L;
     // Left-/right-triangle glyphs written as unicode escapes rather than raw
     // UTF-8 bytes -- this file has had no non-ASCII characters until now, so
     // there's no evidence javac's source encoding is set to UTF-8 for this
@@ -143,22 +179,36 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private static final long CONFIRM_COOLDOWN_NANOS = 250_000_000L;
 
     // Submenu-list phase: tapping Tech or Item (injectCommand idx 1/2) opens
-    // the game's own scrollable tech/item list instead of arming target
-    // selection directly, so the on-panel band offers up/down/confirm/back
-    // navigation for it instead of the targeting arrows. Mirrors targeting's
-    // deadline-based isTargetingActive() pattern: listUntil is a nanoTime
-    // deadline (-1 when inactive), computed live each frame in
-    // isListActive() rather than cached. List-Confirm (a tech/item got
-    // picked) transitions straight into TARGETING mode -- selection is
-    // always followed by target selection -- while List-Back or either of
-    // targeting's own exits (next menu open, battle end) just clear it.
-    private static final long LIST_DURATION_NANOS = 15_000_000_000L;
-    private long listUntil = -1L;
-    // Up-/down-triangle glyphs, same unicode-escape rule as TARGET_LABELS.
-    private static final String[] LIST_LABELS = {"\u25B2", "\u25BC", "Confirm", "Back"};
-    // Hit rects for the four list buttons: 0=up, 1=down, 2=confirm, 3=back.
-    private final RectF[] listHitBoxes = {new RectF(), new RectF(), new RectF(), new RectF()};
-    private int listCount;
+    // the game's own scrollable tech/item list; the panel mirrors it
+    // directly from the live snapshot (snap.listOpen/listRows -- see
+    // PartySnapshot), rather than a timer-based band like targeting's, since
+    // the game itself reports exactly when the submenu is open and what it
+    // holds. listSel is the panel-owned selected row (independent of the
+    // game's own cursor, same spirit as commandSel), reset to 0 whenever the
+    // submenu newly opens or its kind changes -- see update().
+    private int listSel;
+    // Row height (fraction of view height) and the max number of rows shown
+    // at once before the list starts scrolling -- see computeListVisibleRows/
+    // listBandRect.
+    private static final float LIST_ROW_H_FRAC = 0.058f;
+    private static final int LIST_MAX_ROWS = 6;
+    // Hit rects for the currently-drawn window of rows (0..listVisibleCount-1,
+    // mapped to absolute row index via listWindowStart), updated only while
+    // drawing the live snapshot -- same pattern as commandHitBoxes.
+    private final RectF[] listRowHitBoxes = {
+            new RectF(), new RectF(), new RectF(), new RectF(), new RectF(), new RectF(),
+    };
+    private int listVisibleCount;
+    private int listWindowStart;
+    // Small "back" chip (top-left corner, mirroring the eye toggle's
+    // top-right position), shown only while the submenu-list band is up --
+    // taps it like the game's own B/cancel would. Not part of the row list
+    // spec itself, but without it a touch-only player has no way out of the
+    // submenu (the game's real B button is deliberately left unconsumed --
+    // see GameControllerInput -- but touch has no B button to fall back on).
+    private final RectF listBackHitBox = new RectF();
+    private static final float BACK_GLYPH_RADIUS = 12f;
+    private static final float BACK_HIT_HALF = 24f;
 
     private static final int[] PORTRAIT_COLORS = {
             Color.rgb(196, 84, 40), Color.rgb(120, 180, 230), Color.rgb(120, 200, 120),
@@ -175,6 +225,13 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // marker tile: same nearest-neighbor upscale as the map, but kept fully
     // opaque (unlike mapPaint) so it stays crisp on top of the sepia map
     private final Paint markerPaint = new Paint();
+    // Src/dst rects computed by the most recent drawAreaMapBitmap() call --
+    // exposed so the field-position marker (drawFieldContent) can map a
+    // point through the same crop/scale without recomputing it. areaMapSrc
+    // is in the original 256x192 DS image's pixel space; areaMapDst is the
+    // on-screen rect it was drawn into.
+    private final Rect areaMapSrc = new Rect();
+    private final RectF areaMapDst = new RectF();
     private final Path speckles = new Path();
     private int speckleW, speckleH;
     // torn-paper outline: dark-edge path is the full parchment rect walked
@@ -245,10 +302,17 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 }
             }
         }
-        if (isListActive(System.nanoTime()) && listCount > 0) {
-            for (int i = 0; i < listCount; i++) {
-                if (listHitBoxes[i].contains(event.getX(), event.getY())) {
-                    injectList(i);
+        if (snap.inBattle && snap.listOpen && !listBackHitBox.isEmpty()
+                && listBackHitBox.contains(event.getX(), event.getY())) {
+            backList();
+            return true;
+        }
+        if (snap.inBattle && snap.listOpen && listVisibleCount > 0) {
+            for (int i = 0; i < listVisibleCount; i++) {
+                if (listRowHitBoxes[i].contains(event.getX(), event.getY())) {
+                    int idx = listWindowStart + i;
+                    listSel = idx;
+                    confirmListRow(idx);
                     return true;
                 }
             }
@@ -267,15 +331,21 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     }
 
     /**
-     * True while the submenu-list band (Tech/Item navigation) should be
-     * shown/hit-testable -- same shape as {@link #isTargetingActive} but
-     * gated on {@link #listUntil} instead. Targeting and list mode are
-     * mutually exclusive: arming one always clears the other (see {@link
-     * #injectCommand} and {@link #injectList}), so at most one of the two is
-     * ever true for a given snapshot.
+     * True exactly when the panel-owned submenu-list row selection
+     * ({@link #listSel}) is the thing that should react to up/down/confirm
+     * navigation -- in battle, with a live Tech/Item submenu open, and at
+     * least one row to select. Mirrors {@link #commandNavActive}. Also
+     * excludes {@link #isTargetingActive}: a row confirm arms targeting
+     * immediately (see {@link #confirmListRow}) while {@code snap.listOpen}
+     * is still true for one more poll (it's snapshot-driven, one read behind
+     * the game), so without this check a controller A press meant for the
+     * just-opened targeting band would be swallowed here instead -- same
+     * reasoning as {@link #drawTargetingButtons}/{@link #drawSubmenuList}'s
+     * mutual exclusion in {@link #onDraw}.
      */
-    private boolean isListActive(long now) {
-        return snap.inBattle && !snap.menuOpen && listUntil > 0 && now < listUntil;
+    private boolean listNavActive() {
+        return snap.inBattle && snap.listOpen && !snap.listRows.isEmpty()
+                && !isTargetingActive(System.nanoTime());
     }
 
     /**
@@ -303,36 +373,54 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     }
 
     /**
-     * Injects list-navigation input for submenu-list button {@code idx}
-     * (0=up, 1=down, 2=confirm, 3=back) via {@link TargetingInput}, cooldown-
-     * guarded like {@link #injectTarget} (up/down share {@link
-     * #ARROW_COOLDOWN_NANOS}/{@link #lastArrowInjectAt} with the targeting
-     * arrows; confirm/back share {@link #CONFIRM_COOLDOWN_NANOS}/{@link
-     * #lastConfirmInjectAt} with targeting's confirm -- list and targeting
-     * are never active at the same time, so sharing the cooldown clocks is
-     * safe). Confirm means a tech/item was just picked, so it transitions
-     * straight into {@link #TARGETING_DURATION_NANOS} of targeting mode
-     * rather than merely clearing list mode. Back leaves the submenu with no
-     * further mode armed.
+     * Confirms submenu-list row {@code idx} -- either the panel-owned
+     * {@link #listSel} (controller/keyboard confirm) or a directly-tapped
+     * row (see {@link #onTouchEvent}, which also sets {@link #listSel} to
+     * match first). Taps the row's live game-screen coordinates via
+     * {@link BattleInput}, cooldown-guarded like {@link #injectCommand}'s
+     * confirm (shares {@link #lastConfirmInjectAt}/{@link
+     * #CONFIRM_COOLDOWN_NANOS}). A no-op when the row's position isn't known
+     * yet ({@link PartySnapshot.ListRow#x}/{@code y} NaN) so a bad tap never
+     * fires blind. Also a no-op when the row itself is marked unusable ({@link
+     * PartySnapshot.ListRow#usable} false) -- refused with no tap and no
+     * targeting arm, from either a controller confirm or a direct row tap
+     * (see {@link #onTouchEvent}, which reaches this the same way). Selecting
+     * a usable tech/item always leads to target selection next, so this arms
+     * {@link #targetingUntil} exactly like a successful Attack tap through
+     * {@link #injectCommand} would.
      */
-    private void injectList(int idx) {
+    private void confirmListRow(int idx) {
+        if (!snap.inBattle || !snap.listOpen) return;
+        if (idx < 0 || idx >= snap.listRows.size()) return;
+        PartySnapshot.ListRow row = snap.listRows.get(idx);
+        if (!row.usable) return;
+        if (Float.isNaN(row.x) || Float.isNaN(row.y)) return;
         long now = System.nanoTime();
-        if (idx == 2) { // confirm
-            if (lastConfirmInjectAt >= 0 && now - lastConfirmInjectAt < CONFIRM_COOLDOWN_NANOS) return;
-            lastConfirmInjectAt = now;
-            TargetingInput.confirm();
-            listUntil = -1L;
-            targetingUntil = now + TARGETING_DURATION_NANOS;
-        } else if (idx == 3) { // back
-            if (lastConfirmInjectAt >= 0 && now - lastConfirmInjectAt < CONFIRM_COOLDOWN_NANOS) return;
-            lastConfirmInjectAt = now;
-            TargetingInput.back();
-            listUntil = -1L;
-        } else {
-            if (lastArrowInjectAt >= 0 && now - lastArrowInjectAt < ARROW_COOLDOWN_NANOS) return;
-            lastArrowInjectAt = now;
-            if (idx == 0) TargetingInput.up(); else TargetingInput.down();
-        }
+        if (lastConfirmInjectAt >= 0 && now - lastConfirmInjectAt < CONFIRM_COOLDOWN_NANOS) return;
+        lastConfirmInjectAt = now;
+        BattleInput.tap(row.x, row.y);
+        targetingUntil = now + TARGETING_DURATION_NANOS;
+        pendingMenuClose = true;
+        pendingCloseIsCommand = false;
+        pendingMenuCloseAt = now;
+        invalidate();
+    }
+
+    /**
+     * Backs out of the submenu list via {@link TargetingInput#back()} --
+     * the game closes it on its own, and {@code snap.listOpen} simply flips
+     * false on the next snapshot. Cooldown-guarded like {@link
+     * #confirmListRow} (shares the same clock/duration -- the two never fire
+     * in the same gesture). Only reachable from the touch-only {@link
+     * #listBackHitBox} chip; the physical controller's B button is
+     * deliberately left unconsumed so the game's own cancel handling applies
+     * (see GameControllerInput).
+     */
+    private void backList() {
+        long now = System.nanoTime();
+        if (lastConfirmInjectAt >= 0 && now - lastConfirmInjectAt < CONFIRM_COOLDOWN_NANOS) return;
+        lastConfirmInjectAt = now;
+        TargetingInput.back();
         invalidate();
     }
 
@@ -344,9 +432,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      * never fires more than once per {@link #INJECT_COOLDOWN_NANOS} (one
      * in-flight tap at a time). Also arms the brief pressed-button visual
      * feedback. Which follow-up mode gets armed depends on what was tapped:
-     * Attack (idx 0) goes straight to target selection, as before; Tech/Item
-     * (idx 1/2) open the submenu-list band instead, since those commands
-     * present the game's own tech/item list before a target is chosen.
+     * Attack (idx 0) goes straight to target selection; Tech/Item (idx 1/2)
+     * open the game's own submenu list instead (mirrored by the panel's
+     * submenu-list band -- see {@link #drawSubmenuList}, driven directly by
+     * {@code snap.listOpen} rather than anything armed here).
      */
     private void injectCommand(int idx) {
         if (!snap.inBattle || !snap.menuOpen) return;
@@ -358,13 +447,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         pressedAt = now;
         PartySnapshot.CommandTarget t = snap.commandTargets.get(idx);
         BattleInput.tap(t.x, t.y);
-        if (idx == 0) {
-            targetingUntil = now + TARGETING_DURATION_NANOS;
-            listUntil = -1L;
-        } else {
-            listUntil = now + LIST_DURATION_NANOS;
-            targetingUntil = -1L;
-        }
+        targetingUntil = idx == 0 ? now + TARGETING_DURATION_NANOS : -1L;
+        pendingMenuClose = true;
+        pendingCloseIsCommand = true;
+        pendingMenuCloseAt = now;
         invalidate();
     }
 
@@ -410,15 +496,55 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
     /**
      * Confirms the panel-owned command selection, injecting a tap for it via
-     * {@link #injectCommand} exactly as a direct button tap would. Consumption
-     * is reported from {@link #commandNavActive} rather than
-     * {@code injectCommand}'s own return value -- {@code injectCommand} is
-     * cooldown-guarded and can silently no-op, and a false return here would
-     * make the caller forward the same press on to the game as a real button.
+     * {@link #injectCommand} exactly as a direct button tap would; when the
+     * submenu-list band is active instead (see {@link #listNavActive}),
+     * confirms {@link #listSel} via {@link #confirmListRow} instead.
+     * Consumption is reported from {@link #commandNavActive}/{@link
+     * #listNavActive} rather than either injector's own return value -- both
+     * are cooldown-guarded and can silently no-op, and a false return here
+     * would make the caller forward the same press on to the game as a real
+     * button. While {@link #pendingMenuClose} is set (a confirm just fired
+     * and the game hasn't yet reported its menu/list as closed), this
+     * refuses to consume A at all -- see that field's javadoc for why.
      */
     public boolean onControllerConfirm() {
-        if (!commandNavActive()) return false;
-        injectCommand(commandSel);
+        if (pendingMenuClose) return false;
+        if (commandNavActive()) {
+            injectCommand(commandSel);
+            return true;
+        }
+        if (listNavActive()) {
+            confirmListRow(listSel);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Moves the panel-owned submenu-list row selection ({@link #listSel}) up
+     * one row, clamped at 0 (no wrap) -- same shape as {@link
+     * #onControllerLeft}, gated on {@link #listNavActive} instead of {@link
+     * #commandNavActive}. Only meaningful while {@code snap.listOpen}; d-pad
+     * left/right are left untouched in that mode (the game uses L/R for
+     * combo tabs), so there are no matching onControllerLeft/Right list
+     * cases.
+     */
+    public boolean onControllerUp() {
+        if (!listNavActive()) return false;
+        if (listSel > 0) {
+            listSel--;
+            invalidate();
+        }
+        return true;
+    }
+
+    /** Same as {@link #onControllerUp}, moving down and clamping at {@code snap.listRows.size() - 1}. */
+    public boolean onControllerDown() {
+        if (!listNavActive()) return false;
+        if (listSel < snap.listRows.size() - 1) {
+            listSel++;
+            invalidate();
+        }
         return true;
     }
 
@@ -457,14 +583,25 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             // itself ended -- don't wait out the timeout in either case.
             targetingUntil = -1L;
         }
-        if (listUntil > 0 && (!s.inBattle || s.menuOpen)) {
-            // same two early-exit conditions as targeting, above.
-            listUntil = -1L;
+        if (pendingMenuClose) {
+            // see pendingMenuClose's javadoc: clear once the menu/list the
+            // triggering confirm was waiting on has actually closed in a
+            // fresh snapshot, or after the safety timeout either way.
+            boolean closed = pendingCloseIsCommand ? !s.menuOpen : !s.listOpen;
+            boolean timedOut = pendingMenuCloseAt >= 0
+                    && System.nanoTime() - pendingMenuCloseAt > PENDING_CLOSE_TIMEOUT_NANOS;
+            if (closed || timedOut) pendingMenuClose = false;
         }
         if (!snap.menuOpen && s.menuOpen) {
             // command menu just opened: start the panel-owned selection back
             // at Attack, matching the game's own default highlight.
             commandSel = 0;
+        }
+        if ((!snap.listOpen && s.listOpen)
+                || (snap.listOpen && s.listOpen && snap.listKind != s.listKind)) {
+            // submenu list just opened, or stayed open but switched kind
+            // (Tech <-> Item): start the panel-owned row selection back at 0.
+            listSel = 0;
         }
         snap = s;
         invalidate();
@@ -487,7 +624,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         titleFadeStart = -1L;
         fadingOutTitle = null;
         targetingUntil = -1L;
-        listUntil = -1L;
+        pendingMenuClose = false;
+        pendingMenuCloseAt = -1L;
+        listSel = 0;
         ChronoAssets.removeListener(this);
         super.onDetachedFromWindow();
     }
@@ -736,17 +875,24 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // Leave room for the command-button band (see drawCommandButtons)
         // when it's showing, so a long enemy list compresses instead of
         // drawing through the buttons.
-        // Reserve the command-button band's space whenever the command menu,
-        // the target-selection band, or the submenu-list band is showing
-        // (only ever true for the live snapshot -- see isTargetingActive/
-        // isListActive), so a long enemy list compresses instead of drawing
-        // through any of the three.
+        // Reserve the command-button band's space whenever the command menu
+        // or the target-selection band is showing (only ever true for the
+        // live snapshot -- see isTargetingActive), so a long enemy list
+        // compresses instead of drawing through either. The submenu-list
+        // band gets its own reservation below since it can grow taller than
+        // the single-row command band (see listBandRect).
         long now = System.nanoTime();
-        boolean reserveBand = s.menuOpen
-                || (live && isTargetingActive(now)) || (live && isListActive(now));
-        float areaBottom = reserveBand
-                ? parchment.bottom - h * 0.26f
-                : parchment.bottom - h * 0.09f;
+        boolean listShowing = live && s.listOpen && !s.listRows.isEmpty();
+        boolean reserveBand = s.menuOpen || (live && isTargetingActive(now));
+        float areaBottom;
+        if (listShowing) {
+            int visRows = computeListVisibleRows(parchment, s.listRows.size());
+            areaBottom = listBandRect(parchment, visRows).top;
+        } else if (reserveBand) {
+            areaBottom = parchment.bottom - h * 0.26f;
+        } else {
+            areaBottom = parchment.bottom - h * 0.09f;
+        }
         float rowH = Math.min(h * 0.075f, (areaBottom - areaTop) / n);
         float barLeft = parchment.left + w * 0.09f;
         float barRight = parchment.right - w * 0.09f;
@@ -904,31 +1050,174 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     }
 
     /**
-     * Submenu-list band: four equal-width buttons (up-triangle / down-
-     * triangle / "Confirm" / "Back", see {@link #LIST_LABELS}) in the same
-     * band position/chrome as {@link #drawCommandButtons} and {@link
-     * #drawTargetingButtons} (reusing {@link #drawCommandButton}), shown
-     * instead of both once {@link #isListActive} is true. Only ever called
-     * for the live snapshot, like {@link #drawTargetingButtons}, so always
-     * updates {@link #listHitBoxes} unconditionally.
+     * How many submenu-list rows fit on screen at once: capped at {@link
+     * #LIST_MAX_ROWS}, {@code totalRows} itself, and however many actually
+     * fit between the standard band's bottom edge and the space reserved
+     * near the parchment top for the "Battle" title -- see {@link
+     * #listBandRect}, which uses the same two edges.
      */
-    private void drawListButtons(Canvas c, RectF parchment) {
-        int w = getWidth(), h = getHeight();
-        float bandTop = parchment.bottom - h * 0.235f;
+    private int computeListVisibleRows(RectF parchment, int totalRows) {
+        int h = getHeight();
         float bandBottom = parchment.bottom - h * 0.115f;
-        float gap = w * 0.02f;
-        float totalW = parchment.width() - w * 0.09f * 2f;
-        float btnW = (totalW - gap * 3f) / 4f;
-        float x = parchment.left + w * 0.09f;
-        Bitmap winTex = ChronoAssets.getWindowTex();
+        float areaTopLimit = parchment.top + h * 0.13f;
+        float rowH = h * LIST_ROW_H_FRAC;
+        int maxFit = Math.max(1, (int) ((bandBottom - areaTopLimit) / rowH));
+        return Math.max(1, Math.min(totalRows, Math.min(LIST_MAX_ROWS, maxFit)));
+    }
 
-        for (int i = 0; i < 4; i++) {
-            RectF box = new RectF(x, bandTop, x + btnW, bandBottom);
-            drawCommandButton(c, box, LIST_LABELS[i], winTex, false);
-            listHitBoxes[i].set(box);
-            x += btnW + gap;
+    /**
+     * Submenu-list band rect: same bottom edge as the command/targeting band
+     * ({@link #drawCommandButtons}/{@link #drawTargetingButtons}), but grows
+     * upward past that band's single-row height when {@code visibleRows}
+     * calls for more room (i.e. more than one row is visible) -- see {@link
+     * #computeListVisibleRows}. Shared by {@link #drawSubmenuList} (draw)
+     * and {@link #drawBattleContent} (space reservation for the enemy bars
+     * above it) so the two always agree on where the band sits.
+     */
+    private RectF listBandRect(RectF parchment, int visibleRows) {
+        int h = getHeight();
+        float bandBottom = parchment.bottom - h * 0.115f;
+        float areaTopLimit = parchment.top + h * 0.13f;
+        float rowH = h * LIST_ROW_H_FRAC;
+        float bandTop = Math.max(areaTopLimit, bandBottom - Math.max(1, visibleRows) * rowH);
+        float inset = parchment.width() * 0.09f;
+        return new RectF(parchment.left + inset, bandTop, parchment.right - inset, bandBottom);
+    }
+
+    /**
+     * Submenu-list band: mirrors the live Tech/Item list the game itself has
+     * open (see {@code snap.listRows}), one row per entry -- name (from
+     * {@link ChronoAssets#getTechNames()}/{@link ChronoAssets#getItemNames()},
+     * falling back to "#id"), right-aligned extra readout (tech: "MP n" only
+     * when the param is &gt; 0; item: "x n"), unusable rows dimmed, and the
+     * panel-owned {@link #listSel} row highlighted with the same gold accent
+     * as the command highlight (see {@link #DEFAULT_HIGHLIGHT_COLOR}). Drawn
+     * inside one 9-sliced window panel spanning {@link #listBandRect}, which
+     * grows upward and windows/scrolls the row list to keep {@link #listSel}
+     * visible when there are more rows than {@link #computeListVisibleRows}
+     * allows on screen at once. Only ever called for the live snapshot (list
+     * state, like targeting, has no meaning to redraw for a fading-out one),
+     * so always updates {@link #listRowHitBoxes}/{@link #listVisibleCount}/
+     * {@link #listWindowStart} unconditionally, mirroring {@link
+     * #drawTargetingButtons}. Tapping a row (see {@link #onTouchEvent}) sets
+     * {@link #listSel} and confirms it via {@link #confirmListRow}.
+     */
+    private void drawSubmenuList(Canvas c, RectF parchment) {
+        List<PartySnapshot.ListRow> rows = snap.listRows;
+        int total = rows.size();
+        if (total == 0) {
+            listVisibleCount = 0;
+            return;
         }
-        listCount = 4;
+        listSel = Math.max(0, Math.min(listSel, total - 1));
+
+        int visCount = computeListVisibleRows(parchment, total);
+        int windowStart = total > visCount
+                ? Math.max(0, Math.min(listSel - visCount / 2, total - visCount))
+                : 0;
+        RectF band = listBandRect(parchment, visCount);
+
+        Bitmap winTex = ChronoAssets.getWindowTex();
+        if (winTex != null) {
+            float destInset = Math.min(band.width(), band.height()) * 0.08f;
+            drawNinePatch(c, winTex, ChronoAssets.WINDOW_TEX_INSET, band, destInset);
+        } else {
+            fill.setShader(null);
+            fill.setColor(BOX_BORDER_OUT);
+            c.drawRect(band, fill);
+            RectF inner = new RectF(band);
+            inner.inset(3, 3);
+            fill.setColor(BOX_BORDER_IN);
+            c.drawRect(inner, fill);
+            inner.inset(2, 2);
+            fill.setColor(BOX_BG);
+            c.drawRect(inner, fill);
+        }
+
+        float rowH = band.height() / visCount;
+        String[] names = snap.listKind == 0 ? ChronoAssets.getTechNames() : ChronoAssets.getItemNames();
+        for (int i = 0; i < visCount; i++) {
+            int idx = windowStart + i;
+            PartySnapshot.ListRow row = rows.get(idx);
+            RectF rowBox = new RectF(band.left + 6, band.top + i * rowH,
+                    band.right - 6, band.top + (i + 1) * rowH);
+            drawListRow(c, rowBox, row, names, idx == listSel);
+            listRowHitBoxes[i].set(rowBox);
+        }
+        listVisibleCount = visCount;
+        listWindowStart = windowStart;
+    }
+
+    /** One submenu-list row: name, right-aligned extra readout, optional selected-row highlight -- see {@link #drawSubmenuList}. */
+    private void drawListRow(Canvas c, RectF box, PartySnapshot.ListRow row, String[] names, boolean selected) {
+        if (selected) {
+            fill.setShader(null);
+            fill.setColor(Color.argb(50, Color.red(DEFAULT_HIGHLIGHT_COLOR),
+                    Color.green(DEFAULT_HIGHLIGHT_COLOR), Color.blue(DEFAULT_HIGHLIGHT_COLOR)));
+            c.drawRect(box, fill);
+            stroke.setStrokeWidth(2f);
+            stroke.setColor(Color.argb(200, Color.red(DEFAULT_HIGHLIGHT_COLOR),
+                    Color.green(DEFAULT_HIGHLIGHT_COLOR), Color.blue(DEFAULT_HIGHLIGHT_COLOR)));
+            RectF hb = new RectF(box);
+            hb.inset(1f, 1f);
+            c.drawRect(hb, stroke);
+        }
+        // Item rows use the encoded (category << 14) | index id -- see
+        // ChronoAssets.getItemName -- since item.txt's flat line-index table
+        // doesn't cover it (Potion arrived as 16385 = 0x4001). Tech rows keep
+        // the plain line-index lookup into the tech name table.
+        String name;
+        if (snap.listKind == 1) {
+            name = ChronoAssets.getItemName(row.id);
+        } else {
+            name = (names != null && row.id >= 0 && row.id < names.length && !names[row.id].trim().isEmpty())
+                    ? names[row.id] : ("#" + row.id);
+        }
+        int color = row.usable ? Color.WHITE : Color.argb(140, 170, 170, 170);
+        setText(box.height() * 0.42f, color, false, Paint.Align.LEFT, true);
+        c.drawText(name, box.left + box.width() * 0.03f, box.centerY() + box.height() * 0.16f, text);
+
+        // row.extra was found NOT to be the MP cost live (it only carried a
+        // value for a dual tech) -- MP now comes from ChronoAssets.getTechMp,
+        // a separately-loaded table, and is only drawn once that's known.
+        String extra = null;
+        if (snap.listKind == 0) { // tech: MP cost, only when known
+            int mp = ChronoAssets.getTechMp(row.id);
+            if (mp >= 0) extra = "MP " + mp;
+        } else { // item: held count
+            extra = "x " + row.extra;
+        }
+        if (extra != null) {
+            setText(box.height() * 0.38f, color, false, Paint.Align.RIGHT, true);
+            c.drawText(extra, box.right - box.width() * 0.03f, box.centerY() + box.height() * 0.14f, text);
+        }
+    }
+
+    /**
+     * Small "back" chip (rounded square + left-triangle glyph), drawn in the
+     * parchment's top-left corner -- mirroring {@link #drawEyeToggle}'s
+     * top-right placement -- only while the submenu-list band is showing.
+     * Tapping within its ~48px hit box ({@link #listBackHitBox}, see {@link
+     * #onTouchEvent}) calls {@link #backList}. Updates {@link
+     * #listBackHitBox} every call so the hit-test always matches the glyph's
+     * current on-screen position.
+     */
+    private void drawListBackToggle(Canvas c, RectF parchment) {
+        float cx = parchment.left + BACK_GLYPH_RADIUS + 14f;
+        float cy = parchment.top + BACK_GLYPH_RADIUS + 14f;
+        listBackHitBox.set(cx - BACK_HIT_HALF, cy - BACK_HIT_HALF, cx + BACK_HIT_HALF, cy + BACK_HIT_HALF);
+
+        int inkA = Color.argb(210, Color.red(INK), Color.green(INK), Color.blue(INK));
+        stroke.setStrokeWidth(2f);
+        stroke.setColor(inkA);
+        RectF glyphBox = new RectF(cx - BACK_GLYPH_RADIUS, cy - BACK_GLYPH_RADIUS,
+                cx + BACK_GLYPH_RADIUS, cy + BACK_GLYPH_RADIUS);
+        c.drawRoundRect(glyphBox, 4f, 4f, stroke);
+        setText(BACK_GLYPH_RADIUS * 1.3f, inkA, true, Paint.Align.CENTER, false);
+        // reuses TARGET_LABELS[0]'s glyph (a unicode escape, not a raw byte
+        // -- see its own field comment) rather than introducing a second
+        // literal non-ASCII character into this file.
+        c.drawText(TARGET_LABELS[0], cx, cy + BACK_GLYPH_RADIUS * 0.4f, text);
     }
 
     private static float clamp01(float v) {
@@ -1090,7 +1379,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         if (overworld) {
             drawOverworldContent(c, parchment, s, title);
         } else {
-            drawFieldContent(c, parchment, title, live);
+            drawFieldContent(c, parchment, s, title, live);
         }
     }
 
@@ -1154,33 +1443,141 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     }
 
     /**
-     * Field location: no map, just the location name as the parchment's
-     * centerpiece. When {@code live} and a location-name change is fading
-     * (see {@link #titleFadeStart}), crossfades the old title out and the
-     * new one in over {@link #TITLE_FADE_NANOS}; otherwise just draws it.
+     * Field location: the location name as the parchment's centerpiece, plus
+     * — when a rendered DS-style area minimap exists for {@code s.fieldMapId}
+     * (see {@link ChronoAssets#getAreaMap(int)}) — that bitmap scaled to fit
+     * beneath it, mirroring {@link #drawOverworldContent}'s world-map layout.
+     * No bitmap (not rendered/pushed yet) falls back to the original
+     * text-only centerpiece. When {@code live} and a location-name change is
+     * fading (see {@link #titleFadeStart}), crossfades the old title out and
+     * the new one in over {@link #TITLE_FADE_NANOS}; otherwise just draws it.
      */
-    private void drawFieldContent(Canvas c, RectF parchment, String title, boolean live) {
-        int h = getHeight();
-        setText(h * 0.075f, INK, true, Paint.Align.CENTER, false);
+    private void drawFieldContent(Canvas c, RectF parchment, PartySnapshot s, String title, boolean live) {
+        int w = getWidth(), h = getHeight();
+        Bitmap areaMap = ChronoAssets.getAreaMap(s.fieldMapId);
+
+        setText(h * (areaMap != null ? 0.045f : 0.075f), INK, true, Paint.Align.CENTER, false);
         text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
-        float ty = parchment.centerY() + h * 0.025f;
+        float ty = areaMap != null ? parchment.top + h * 0.085f : parchment.centerY() + h * 0.025f;
+
+        String posSuffix = (SHOW_FIELD_POS && !Float.isNaN(s.fieldX) && !Float.isNaN(s.fieldY))
+                ? String.format(java.util.Locale.US, "  (%.1f,%.1f)", s.fieldX, s.fieldY) : "";
+        String label = ((SHOW_MAP_ID && s.fieldMapId >= 0) ? title + "  #" + s.fieldMapId : title) + posSuffix;
+        String fadingLabel = ((SHOW_MAP_ID && s.fieldMapId >= 0)
+                ? (fadingOutTitle != null ? fadingOutTitle + "  #" + s.fieldMapId : fadingOutTitle) : fadingOutTitle);
+        if (fadingLabel != null) fadingLabel += posSuffix;
 
         if (live && titleFadeStart >= 0) {
             long elapsed = System.nanoTime() - titleFadeStart;
             float t = Math.min(1f, elapsed / (float) TITLE_FADE_NANOS);
             if (t < 1f) {
                 text.setAlpha((int) (255 * (1f - t)));
-                c.drawText(fadingOutTitle, parchment.centerX(), ty, text);
+                c.drawText(fadingLabel, parchment.centerX(), ty, text);
                 text.setAlpha((int) (255 * t));
-                c.drawText(title, parchment.centerX(), ty, text);
+                c.drawText(label, parchment.centerX(), ty, text);
                 text.setAlpha(255);
+                if (areaMap != null) {
+                    drawAreaMapBitmap(c, parchment, areaMap, w, h);
+                    drawFieldPosMarkerIfCalibrated(c, s, h);
+                }
                 return;
             }
             // fade finished this frame -- settle and fall through to a plain draw
             titleFadeStart = -1L;
             fadingOutTitle = null;
         }
-        c.drawText(title, parchment.centerX(), ty, text);
+        c.drawText(label, parchment.centerX(), ty, text);
+        if (areaMap != null) {
+            drawAreaMapBitmap(c, parchment, areaMap, w, h);
+            drawFieldPosMarkerIfCalibrated(c, s, h);
+        }
+    }
+
+    // Scratch buffer for AreaMapCalib.toMapPixel's out param -- reused to
+    // avoid an allocation every draw.
+    private final float[] areaMapCalibOut = new float[2];
+
+    /** Looks up s's field position via AreaMapCalib and draws the marker if it maps to a point inside the drawn area map. */
+    private void drawFieldPosMarkerIfCalibrated(Canvas c, PartySnapshot s, int h) {
+        if (AreaMapCalib.toMapPixel(s.fieldMapId, s.fieldX, s.fieldY, areaMapCalibOut)) {
+            drawFieldPosMarker(c, areaMapCalibOut[0], areaMapCalibOut[1], h);
+        }
+    }
+
+    // area_minimap_%03d.png (256x192) bakes its own parchment frame into the
+    // art (a ~14px border with rounded corners, matching this panel's own
+    // parchment chrome) -- (16,16)-(240,176) is the floor-plan content only,
+    // with that frame cropped away, so the map can be scaled up to actually
+    // fill the panel instead of being drawn small inside a second frame.
+    private static final int AREA_MAP_SRC_L = 16, AREA_MAP_SRC_T = 16;
+    private static final int AREA_MAP_SRC_R = 240, AREA_MAP_SRC_B = 176;
+
+    /**
+     * Draws the cropped floor-plan region of a rendered DS-style area
+     * minimap (see {@link #AREA_MAP_SRC_L} et al.), scaled up to fill the
+     * area between the title and the gold/time corner text as large as
+     * possible (aspect preserved, centered, ~4% margin left around it) --
+     * mirroring {@link #drawOverworldContent}'s world-map placement style
+     * (nearest-neighbour via {@link #mapPaint}, parchment-blended alpha) but
+     * fit to the crop's own aspect ratio rather than a fixed 4:3.
+     */
+    private void drawAreaMapBitmap(Canvas c, RectF parchment, Bitmap areaMap, int w, int h) {
+        RectF area = new RectF(parchment.left + w * 0.06f, parchment.top + h * 0.13f,
+                parchment.right - w * 0.06f, parchment.bottom - h * 0.09f);
+        float margin = Math.min(area.width(), area.height()) * 0.04f;
+        area.inset(margin, margin);
+
+        Rect src = new Rect(AREA_MAP_SRC_L, AREA_MAP_SRC_T,
+                Math.min(AREA_MAP_SRC_R, areaMap.getWidth()),
+                Math.min(AREA_MAP_SRC_B, areaMap.getHeight()));
+        if (src.width() <= 0 || src.height() <= 0) return; // unexpectedly small source, skip rather than draw garbage
+
+        float scale = Math.min(area.width() / src.width(), area.height() / src.height());
+        float dw = src.width() * scale, dh = src.height() * scale;
+        RectF dst = new RectF(area.centerX() - dw / 2f, area.centerY() - dh / 2f,
+                area.centerX() + dw / 2f, area.centerY() + dh / 2f);
+        c.drawBitmap(areaMap, src, dst, mapPaint);
+
+        // Stash the src/dst rects this draw used, so drawFieldContent's
+        // position-marker overlay can map a 256x192-image-space point (see
+        // AreaMapCalib.toMapPixel) through the exact same crop/scale.
+        areaMapSrc.set(src);
+        areaMapDst.set(dst);
+    }
+
+    /**
+     * Draws the live field-position marker (the same minimap_mark.png
+     * "position" frame used by {@link #drawOverworldContent}) at the point
+     * {@code (imgX, imgY)} in the original 256x192 DS area-minimap image
+     * space, transformed through {@code areaMapSrc}/{@code areaMapDst} (set
+     * by the {@link #drawAreaMapBitmap} call this frame). Skips drawing if
+     * the point falls outside {@code areaMapDst} (off the visible crop).
+     */
+    private void drawFieldPosMarker(Canvas c, float imgX, float imgY, int h) {
+        if (areaMapDst.width() <= 0 || areaMapDst.height() <= 0) return;
+        if (areaMapSrc.width() <= 0 || areaMapSrc.height() <= 0) return;
+        float u = (imgX - areaMapSrc.left) / (float) areaMapSrc.width();
+        float v = (imgY - areaMapSrc.top) / (float) areaMapSrc.height();
+        if (u < 0f || u > 1f || v < 0f || v > 1f) return;
+        float mx = areaMapDst.left + areaMapDst.width() * u;
+        float my = areaMapDst.top + areaMapDst.height() * v;
+
+        Bitmap mark = ChronoAssets.getMinimapMark();
+        if (mark != null) {
+            float ms = h * 0.03f;
+            RectF markDst = new RectF(mx - ms, my - ms * 1.4f, mx + ms, my + ms * 0.6f);
+            c.drawBitmap(mark, null, markDst, markerPaint);
+        } else {
+            fill.setColor(Color.rgb(210, 50, 70));
+            Path marker = new Path();
+            float ms = h * 0.016f;
+            marker.moveTo(mx, my - ms);
+            marker.lineTo(mx + ms, my);
+            marker.lineTo(mx, my + ms);
+            marker.lineTo(mx - ms, my);
+            marker.close();
+            c.drawPath(marker, fill);
+        }
     }
 
     @Override
@@ -1254,43 +1651,47 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // hit-testable against the live snapshot, never the fading-out one.
         long bandNow = System.nanoTime();
         boolean targeting = snap.inBattle && isTargetingActive(bandNow);
-        boolean listMode = snap.inBattle && isListActive(bandNow);
+        boolean listMode = snap.inBattle && snap.listOpen && !snap.listRows.isEmpty();
         if (snap.inBattle) {
             drawEyeToggle(c, parchment);
             if (targeting) {
                 drawTargetingButtons(c, parchment);
                 commandCount = 0;
-                listCount = 0;
+                listVisibleCount = 0;
+                listBackHitBox.setEmpty();
             } else if (listMode) {
-                drawListButtons(c, parchment);
+                drawSubmenuList(c, parchment);
+                drawListBackToggle(c, parchment);
                 commandCount = 0;
                 targetCount = 0;
             } else {
                 drawCommandButtons(c, parchment, snap, true);
                 targetCount = 0;
-                listCount = 0;
+                listVisibleCount = 0;
+                listBackHitBox.setEmpty();
             }
         } else {
             eyeHitBox.setEmpty();
             commandCount = 0;
             targetCount = 0;
-            listCount = 0;
+            listVisibleCount = 0;
+            listBackHitBox.setEmpty();
         }
-        // targeting/list mode each has its own wall-clock timeout (see
-        // isTargetingActive/isListActive) that isn't tied to a snapshot
-        // change, so the band needs exactly one more repaint right at the
-        // deadline or it would only clear itself whenever the next update()
-        // happens to land. This is a single delayed callback, not the
+        // targeting mode has its own wall-clock timeout (see
+        // isTargetingActive) that isn't tied to a snapshot change, so the
+        // band needs exactly one more repaint right at the deadline or it
+        // would only clear itself whenever the next update() happens to
+        // land. This is a single delayed callback, not the
         // postInvalidateOnAnimation loop the other animators below use --
         // that would redraw at display refresh rate (full parchment/
-        // speckle/ninepatch repaint) for up to 15s straight after every
+        // speckle/ninepatch repaint) for up to 8s straight after every
         // command, which breaks this view's "fully idle once settled"
         // invariant for no visible benefit (nothing here is actually
-        // animating frame to frame).
+        // animating frame to frame). The submenu-list band needs no such
+        // callback -- snap.listOpen is snapshot-driven, not a timer, so the
+        // next real snapshot update already repaints it.
         if (targeting) {
             postInvalidateDelayed(Math.max(1L, (targetingUntil - System.nanoTime()) / 1_000_000L + 16L));
-        } else if (listMode) {
-            postInvalidateDelayed(Math.max(1L, (listUntil - System.nanoTime()) / 1_000_000L + 16L));
         }
 
         // DS-style status boxes along the top, one per party member (n > 0
