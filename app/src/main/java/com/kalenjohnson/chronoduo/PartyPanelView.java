@@ -87,6 +87,17 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private String resultsMessage;
     private String resultsFadingMessage;
     private long resultsMessageFadeStart = -1L;
+    // The game holds its victory pose for a beat before the first Earned
+    // window; mirror that so the bottom message doesn't pop the instant the
+    // last enemy drops.
+    private static final long RESULTS_DELAY_NANOS = 0L; // no artificial delay: resultsActive already keys off the game posting its first window (step 1)
+    private long resultsActiveSince = -1L;
+
+    private boolean resultsVisible(PartySnapshot s) {
+        return s.resultsActive && resultsActiveSince >= 0
+                && System.nanoTime() - resultsActiveSince >= RESULTS_DELAY_NANOS;
+    }
+
     private int[] resultsBaseLevels;
 
     // Field-mode area-map bitmap crossfade: kept separate from the title
@@ -760,6 +771,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 // results screen just started: baseline levels for
                 // leveledMemberName, and start clean (no message from a
                 // previous fight can carry over).
+                resultsActiveSince = System.nanoTime();
                 resultsBaseLevels = levelsOf(snap);
                 resultsMessage = null;
                 resultsFadingMessage = null;
@@ -1201,7 +1213,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // the single-row command band (see listBandRect).
         long now = System.nanoTime();
         boolean listShowing = live && s.listOpen && !s.listRows.isEmpty();
-        boolean resultsShowing = live && s.resultsActive;
+        boolean resultsShowing = live && resultsVisible(s);
         boolean reserveBand = s.menuOpen || (live && isTargetingActive(now));
         float areaBottom;
         if (resultsShowing) {
@@ -2300,6 +2312,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
         if (titleFadeStart >= 0) animating = true;
         if (areaMapFadeStart >= 0) animating = true;
+        if (resultsMessageFadeStart >= 0) animating = true;
+        if (snap.resultsActive && !resultsVisible(snap)) animating = true; // waiting out the victory pose
         if (pressedCommand >= 0 && pressedAt >= 0
                 && System.nanoTime() - pressedAt < PRESS_FEEDBACK_NANOS) {
             animating = true;
@@ -2319,7 +2333,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // which is why the eye toggle is placed here too. Only ever drawn/
         // hit-testable against the live snapshot, never the fading-out one.
         long bandNow = System.nanoTime();
-        boolean resultsMode = snap.inBattle && snap.resultsActive;
+        boolean resultsMode = snap.inBattle && resultsVisible(snap);
         boolean targeting = !resultsMode && snap.inBattle && isTargetingActive(bandNow);
         boolean listMode = !resultsMode && snap.inBattle && snap.listOpen && !snap.listRows.isEmpty();
         if (snap.inBattle) {

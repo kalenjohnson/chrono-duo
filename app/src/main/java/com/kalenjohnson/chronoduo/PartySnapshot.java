@@ -327,7 +327,7 @@ public final class PartySnapshot {
                 if (e.curHp != 0) { allEnemiesDead = false; break; }
             }
             snap.resultsActive = allEnemiesDead
-                    && snap.resultsStep >= 0 && snap.resultsStep <= 30;
+                    && snap.resultsStep >= 1 && snap.resultsStep <= 30; // step 0 = engine still waiting out death animations; 1 = first window is up
         }
         return snap;
     }

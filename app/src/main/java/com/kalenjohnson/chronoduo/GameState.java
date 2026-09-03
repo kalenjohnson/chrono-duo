@@ -55,6 +55,43 @@ public final class GameState {
      */
     public static native void nativeLogPixelStats();
 
+    /**
+     * Registers (or replaces) a user-local texture substitution keyed by
+     * asset basename (e.g. "c000_0.png" -- no directory component). {@code w}
+     * and {@code h} must match the size the game actually uploads for that
+     * asset exactly, or the native side logs a mismatch and leaves the
+     * original texture in place; {@code rgba} must be {@code w*h*4}
+     * PREMULTIPLIED RGBA8888 bytes, tightly packed (R,G,B,A per texel, the
+     * game's own upload order), matching how the game premultiplies its own
+     * PNGs before upload.
+     *
+     * {@code alphaFp}/{@code redFp} are content fingerprints of the game's
+     * ORIGINAL (unmodified) texture at this name -- a 64-bit FNV-1a hash over
+     * a 64x64 grid of alpha-channel samples (w/h mixed into the hash first),
+     * and a second FNV-1a hash over the same grid's red-channel samples as a
+     * tiebreaker. See AppActivity#fingerprint and gamestate.c's
+     * tex_fingerprint for the identical sampling formula both sides must
+     * agree on: for i,j in 0..63, x = (i*w)/64, y = (j*h)/64 (integer
+     * division), sampling pixel (x,y). These let hooked_glTexImage2D
+     * (gamestate.c) match uploads that bypass the path-based hooks entirely
+     * (e.g. character sheets loaded via a code path that never calls
+     * TextureCache::addImage or ResourceManager::createTexture) by comparing
+     * fingerprints of the live upload's pixels against this registered
+     * fingerprint of the original asset, instead of by asset path.
+     *
+     * Installed via GOT-patched TextureCache::addImage /
+     * ResourceManager::createTexture hooks plus a content-fingerprint match
+     * inside the glTexImage2D hook (gamestate.c) that are always live once
+     * nativeSetPixelGraphics has run once, independent of the pixel-graphics
+     * on/off pref. Returns false on a bad size, an rgba array whose length
+     * doesn't match w*h*4, or an OOM/full-table failure.
+     */
+    public static native boolean nativeRegisterTextureReplacement(
+            String name, int w, int h, long alphaFp, long redFp, byte[] rgba);
+
+    /** Frees and clears every registered texture replacement. See gamestate.c. */
+    public static native void nativeClearTextureReplacements();
+
     /** Reads the persisted pixel-graphics preference. Default true (crisp/GL_NEAREST). */
     public static boolean getPixelGraphicsPref(Context ctx) {
         return ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

@@ -155,6 +155,7 @@ public class AppActivity extends Cocos2dxActivity {
             }
         });
         extractCompanionAssets();
+        scanOrigArtReplacements();
 
         com.kalenjohnson.chronoduo.GameState.attach();
         // Frame-perfect menu parking: a per-rendered-frame GL tick that kills
@@ -425,6 +426,229 @@ public class AppActivity extends Cocos2dxActivity {
                 Log.w(TAG, "companion asset extraction failed", e);
             }
         }, "ChronoResExtract").start();
+    }
+
+    /**
+     * Scans {@code <externalFilesDir>/orig_art/*.png} and
+     * {@code <filesDir>/orig_art/*.png} for user-supplied texture
+     * replacements (original 1x pixel art, pixel-doubled back up to the
+     * game's shipped texture size) and registers each one with the native
+     * glTexImage2D hook via {@link com.kalenjohnson.chronoduo.GameState
+     * #nativeRegisterTextureReplacement}, keyed by filename (e.g.
+     * "c000_0.png" replaces the game's "Game/chara/png/c000_0.png") AND by a
+     * content fingerprint of the ORIGINAL asset (see {@link #fingerprint}) --
+     * some uploads (the character sheets among them) bypass the path-based
+     * hooks entirely, so the fingerprint is what actually matches those; see
+     * gamestate.c's tex_fingerprint / hooked_glTexImage2D. Runs off the main
+     * thread (file IO + PNG decode + resources.bin extraction); registration
+     * itself is safe to call from any thread (see gamestate.c). Both
+     * directories are scanned so files can be dropped in either without a
+     * rebuild (adb push to externalFilesDir; on-device import tooling could
+     * use filesDir); when both hold a same-named file, filesDir's (scanned
+     * second) wins, matching ChronoAssets.getAreaMap's own
+     * filesDir-first-else-external convention for user-local overrides
+     * elsewhere in this app. Best effort: a missing directory, a file that
+     * fails to decode, an unrecognized name, a missing resources.bin entry,
+     * or a size mismatch against the original is simply skipped and logged.
+     */
+    private void scanOrigArtReplacements() {
+        File ext = getExternalFilesDir(null);
+        final File extDir = new File(ext != null ? ext : getFilesDir(), "orig_art");
+        final File filesDir = new File(getFilesDir(), "orig_art");
+        final Context appCtx = getApplicationContext();
+        final android.content.res.AssetManager gameAssets = runtime.getChronoAssets();
+        new Thread(() -> {
+            int registered = 0;
+            registered += registerOrigArtDir(extDir, appCtx, gameAssets);
+            registered += registerOrigArtDir(filesDir, appCtx, gameAssets);
+            Log.i(TAG, "orig_art: registered " + registered + " texture replacement(s)");
+        }, "ChronoOrigArtScan").start();
+    }
+
+    /**
+     * Maps an orig_art replacement filename to the resources.bin entry it
+     * should be fingerprinted against. For now only handles character sheet
+     * names ("c000_0.png", "c123_1.png", ...) under Game/chara/png/; returns
+     * null (skip, unsupported name) for anything else. A small standalone
+     * function so other directories (items, monsters, ...) can be added
+     * later without touching the scan loop itself.
+     */
+    private static String origArtResourceEntry(String name) {
+        if (name.matches("c\\d\\d\\d_\\d\\.png")) {
+            return "Game/chara/png/" + name;
+        }
+        return null;
+    }
+
+    // ---- FNV-1a content fingerprint (must stay bit-identical to
+    // gamestate.c's fnv1a_byte/fnv1a_u32/tex_fingerprint) ----
+    private static final long FNV64_OFFSET = 0xcbf29ce484222325L;
+    private static final long FNV64_PRIME = 0x100000001b3L;
+
+    private static long fnv1aByte(long h, int b) {
+        h ^= (b & 0xffL);
+        h *= FNV64_PRIME;
+        return h;
+    }
+
+    private static long fnv1aU32(long h, int v) {
+        h = fnv1aByte(h, (v >>> 24) & 0xff);
+        h = fnv1aByte(h, (v >>> 16) & 0xff);
+        h = fnv1aByte(h, (v >>> 8) & 0xff);
+        h = fnv1aByte(h, v & 0xff);
+        return h;
+    }
+
+    /**
+     * Copies a Bitmap's raw pixel bytes out via {@link android.graphics.Bitmap
+     * #copyPixelsToBuffer}. For {@code Config.ARGB_8888}, despite the name,
+     * Android stores each texel as four bytes in memory in R,G,B,A order
+     * (confirmed: android.graphics.Bitmap's native pixel format for
+     * ARGB_8888 is kRGBA_8888_SkColorType) -- i.e. this returns exactly the
+     * R,G,B,A byte layout the game uploads via glTexImage2D(..., GL_RGBA,
+     * GL_UNSIGNED_BYTE, ...), so no channel reordering is needed here or in
+     * {@link #registerOrigArtDir}.
+     */
+    private static byte[] bitmapRgbaBytes(android.graphics.Bitmap bmp) {
+        int w = bmp.getWidth(), h = bmp.getHeight();
+        byte[] bytes = new byte[w * h * 4];
+        bmp.copyPixelsToBuffer(java.nio.ByteBuffer.wrap(bytes));
+        return bytes;
+    }
+
+    /**
+     * Computes {alphaFp, redFp} over a 64x64 grid of samples (4096 total),
+     * identically to gamestate.c's tex_fingerprint: for i,j in 0..63,
+     * x = (i*w)/64, y = (j*h)/64 (integer division), sampling pixel (x,y).
+     * {@code alphaBytes}/{@code redBytes} are tightly packed R,G,B,A buffers
+     * (see {@link #bitmapRgbaBytes}) of size w*h*4 each, both w x h; they may
+     * be the same buffer or two different decodes of the same image (this
+     * class passes two different decodes -- see registerOrigArtDir -- since
+     * alpha is unaffected by premultiplication but red is not, and the
+     * fingerprint must reflect what the game's premultiplied upload looks
+     * like).
+     */
+    private static long[] fingerprint(byte[] alphaBytes, byte[] redBytes, int w, int h) {
+        long ah = FNV64_OFFSET, rh = FNV64_OFFSET;
+        ah = fnv1aU32(ah, w);
+        ah = fnv1aU32(ah, h);
+        rh = fnv1aU32(rh, w);
+        rh = fnv1aU32(rh, h);
+        for (int i = 0; i < 64; i++) {
+            int x = (i * w) / 64;
+            for (int j = 0; j < 64; j++) {
+                int y = (j * h) / 64;
+                int idx = (y * w + x) * 4;
+                ah = fnv1aByte(ah, alphaBytes[idx + 3] & 0xff);
+                rh = fnv1aByte(rh, redBytes[idx] & 0xff);
+            }
+        }
+        return new long[]{ah, rh};
+    }
+
+    /**
+     * Registers every *.png in {@code dir}; returns how many succeeded.
+     * Background thread only (file IO, PNG decode, resources.bin
+     * extraction). For each replacement file, resolves the matching
+     * resources.bin entry via {@link #origArtResourceEntry}, extracts the
+     * ORIGINAL asset (via {@link com.kalenjohnson.chronoduo.ChronoResources
+     * #extract}, cached under filesDir) and decodes it twice -- once
+     * non-premultiplied (for the alpha fingerprint, unaffected by
+     * premultiplication) and once premultiplied (for the red fingerprint,
+     * matching what the game's own premultiply step produces at upload) --
+     * to compute alphaFp/redFp; then decodes the replacement itself
+     * PREMULTIPLIED (matching the game's upload order) and registers its raw
+     * R,G,B,A bytes together with those fingerprints. w/h come from the
+     * ORIGINAL; a replacement whose decoded size doesn't match is skipped
+     * with a log rather than registered mismatched.
+     */
+    private static int registerOrigArtDir(File dir, Context appCtx,
+                                           android.content.res.AssetManager gameAssets) {
+        File[] files = dir.isDirectory() ? dir.listFiles() : null;
+        if (files == null) return 0;
+        int count = 0;
+        for (File f : files) {
+            String name = f.getName();
+            if (!name.toLowerCase(java.util.Locale.ROOT).endsWith(".png")) continue;
+
+            String entry = origArtResourceEntry(name);
+            if (entry == null) {
+                Log.w(TAG, "orig_art: no resources.bin mapping for " + name + " -- skipped");
+                continue;
+            }
+
+            File origFile;
+            try {
+                origFile = com.kalenjohnson.chronoduo.ChronoResources.extract(appCtx, gameAssets, entry);
+            } catch (Exception e) {
+                Log.w(TAG, "orig_art: failed to extract original " + entry + " for " + name, e);
+                continue;
+            }
+
+            android.graphics.Bitmap origNonPremul = null, origPremul = null, replacement = null;
+            try {
+                android.graphics.BitmapFactory.Options optsNP = new android.graphics.BitmapFactory.Options();
+                optsNP.inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888;
+                optsNP.inPremultiplied = false;
+                optsNP.inScaled = false;
+                origNonPremul = android.graphics.BitmapFactory.decodeFile(origFile.getAbsolutePath(), optsNP);
+                if (origNonPremul == null) {
+                    Log.w(TAG, "orig_art: decode returned null for original " + origFile);
+                    continue;
+                }
+                int w = origNonPremul.getWidth(), h = origNonPremul.getHeight();
+
+                // Second decode of the ORIGINAL, premultiplied this time, purely
+                // to get the red channel as the game's own premultiply step
+                // would produce it (alpha itself is identical either way, so the
+                // non-premultiplied decode above is used for that channel).
+                android.graphics.BitmapFactory.Options optsP = new android.graphics.BitmapFactory.Options();
+                optsP.inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888;
+                optsP.inPremultiplied = true;
+                optsP.inScaled = false;
+                origPremul = android.graphics.BitmapFactory.decodeFile(origFile.getAbsolutePath(), optsP);
+                if (origPremul == null) {
+                    Log.w(TAG, "orig_art: premultiplied decode returned null for original " + origFile);
+                    continue;
+                }
+
+                long[] fp = fingerprint(bitmapRgbaBytes(origNonPremul), bitmapRgbaBytes(origPremul), w, h);
+                long alphaFp = fp[0], redFp = fp[1];
+
+                android.graphics.BitmapFactory.Options replOpts = new android.graphics.BitmapFactory.Options();
+                replOpts.inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888;
+                replOpts.inPremultiplied = true; // matches the game's own upload order (premultiplied RGBA)
+                replOpts.inScaled = false;
+                replacement = android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath(), replOpts);
+                if (replacement == null) {
+                    Log.w(TAG, "orig_art: decode returned null for " + f);
+                    continue;
+                }
+                if (replacement.getWidth() != w || replacement.getHeight() != h) {
+                    Log.w(TAG, "orig_art: " + name + " is " + replacement.getWidth() + "x"
+                            + replacement.getHeight() + ", original " + entry + " is " + w + "x" + h
+                            + " -- size mismatch, skipped");
+                    continue;
+                }
+
+                byte[] rgba = bitmapRgbaBytes(replacement);
+                boolean ok = com.kalenjohnson.chronoduo.GameState
+                        .nativeRegisterTextureReplacement(name, w, h, alphaFp, redFp, rgba);
+                if (ok) {
+                    count++;
+                } else {
+                    Log.w(TAG, "orig_art: native registration failed for " + name
+                            + " (" + w + "x" + h + ")");
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "orig_art: failed to process " + f, e);
+            } finally {
+                if (origNonPremul != null) origNonPremul.recycle();
+                if (origPremul != null) origPremul.recycle();
+                if (replacement != null) replacement.recycle();
+            }
+        }
+        return count;
     }
 
     // Extension/menu_win.png is a 512x512 sheet of pre-baked DS-style window

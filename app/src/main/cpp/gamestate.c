@@ -17,6 +17,7 @@
 #include <math.h>
 #include <errno.h>
 #include <elf.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -63,6 +64,10 @@ static void  *(*p_list_getElement)(void *, int);
 typedef struct { float w, h; } CCSize;
 typedef struct { float x, y; } CCVec2;
 static int safe_read(const void *addr, void *out, size_t len);
+// libc++ std::string reader (defined later in the file); forward-declared so
+// the addImage/createTexture hooks below (which run well before the
+// definition) can use it, same as safe_read above.
+static const char *sso_cstr(void *str, char *buf, int cap);
 
 // cocos2d::Node member offsets (3.14.1 arm64, from accessor disassembly):
 // getPosition->this+0x50, getAnchorPoint->+0x78, getContentSize->+0x80,
@@ -599,13 +604,167 @@ static void pixel_decimate_log_once(GLsizei width, GLsizei height) {
     LOGI("pixel-gfx: decimated %dx%d -> %dx%d", width, height, width / 2, height / 2);
 }
 
+// ---------------------------------------------------------------------------
+// Pixel graphics, mechanism 5: user-local texture replacement.
+//
+// GOT-patches cocos2d::TextureCache::addImage(const std::string&) and
+// ctr::ResourceManager::createTexture(const std::string&) -- both take just
+// an asset path (self, const std::string*) and both have R_AARCH64_JUMP_SLOT
+// relocations in libchrono.so (verified with `readelf -r -W`; addImage's
+// other overload and createTexture's Image*-taking overload also have slots
+// but don't carry a filename by themselves, so they're not hooked). Texture
+// upload happens synchronously inside these calls (-> initWithImage ->
+// glTexImage2D), so the hook here just records which asset path is "in
+// flight" in g_pending_tex_path; hooked_glTexImage2D (mechanism 3, below)
+// consults it to decide whether to substitute a user-registered replacement
+// image for the upload.
+//
+// The replacement registry itself (g_tex_repl[]) is populated from Java via
+// nativeRegisterTextureReplacement, scanning <externalFilesDir|filesDir>/
+// orig_art/*.png at boot -- see AppActivity.extractCompanionAssets's sibling
+// scanOrigArtReplacements().
+// ---------------------------------------------------------------------------
+
+#define PIXEL_SYM_ADDIMAGE \
+    "_ZN7cocos2d12TextureCache8addImageERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE"
+#define PIXEL_SYM_CREATETEXTURE \
+    "_ZN3ctr15ResourceManager13createTextureERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE"
+
+static uintptr_t *g_pixel_addimage_slot;
+static uintptr_t  g_pixel_addimage_orig;
+static int        g_pixel_addimage_orig_saved;
+static uintptr_t *g_pixel_createtex_slot;
+static uintptr_t  g_pixel_createtex_orig;
+static int        g_pixel_createtex_orig_saved;
+
+static void *(*p_real_addImage)(void *self, const void *stdstring);
+static void *(*p_real_createTexture)(void *self, const void *stdstring);
+
+// Basename (e.g. "c000_0.png") and full path of the asset currently being
+// loaded, valid only for the duration of the addImage/createTexture call
+// that's in flight -- set on entry, cleared on return. GL thread only (both
+// hooked functions and glTexImage2D itself only ever run there).
+static char g_pending_tex_path[256];
+static char g_pending_tex_path_full[256];
+
+static void pixel_set_pending_tex_path(const char *full) {
+    if (!full || !full[0]) { g_pending_tex_path[0] = 0; g_pending_tex_path_full[0] = 0; return; }
+    strncpy(g_pending_tex_path_full, full, sizeof(g_pending_tex_path_full) - 1);
+    g_pending_tex_path_full[sizeof(g_pending_tex_path_full) - 1] = 0;
+    const char *slash = strrchr(full, '/');
+    const char *base = slash ? slash + 1 : full;
+    strncpy(g_pending_tex_path, base, sizeof(g_pending_tex_path) - 1);
+    g_pending_tex_path[sizeof(g_pending_tex_path) - 1] = 0;
+}
+
+static void pixel_clear_pending_tex_path(void) {
+    g_pending_tex_path[0] = 0;
+    g_pending_tex_path_full[0] = 0;
+}
+
+static void *hooked_addImage(void *self, const void *stdstring) {
+    char buf[256];
+    pixel_set_pending_tex_path(sso_cstr((void *) stdstring, buf, sizeof(buf)));
+    void *ret = p_real_addImage ? p_real_addImage(self, stdstring) : NULL;
+    pixel_clear_pending_tex_path();
+    return ret;
+}
+
+static void *hooked_createTexture(void *self, const void *stdstring) {
+    char buf[256];
+    pixel_set_pending_tex_path(sso_cstr((void *) stdstring, buf, sizeof(buf)));
+    void *ret = p_real_createTexture ? p_real_createTexture(self, stdstring) : NULL;
+    pixel_clear_pending_tex_path();
+    return ret;
+}
+
+// Replacement registry: up to 64 user-supplied RGBA images, keyed by the
+// asset basename (e.g. "c000_0.png") that g_pending_tex_path is set to when
+// the game loads it. Registered by nativeRegisterTextureReplacement (Java,
+// background thread, at boot); consulted by hooked_glTexImage2D (GL thread).
+// Guarded by g_tex_repl_mutex since registration and consultation run on
+// different threads.
+#define TEX_REPL_MAX 64
+typedef struct {
+    char     name[64];
+    int      w, h;
+    uint8_t *rgba;           // malloc'd w*h*4 bytes, tightly packed PREMULTIPLIED RGBA8888
+    uint64_t alpha_fp;       // FNV-1a over a 64x64 alpha-channel sample grid of the ORIGINAL asset (see tex_fingerprint)
+    uint64_t red_fp;         // same grid, red channel -- tiebreaker when alpha_fp collides across entries
+    int      replaced_logged;
+    int      mismatch_logged;
+} tex_replacement_t;
+static tex_replacement_t g_tex_repl[TEX_REPL_MAX];
+static int              g_tex_repl_count;
+static pthread_mutex_t  g_tex_repl_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Content-fingerprint match (mechanism 5b): some uploads (observed live for
+// the character sheets, Game/chara/png/c000_0.png 512x512 and c000_1.png
+// 512x416) go through neither TextureCache::addImage nor
+// ResourceManager::createTexture, so g_pending_tex_path is never set for
+// them and the path-based match above always misses. For those, match by
+// content instead: hash a fixed 64x64 grid of samples from the live upload's
+// alpha channel (premultiplication doesn't touch alpha, so this hash is
+// stable regardless of how the game's premultiply/swizzle step treats
+// color) and compare against the same hash computed (in Java,
+// AppActivity#fingerprint) over the ORIGINAL asset extracted from
+// resources.bin. A second FNV-1a hash over the same grid's red channel
+// breaks ties when more than one registered entry shares an alpha hash.
+//
+// Sampling formula (must stay bit-identical to the Java side): for a WxH
+// image, for i,j in 0..63 (4096 samples), x = (i*w)/64, y = (j*h)/64
+// (integer/floor division), sample pixel (x,y). Hash is 64-bit FNV-1a,
+// seeded with w then h (as big-endian bytes) before the sample bytes, so
+// two same-content-but-different-size buffers still hash differently.
+#define FNV64_OFFSET 0xcbf29ce484222325ULL
+#define FNV64_PRIME  0x100000001b3ULL
+
+static inline uint64_t fnv1a_byte(uint64_t h, uint8_t b) {
+    h ^= b;
+    h *= FNV64_PRIME;
+    return h;
+}
+
+static inline uint64_t fnv1a_u32(uint64_t h, uint32_t v) {
+    h = fnv1a_byte(h, (uint8_t) ((v >> 24) & 0xff));
+    h = fnv1a_byte(h, (uint8_t) ((v >> 16) & 0xff));
+    h = fnv1a_byte(h, (uint8_t) ((v >> 8) & 0xff));
+    h = fnv1a_byte(h, (uint8_t) (v & 0xff));
+    return h;
+}
+
+// Computes (alpha_fp, red_fp) over `rgba` (tightly packed RGBA8888, w*h*4
+// bytes) per the sampling formula above. Cheap: 4096 grid samples, 2 byte
+// reads each -- only call when the upload's size matches at least one
+// registered replacement (see hooked_glTexImage2D).
+static void tex_fingerprint(const uint8_t *rgba, int w, int h,
+                             uint64_t *out_alpha_fp, uint64_t *out_red_fp) {
+    uint64_t ah = FNV64_OFFSET, rh = FNV64_OFFSET;
+    ah = fnv1a_u32(ah, (uint32_t) w);
+    ah = fnv1a_u32(ah, (uint32_t) h);
+    rh = fnv1a_u32(rh, (uint32_t) w);
+    rh = fnv1a_u32(rh, (uint32_t) h);
+    for (int i = 0; i < 64; i++) {
+        int x = (i * w) / 64;
+        for (int j = 0; j < 64; j++) {
+            int y = (j * h) / 64;
+            const uint8_t *p = rgba + ((size_t) y * (size_t) w + (size_t) x) * 4;
+            ah = fnv1a_byte(ah, p[3]); // alpha
+            rh = fnv1a_byte(rh, p[0]); // red
+        }
+    }
+    *out_alpha_fp = ah;
+    *out_red_fp = rh;
+}
+
 static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat,
                                  GLsizei width, GLsizei height, GLint border,
                                  GLenum format, GLenum type, const void *pixels) {
     g_pixel_teximage_calls++;
     if (g_pixel_teximage_calls <= 40) {
-        LOGI("pixel-gfx: texImage2D %dx%d fmt=0x%x type=0x%x level=%d",
-             width, height, (unsigned int) internalformat, type, level);
+        LOGI("pixel-gfx: texImage2D %dx%d fmt=0x%x type=0x%x level=%d path=%s",
+             width, height, (unsigned int) internalformat, type, level,
+             g_pending_tex_path_full[0] ? g_pending_tex_path_full : "-");
     } else {
         int seen = 0;
         for (int i = 0; i < g_pixel_teximg_seen_count; i++) {
@@ -632,6 +791,91 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
         LOGI("pixel-gfx: stats texImage2D_calls=%u texParam_rewrites=%u",
              g_pixel_teximage_calls, g_pixel_texparami_rewrites);
     }
+
+    // Texture replacement (mechanism 5): if a registered replacement matches
+    // this upload -- by asset path (addImage/createTexture hooks above) or,
+    // failing that, by content fingerprint (mechanism 5b, for uploads that
+    // bypass both hooks) -- upload the replacement's pixels instead of the
+    // game's. Independent of g_pixel_decimate -- active whenever anything is
+    // registered -- and checked ahead of decimation so a replaced texture is
+    // never also decimated. Only for fresh (level 0), real (pixels != NULL)
+    // RGBA/UNSIGNED_BYTE uploads, same guard style as decimation below.
+    if (level == 0 && pixels != NULL && format == GL_RGBA && type == GL_UNSIGNED_BYTE &&
+        g_tex_repl_count > 0) {
+        pthread_mutex_lock(&g_tex_repl_mutex);
+        tex_replacement_t *r = NULL;
+        int via_fingerprint = 0;
+
+        // First attempt: path-based match (original mechanism 5).
+        if (g_pending_tex_path[0]) {
+            for (int i = 0; i < g_tex_repl_count; i++) {
+                if (strcmp(g_tex_repl[i].name, g_pending_tex_path) == 0) { r = &g_tex_repl[i]; break; }
+            }
+        }
+
+        // Second attempt: content fingerprint (mechanism 5b). Only bother
+        // hashing the upload if its size matches at least one registered
+        // entry -- keeps this a no-op for the vast majority of uploads.
+        if (!r) {
+            int size_registered = 0;
+            for (int i = 0; i < g_tex_repl_count; i++) {
+                if (g_tex_repl[i].w == width && g_tex_repl[i].h == height) {
+                    size_registered = 1;
+                    break;
+                }
+            }
+            if (size_registered) {
+                uint64_t alpha_fp, red_fp;
+                tex_fingerprint((const uint8_t *) pixels, width, height, &alpha_fp, &red_fp);
+                tex_replacement_t *candidates[TEX_REPL_MAX];
+                int ncand = 0;
+                for (int i = 0; i < g_tex_repl_count; i++) {
+                    if (g_tex_repl[i].w == width && g_tex_repl[i].h == height &&
+                        g_tex_repl[i].alpha_fp == alpha_fp) {
+                        candidates[ncand++] = &g_tex_repl[i];
+                    }
+                }
+                if (ncand == 1) {
+                    r = candidates[0];
+                    via_fingerprint = 1;
+                } else if (ncand > 1) {
+                    for (int i = 0; i < ncand; i++) {
+                        if (candidates[i]->red_fp == red_fp) {
+                            r = candidates[i];
+                            via_fingerprint = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (r) {
+            if (r->w == width && r->h == height) {
+                if (p_real_glTexImage2D) {
+                    p_real_glTexImage2D(target, level, internalformat, width, height, border,
+                                         format, type, r->rgba);
+                }
+                if (!r->replaced_logged) {
+                    if (via_fingerprint) {
+                        LOGI("pixel-gfx: replaced %s by fingerprint", r->name);
+                    } else {
+                        LOGI("pixel-gfx: replaced %s %dx%d", r->name, width, height);
+                    }
+                    r->replaced_logged = 1;
+                }
+                pthread_mutex_unlock(&g_tex_repl_mutex);
+                return;
+            }
+            if (!r->mismatch_logged) {
+                LOGE("pixel-gfx: replacement %s is %dx%d, upload is %dx%d -- size mismatch, "
+                     "using original", r->name, r->w, r->h, width, height);
+                r->mismatch_logged = 1;
+            }
+        }
+        pthread_mutex_unlock(&g_tex_repl_mutex);
+    }
+
     // Decimate: keep one texel of every 2x2 block so pre-upscaled ~2x art
     // approximates the original 1x pixel art. Only for fresh (level 0),
     // real (pixels != NULL, so RenderTexture's empty-framebuffer allocation
@@ -782,6 +1026,17 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetPixelGraphics(JNIEnv *env, jc
             LOGE("pixel-gfx: real glTexImage2D not resolvable -- skipping diagnostic hook");
         } else {
             g_pixel_teximg_slot = pixel_find_jump_slot(g_pixel_lib_base, PIXEL_SYM_TEXIMAGE2D);
+            // Installed unconditionally (enable=1, not gated on the `enable`
+            // param below): hooked_glTexImage2D is also where texture
+            // replacement (mechanism 5) substitutes registered replacement
+            // pixels, which must stay active regardless of the pixel-
+            // graphics on/off pref -- see the addImage/createTexture hooks
+            // below, which feed it g_pending_tex_path. Decimation and the
+            // diagnostic logging inside the hook are separately gated by
+            // g_pixel_decimate and always-on respectively, so this being
+            // unconditional doesn't change their behavior.
+            pixel_patch_slot(g_pixel_teximg_slot, &g_pixel_teximg_orig,
+                              &g_pixel_teximg_orig_saved, (uintptr_t) hooked_glTexImage2D, 1);
         }
 
         p_real_glGenerateMipmap = (void (*)(GLenum)) dlsym(RTLD_DEFAULT, PIXEL_SYM_GENMIPMAP);
@@ -793,6 +1048,34 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetPixelGraphics(JNIEnv *env, jc
         } else {
             g_pixel_genmip_slot = pixel_find_jump_slot(g_pixel_lib_base, PIXEL_SYM_GENMIPMAP);
         }
+
+        // Texture replacement hooks (mechanism 5): TextureCache::addImage and
+        // ResourceManager::createTexture, both (const std::string&) overloads
+        // resolved from libchrono.so itself (h), same convention as the
+        // antialias/alias symbols above. Installed unconditionally here --
+        // independent of `enable` -- since consulting g_pending_tex_path in
+        // hooked_glTexImage2D is a no-op whenever the replacement registry is
+        // empty, so leaving these patched in is harmless.
+        p_real_addImage = (void *(*)(void *, const void *)) dlsym(h, PIXEL_SYM_ADDIMAGE);
+        if (!p_real_addImage) {
+            LOGE("pixel-gfx: symbol %s not found -- addImage texture replacement unavailable",
+                 PIXEL_SYM_ADDIMAGE);
+        } else {
+            g_pixel_addimage_slot = pixel_find_jump_slot(g_pixel_lib_base, PIXEL_SYM_ADDIMAGE);
+            pixel_patch_slot(g_pixel_addimage_slot, &g_pixel_addimage_orig,
+                              &g_pixel_addimage_orig_saved, (uintptr_t) hooked_addImage, 1);
+        }
+        p_real_createTexture = (void *(*)(void *, const void *)) dlsym(h, PIXEL_SYM_CREATETEXTURE);
+        if (!p_real_createTexture) {
+            LOGI("pixel-gfx: symbol %s not found -- createTexture texture replacement unavailable",
+                 PIXEL_SYM_CREATETEXTURE);
+        } else {
+            g_pixel_createtex_slot = pixel_find_jump_slot(g_pixel_lib_base, PIXEL_SYM_CREATETEXTURE);
+            pixel_patch_slot(g_pixel_createtex_slot, &g_pixel_createtex_orig,
+                              &g_pixel_createtex_orig_saved, (uintptr_t) hooked_createTexture, 1);
+        }
+        LOGI("pixel-gfx: texture-replacement hooks installed: addImage-slot=%p createTexture-slot=%p",
+             (void *) g_pixel_addimage_slot, (void *) g_pixel_createtex_slot);
     }
 
     uintptr_t addr = (uintptr_t) g_pixel_got_slot;
@@ -822,8 +1105,11 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetPixelGraphics(JNIEnv *env, jc
                       (uintptr_t) hooked_glTexParameteri, enable);
     pixel_patch_slot(g_pixel_texpf_slot, &g_pixel_texpf_orig, &g_pixel_texpf_orig_saved,
                       (uintptr_t) hooked_glTexParameterf, enable);
-    pixel_patch_slot(g_pixel_teximg_slot, &g_pixel_teximg_orig, &g_pixel_teximg_orig_saved,
-                      (uintptr_t) hooked_glTexImage2D, enable);
+    // glTexImage2D is intentionally NOT re-patched here on every toggle --
+    // it was installed unconditionally (enable=1) in the one-time setup
+    // block above and must stay installed even when `enable` is false, so
+    // texture replacement keeps working with pixel graphics off. See the
+    // comment at its install site.
     pixel_patch_slot(g_pixel_genmip_slot, &g_pixel_genmip_orig, &g_pixel_genmip_orig_saved,
                       (uintptr_t) hooked_glGenerateMipmap, enable);
 
@@ -856,6 +1142,92 @@ JNIEXPORT void JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeLogPixelStats(JNIEnv *env, jclass cls) {
     LOGI("pixel-gfx: stats texImage2D_calls=%u glGenerateMipmap_calls=%u texParam_rewrites=%u",
          g_pixel_teximage_calls, g_pixel_genmipmap_calls, g_pixel_texparami_rewrites);
+}
+
+// Registers (or replaces) a user-local texture substitution: `name` is the
+// asset basename (e.g. "c000_0.png", matched against g_pending_tex_path --
+// see mechanism 5 above -- or, failing that, by content fingerprint against
+// alphaFp/redFp -- see mechanism 5b / tex_fingerprint above), `w`/`h` its
+// pixel size, `rgba` its tightly packed PREMULTIPLIED RGBA8888 pixels (w*h*4
+// bytes, the game's own upload order). `alphaFp`/`redFp` are the FNV-1a
+// content fingerprints of the ORIGINAL asset (computed in Java, see
+// AppActivity#fingerprint, over the same 64x64 sample grid as
+// tex_fingerprint). Called from a background Java thread at boot
+// (AppActivity's orig_art scan); consulted from the GL thread inside
+// hooked_glTexImage2D -- g_tex_repl_mutex covers the handoff. Returns false
+// on a bad size, an rgba array whose length doesn't match w*h*4, an OOM, or
+// a full table (already-registered `name` always succeeds by replacing the
+// existing entry, regardless of table fullness).
+JNIEXPORT jboolean JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeRegisterTextureReplacement(
+        JNIEnv *env, jclass cls, jstring name, jint w, jint h,
+        jlong alphaFp, jlong redFp, jbyteArray rgba) {
+    if (!name || !rgba || w <= 0 || h <= 0) return JNI_FALSE;
+    jsize rgba_len = (*env)->GetArrayLength(env, rgba);
+    size_t needed = (size_t) w * (size_t) h * 4;
+    if ((size_t) rgba_len != needed) {
+        LOGE("pixel-gfx: nativeRegisterTextureReplacement: rgba length %d != %zu for %dx%d",
+             (int) rgba_len, needed, w, h);
+        return JNI_FALSE;
+    }
+    const char *cname = (*env)->GetStringUTFChars(env, name, NULL);
+    if (!cname) return JNI_FALSE;
+
+    uint8_t *buf = (uint8_t *) malloc(needed);
+    if (!buf) {
+        LOGE("pixel-gfx: nativeRegisterTextureReplacement: malloc(%zu) failed for %s",
+             needed, cname);
+        (*env)->ReleaseStringUTFChars(env, name, cname);
+        return JNI_FALSE;
+    }
+    (*env)->GetByteArrayRegion(env, rgba, 0, rgba_len, (jbyte *) buf);
+
+    jboolean ok = JNI_FALSE;
+    pthread_mutex_lock(&g_tex_repl_mutex);
+    tex_replacement_t *slot = NULL;
+    for (int i = 0; i < g_tex_repl_count; i++) {
+        if (strcmp(g_tex_repl[i].name, cname) == 0) { slot = &g_tex_repl[i]; break; }
+    }
+    if (!slot && g_tex_repl_count < TEX_REPL_MAX) {
+        slot = &g_tex_repl[g_tex_repl_count++];
+        memset(slot, 0, sizeof(*slot));
+        strncpy(slot->name, cname, sizeof(slot->name) - 1);
+    }
+    if (slot) {
+        free(slot->rgba);
+        slot->rgba = buf;
+        slot->w = w;
+        slot->h = h;
+        slot->alpha_fp = (uint64_t) alphaFp;
+        slot->red_fp = (uint64_t) redFp;
+        slot->replaced_logged = 0;
+        slot->mismatch_logged = 0;
+        ok = JNI_TRUE;
+    } else {
+        LOGE("pixel-gfx: nativeRegisterTextureReplacement: table full (%d), dropping %s",
+             TEX_REPL_MAX, cname);
+        free(buf);
+    }
+    pthread_mutex_unlock(&g_tex_repl_mutex);
+
+    if (ok) LOGI("pixel-gfx: registered replacement %s %dx%d", cname, w, h);
+    (*env)->ReleaseStringUTFChars(env, name, cname);
+    return ok;
+}
+
+// Frees and clears every registered replacement (not currently called from
+// Java, provided for completeness/symmetry with the register call and for
+// a future "reload" UI action).
+JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeClearTextureReplacements(JNIEnv *env, jclass cls) {
+    pthread_mutex_lock(&g_tex_repl_mutex);
+    for (int i = 0; i < g_tex_repl_count; i++) {
+        free(g_tex_repl[i].rgba);
+        g_tex_repl[i].rgba = NULL;
+    }
+    g_tex_repl_count = 0;
+    pthread_mutex_unlock(&g_tex_repl_mutex);
+    LOGI("pixel-gfx: cleared all texture replacements");
 }
 
 // Read from the translated-65816 layer's virtual SNES memory ("Asm" buffer).
