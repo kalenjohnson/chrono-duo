@@ -126,7 +126,19 @@ Verified live on device (values matched Crono/Marle/Lucca/… canonical stats):
   `GameState.dumpToFiles()` writes sfcwork.bin (64KB) + asmmem.bin (192KB) to
   the app's external files dir every 8s (dev only); adb pull before/after a
   known in-game change and diff with python.
-- **Still open:** gold, play time, current map/area id, battle state.
+- **Gold = cSfcWork+0x1a04 (u32), play time seconds = +0x1a10 (u32)** — found
+  by differential dumps (Bronze Blade purchase / idle ticking). Both live.
+- **SHELVED — hiding the on-screen MENU/Map buttons:** scene-graph walker works
+  (safe reads via process_vm_readv after a SIGSEGV lesson; find_running_scene
+  scans Director members for RTTI "*Scene"). Field screen button = `FieldMenu`
+  node, world map = `WorldMenu` (3 MenuItemSprites). BUT the periodic
+  `nativeSetVisibleByPattern("WorldMenu", false)` doesn't stick — dumps still
+  show WorldMenu vis=1. Unclear whether the tick isn't reaching the GL thread,
+  the game re-shows the node, or find_running_scene picks a stale Scene at
+  hide-time. Debug later (log the per-tick hit count first). Dev trigger
+  exists: `adb shell am broadcast -a com.kalenjohnson.chronoduo.SCENE_DUMP`.
+- **Still open:** current map/area id, battle state, character portraits
+  (need resources.bin decryption à la ChronoMod).
   For gold: diff before/after buying something. For play time: two dumps with
   everything else idle. Battle info: `SfcBattleWork` / `SceneBattle::getwork8`
   (reads a buffer pointer at SceneBattle+0x8) is the entry point.

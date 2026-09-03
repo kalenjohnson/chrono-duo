@@ -91,6 +91,37 @@ public class AppActivity extends Cocos2dxActivity {
                 }
             };
             h.postDelayed(dump, 8000);
+
+            // "clean UI": keep the game's on-screen touch buttons hidden — the
+            // controller covers them (Y = menu). Re-applied every 2s because
+            // scene transitions rebuild the UI nodes.
+            Runnable cleanUi = new Runnable() {
+                @Override public void run() {
+                    Cocos2dxHelper.runOnGLThread(() -> {
+                        for (String pat : com.kalenjohnson.chronoduo.GameState.HIDDEN_UI_PATTERNS) {
+                            com.kalenjohnson.chronoduo.GameState.nativeSetVisibleByPattern(pat, false);
+                        }
+                    });
+                    h.postDelayed(this, 2000);
+                }
+            };
+            h.postDelayed(cleanUi, 2000);
+        }
+
+        // dev trigger: adb shell am broadcast -a com.kalenjohnson.chronoduo.SCENE_DUMP
+        android.content.IntentFilter filter =
+                new android.content.IntentFilter("com.kalenjohnson.chronoduo.SCENE_DUMP");
+        android.content.BroadcastReceiver devReceiver = new android.content.BroadcastReceiver() {
+            @Override public void onReceive(Context c, android.content.Intent i) {
+                int depth = i.getIntExtra("depth", 4);
+                Cocos2dxHelper.runOnGLThread(
+                        () -> com.kalenjohnson.chronoduo.GameState.nativeSceneDump(depth));
+            }
+        };
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(devReceiver, filter, Context.RECEIVER_EXPORTED);
+        } else {
+            registerReceiver(devReceiver, filter);
         }
     }
 

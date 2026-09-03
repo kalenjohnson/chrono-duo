@@ -40,15 +40,35 @@ public final class SecondScreenManager {
         this.displayManager = (DisplayManager) activity.getSystemService(Activity.DISPLAY_SERVICE);
     }
 
+    private final android.content.BroadcastReceiver screenOnReceiver =
+            new android.content.BroadcastReceiver() {
+                @Override public void onReceive(android.content.Context ctx, android.content.Intent i) {
+                    // After device sleep the panel powers back on without any
+                    // display event; the old Presentation surface stays black.
+                    // Recreate it from scratch.
+                    dismiss();
+                    handler.postDelayed(SecondScreenManager.this::update, 400);
+                }
+            };
+
     public void onResume() {
         resumed = true;
         displayManager.registerDisplayListener(listener, handler);
+        activity.registerReceiver(screenOnReceiver,
+                new android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_ON));
         update();
+        // displays are sometimes not ready the instant we resume — retry briefly
+        handler.postDelayed(this::update, 600);
+        handler.postDelayed(this::update, 2500);
     }
 
     public void onPause() {
         resumed = false;
         displayManager.unregisterDisplayListener(listener);
+        try {
+            activity.unregisterReceiver(screenOnReceiver);
+        } catch (IllegalArgumentException ignored) {
+        }
         dismiss();
     }
 
