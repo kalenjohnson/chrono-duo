@@ -28,6 +28,7 @@ final class TargetingInput {
 
     private static final long ARROW_UP_DELAY_MS = 120;
     private static final long CONFIRM_UP_DELAY_MS = 70;
+    private static final long BACK_UP_DELAY_MS = 70;
 
     private static final Handler handler = new Handler(Looper.getMainLooper());
     private static boolean connected;
@@ -55,6 +56,21 @@ final class TargetingInput {
     /** Confirms the current target (A down, then up ~70ms later). */
     static void confirm() {
         press(GameControllerDelegate.BUTTON_A, CONFIRM_UP_DELAY_MS);
+    }
+
+    /** Moves the submenu list cursor up (dpad-up down, then up ~120ms later). */
+    static void up() {
+        press(GameControllerDelegate.BUTTON_DPAD_UP, ARROW_UP_DELAY_MS);
+    }
+
+    /** Moves the submenu list cursor down (dpad-down down, then up ~120ms later). */
+    static void down() {
+        press(GameControllerDelegate.BUTTON_DPAD_DOWN, ARROW_UP_DELAY_MS);
+    }
+
+    /** Backs out of the submenu list (B down, then up ~70ms later). */
+    static void back() {
+        press(GameControllerDelegate.BUTTON_B, BACK_UP_DELAY_MS);
     }
 
     private static void press(int button, long upDelayMs) {

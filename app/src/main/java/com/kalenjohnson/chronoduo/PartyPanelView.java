@@ -135,6 +135,24 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private static final long ARROW_COOLDOWN_NANOS = 120_000_000L;
     private static final long CONFIRM_COOLDOWN_NANOS = 250_000_000L;
 
+    // Submenu-list phase: tapping Tech or Item (injectCommand idx 1/2) opens
+    // the game's own scrollable tech/item list instead of arming target
+    // selection directly, so the on-panel band offers up/down/confirm/back
+    // navigation for it instead of the targeting arrows. Mirrors targeting's
+    // deadline-based isTargetingActive() pattern: listUntil is a nanoTime
+    // deadline (-1 when inactive), computed live each frame in
+    // isListActive() rather than cached. List-Confirm (a tech/item got
+    // picked) transitions straight into TARGETING mode -- selection is
+    // always followed by target selection -- while List-Back or either of
+    // targeting's own exits (next menu open, battle end) just clear it.
+    private static final long LIST_DURATION_NANOS = 15_000_000_000L;
+    private long listUntil = -1L;
+    // Up-/down-triangle glyphs, same unicode-escape rule as TARGET_LABELS.
+    private static final String[] LIST_LABELS = {"\u25B2", "\u25BC", "Confirm", "Back"};
+    // Hit rects for the four list buttons: 0=up, 1=down, 2=confirm, 3=back.
+    private final RectF[] listHitBoxes = {new RectF(), new RectF(), new RectF(), new RectF()};
+    private int listCount;
+
     private static final int[] PORTRAIT_COLORS = {
             Color.rgb(196, 84, 40), Color.rgb(120, 180, 230), Color.rgb(120, 200, 120),
             Color.rgb(190, 160, 70), Color.rgb(80, 160, 90), Color.rgb(230, 200, 140),
@@ -219,6 +237,14 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 }
             }
         }
+        if (isListActive(System.nanoTime()) && listCount > 0) {
+            for (int i = 0; i < listCount; i++) {
+                if (listHitBoxes[i].contains(event.getX(), event.getY())) {
+                    injectList(i);
+                    return true;
+                }
+            }
+        }
         return false;
     }
 
@@ -230,6 +256,18 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      */
     private boolean isTargetingActive(long now) {
         return snap.inBattle && !snap.menuOpen && targetingUntil > 0 && now < targetingUntil;
+    }
+
+    /**
+     * True while the submenu-list band (Tech/Item navigation) should be
+     * shown/hit-testable -- same shape as {@link #isTargetingActive} but
+     * gated on {@link #listUntil} instead. Targeting and list mode are
+     * mutually exclusive: arming one always clears the other (see {@link
+     * #injectCommand} and {@link #injectList}), so at most one of the two is
+     * ever true for a given snapshot.
+     */
+    private boolean isListActive(long now) {
+        return snap.inBattle && !snap.menuOpen && listUntil > 0 && now < listUntil;
     }
 
     /**
@@ -257,13 +295,50 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     }
 
     /**
+     * Injects list-navigation input for submenu-list button {@code idx}
+     * (0=up, 1=down, 2=confirm, 3=back) via {@link TargetingInput}, cooldown-
+     * guarded like {@link #injectTarget} (up/down share {@link
+     * #ARROW_COOLDOWN_NANOS}/{@link #lastArrowInjectAt} with the targeting
+     * arrows; confirm/back share {@link #CONFIRM_COOLDOWN_NANOS}/{@link
+     * #lastConfirmInjectAt} with targeting's confirm -- list and targeting
+     * are never active at the same time, so sharing the cooldown clocks is
+     * safe). Confirm means a tech/item was just picked, so it transitions
+     * straight into {@link #TARGETING_DURATION_NANOS} of targeting mode
+     * rather than merely clearing list mode. Back leaves the submenu with no
+     * further mode armed.
+     */
+    private void injectList(int idx) {
+        long now = System.nanoTime();
+        if (idx == 2) { // confirm
+            if (lastConfirmInjectAt >= 0 && now - lastConfirmInjectAt < CONFIRM_COOLDOWN_NANOS) return;
+            lastConfirmInjectAt = now;
+            TargetingInput.confirm();
+            listUntil = -1L;
+            targetingUntil = now + TARGETING_DURATION_NANOS;
+        } else if (idx == 3) { // back
+            if (lastConfirmInjectAt >= 0 && now - lastConfirmInjectAt < CONFIRM_COOLDOWN_NANOS) return;
+            lastConfirmInjectAt = now;
+            TargetingInput.back();
+            listUntil = -1L;
+        } else {
+            if (lastArrowInjectAt >= 0 && now - lastArrowInjectAt < ARROW_COOLDOWN_NANOS) return;
+            lastArrowInjectAt = now;
+            if (idx == 0) TargetingInput.up(); else TargetingInput.down();
+        }
+        invalidate();
+    }
+
+    /**
      * Injects a tap for command button {@code idx} (0=Attack, 1=Tech,
      * 2=Item) at its live game-screen coordinates via {@link BattleInput},
      * guarded so an injection never fires outside battle/menuOpen, never
      * fires when the underlying command list is stale/shorter than idx, and
      * never fires more than once per {@link #INJECT_COOLDOWN_NANOS} (one
      * in-flight tap at a time). Also arms the brief pressed-button visual
-     * feedback.
+     * feedback. Which follow-up mode gets armed depends on what was tapped:
+     * Attack (idx 0) goes straight to target selection, as before; Tech/Item
+     * (idx 1/2) open the submenu-list band instead, since those commands
+     * present the game's own tech/item list before a target is chosen.
      */
     private void injectCommand(int idx) {
         if (!snap.inBattle || !snap.menuOpen) return;
@@ -275,7 +350,13 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         pressedAt = now;
         PartySnapshot.CommandTarget t = snap.commandTargets.get(idx);
         BattleInput.tap(t.x, t.y);
-        targetingUntil = now + TARGETING_DURATION_NANOS;
+        if (idx == 0) {
+            targetingUntil = now + TARGETING_DURATION_NANOS;
+            listUntil = -1L;
+        } else {
+            listUntil = now + LIST_DURATION_NANOS;
+            targetingUntil = -1L;
+        }
         invalidate();
     }
 
@@ -314,6 +395,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             // itself ended -- don't wait out the timeout in either case.
             targetingUntil = -1L;
         }
+        if (listUntil > 0 && (!s.inBattle || s.menuOpen)) {
+            // same two early-exit conditions as targeting, above.
+            listUntil = -1L;
+        }
         snap = s;
         invalidate();
     }
@@ -335,6 +420,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         titleFadeStart = -1L;
         fadingOutTitle = null;
         targetingUntil = -1L;
+        listUntil = -1L;
         ChronoAssets.removeListener(this);
         super.onDetachedFromWindow();
     }
@@ -584,11 +670,14 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // Leave room for the command-button band (see drawCommandButtons)
         // when it's showing, so a long enemy list compresses instead of
         // drawing through the buttons.
-        // Reserve the command-button band's space whenever either the
-        // command menu or the target-selection band is showing (only ever
-        // true for the live snapshot -- see isTargetingActive), so a long
-        // enemy list compresses instead of drawing through either band.
-        boolean reserveBand = s.menuOpen || (live && isTargetingActive(System.nanoTime()));
+        // Reserve the command-button band's space whenever the command menu,
+        // the target-selection band, or the submenu-list band is showing
+        // (only ever true for the live snapshot -- see isTargetingActive/
+        // isListActive), so a long enemy list compresses instead of drawing
+        // through any of the three.
+        long now = System.nanoTime();
+        boolean reserveBand = s.menuOpen
+                || (live && isTargetingActive(now)) || (live && isListActive(now));
         float areaBottom = reserveBand
                 ? parchment.bottom - h * 0.26f
                 : parchment.bottom - h * 0.09f;
@@ -637,15 +726,36 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             RectF box = new RectF(x, bandTop, x + btnW, bandBottom);
             boolean pressed = live && pressedCommand == i
                     && pressedAt >= 0 && System.nanoTime() - pressedAt < PRESS_FEEDBACK_NANOS;
-            drawCommandButton(c, box, COMMAND_LABELS[i], winTex, pressed);
+            // Attack (index 0) gets a subtle default-selected treatment,
+            // matching the game's own touchscreen default highlighting --
+            // purely cosmetic, suppressed while the pressed-feedback flash
+            // is showing so the two don't visually compete.
+            drawCommandButton(c, box, COMMAND_LABELS[i], winTex, pressed, i == 0);
             if (live) commandHitBoxes[i].set(box);
             x += btnW + gap;
         }
         if (live) commandCount = count;
     }
 
+    // Warm-gold accent used for the default-selected button highlight (see
+    // drawCommandButton's highlighted param) -- distinct from the neutral
+    // white pressed-feedback tint so the two read as different things even
+    // if they ever briefly overlapped.
+    private static final int DEFAULT_HIGHLIGHT_COLOR = Color.rgb(255, 224, 130);
+
     /** One command button: 9-sliced window texture (fallback: hand-drawn navy box), centered label, optional pressed-state overlay. */
     private void drawCommandButton(Canvas c, RectF box, String label, Bitmap winTex, boolean pressed) {
+        drawCommandButton(c, box, label, winTex, pressed, false);
+    }
+
+    /**
+     * Same as the 4-arg overload, plus {@code highlighted}: a subtle
+     * brighter border + faint tint applied when true (and {@code pressed} is
+     * false, so it never fights the pressed flash), matching the game's own
+     * touchscreen default highlighting -- purely cosmetic, carries no
+     * targeting/injection meaning.
+     */
+    private void drawCommandButton(Canvas c, RectF box, String label, Bitmap winTex, boolean pressed, boolean highlighted) {
         if (winTex != null) {
             float destInset = Math.min(box.width(), box.height()) * 0.16f;
             drawNinePatch(c, winTex, ChronoAssets.WINDOW_TEX_INSET, box, destInset);
@@ -660,6 +770,18 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             inner.inset(2, 2);
             fill.setColor(BOX_BG);
             c.drawRect(inner, fill);
+        }
+        if (highlighted && !pressed) {
+            fill.setShader(null);
+            fill.setColor(Color.argb(50, Color.red(DEFAULT_HIGHLIGHT_COLOR),
+                    Color.green(DEFAULT_HIGHLIGHT_COLOR), Color.blue(DEFAULT_HIGHLIGHT_COLOR)));
+            c.drawRect(box, fill);
+            stroke.setStrokeWidth(2.5f);
+            stroke.setColor(Color.argb(210, Color.red(DEFAULT_HIGHLIGHT_COLOR),
+                    Color.green(DEFAULT_HIGHLIGHT_COLOR), Color.blue(DEFAULT_HIGHLIGHT_COLOR)));
+            RectF hb = new RectF(box);
+            hb.inset(1.5f, 1.5f);
+            c.drawRect(hb, stroke);
         }
         if (pressed) {
             fill.setShader(null);
@@ -708,6 +830,34 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         targetHitBoxes[2].set(right);
 
         targetCount = 3;
+    }
+
+    /**
+     * Submenu-list band: four equal-width buttons (up-triangle / down-
+     * triangle / "Confirm" / "Back", see {@link #LIST_LABELS}) in the same
+     * band position/chrome as {@link #drawCommandButtons} and {@link
+     * #drawTargetingButtons} (reusing {@link #drawCommandButton}), shown
+     * instead of both once {@link #isListActive} is true. Only ever called
+     * for the live snapshot, like {@link #drawTargetingButtons}, so always
+     * updates {@link #listHitBoxes} unconditionally.
+     */
+    private void drawListButtons(Canvas c, RectF parchment) {
+        int w = getWidth(), h = getHeight();
+        float bandTop = parchment.bottom - h * 0.235f;
+        float bandBottom = parchment.bottom - h * 0.115f;
+        float gap = w * 0.02f;
+        float totalW = parchment.width() - w * 0.09f * 2f;
+        float btnW = (totalW - gap * 3f) / 4f;
+        float x = parchment.left + w * 0.09f;
+        Bitmap winTex = ChronoAssets.getWindowTex();
+
+        for (int i = 0; i < 4; i++) {
+            RectF box = new RectF(x, bandTop, x + btnW, bandBottom);
+            drawCommandButton(c, box, LIST_LABELS[i], winTex, false);
+            listHitBoxes[i].set(box);
+            x += btnW + gap;
+        }
+        listCount = 4;
     }
 
     private static float clamp01(float v) {
@@ -1031,33 +1181,45 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // they'd sit under the vignette and the inner ink-frame stroke,
         // which is why the eye toggle is placed here too. Only ever drawn/
         // hit-testable against the live snapshot, never the fading-out one.
-        boolean targeting = snap.inBattle && isTargetingActive(System.nanoTime());
+        long bandNow = System.nanoTime();
+        boolean targeting = snap.inBattle && isTargetingActive(bandNow);
+        boolean listMode = snap.inBattle && isListActive(bandNow);
         if (snap.inBattle) {
             drawEyeToggle(c, parchment);
             if (targeting) {
                 drawTargetingButtons(c, parchment);
                 commandCount = 0;
+                listCount = 0;
+            } else if (listMode) {
+                drawListButtons(c, parchment);
+                commandCount = 0;
+                targetCount = 0;
             } else {
                 drawCommandButtons(c, parchment, snap, true);
                 targetCount = 0;
+                listCount = 0;
             }
         } else {
             eyeHitBox.setEmpty();
             commandCount = 0;
             targetCount = 0;
+            listCount = 0;
         }
-        // targeting mode has its own wall-clock timeout (see
-        // isTargetingActive) that isn't tied to a snapshot change, so the
-        // band needs exactly one more repaint right at the deadline or it
-        // would only clear itself whenever the next update() happens to
-        // land. This is a single delayed callback, not the postInvalidate-
-        // OnAnimation loop the other animators below use -- that would
-        // redraw at display refresh rate (full parchment/speckle/ninepatch
-        // repaint) for up to 8s straight after every command, which breaks
-        // this view's "fully idle once settled" invariant for no visible
-        // benefit (nothing here is actually animating frame to frame).
+        // targeting/list mode each has its own wall-clock timeout (see
+        // isTargetingActive/isListActive) that isn't tied to a snapshot
+        // change, so the band needs exactly one more repaint right at the
+        // deadline or it would only clear itself whenever the next update()
+        // happens to land. This is a single delayed callback, not the
+        // postInvalidateOnAnimation loop the other animators below use --
+        // that would redraw at display refresh rate (full parchment/
+        // speckle/ninepatch repaint) for up to 15s straight after every
+        // command, which breaks this view's "fully idle once settled"
+        // invariant for no visible benefit (nothing here is actually
+        // animating frame to frame).
         if (targeting) {
             postInvalidateDelayed(Math.max(1L, (targetingUntil - System.nanoTime()) / 1_000_000L + 16L));
+        } else if (listMode) {
+            postInvalidateDelayed(Math.max(1L, (listUntil - System.nanoTime()) / 1_000_000L + 16L));
         }
 
         // DS-style status boxes along the top, one per party member (n > 0
