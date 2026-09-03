@@ -5,9 +5,11 @@ import java.util.List;
 
 /**
  * Parsed party state. Character records live at cSfcWork+0x10 with stride
- * 0x120: +0x00 char id, +0x10 curHP, +0x14 maxHP, +0x18 curMP, +0x1c maxMP,
- * +0x40 level (u32 LE each). Active names: libc++ std::strings at +0x19a8,
- * stride 0x18 (always SSO-short for 6-char names).
+ * 0x120: +0x00 char id, +0x10 maxHP, +0x14 curHP, +0x18 maxMP, +0x1c curMP,
+ * +0x40 level (u32 LE each). HP order verified live (post-loss panel read
+ * "70/1" — 70 is Crono's max, at +0x10). MP order is inferred to mirror HP's
+ * (max-then-cur) and is NOT independently verified. Active names: libc++
+ * std::strings at +0x19a8, stride 0x18 (always SSO-short for 6-char names).
  */
 public final class PartySnapshot {
     public static final String[] DEFAULT_NAMES =
@@ -49,15 +51,15 @@ public final class PartySnapshot {
             int slot = u32(b, 0x11c);
             if (slot < 1 || slot > 3) continue; // not in the active party
             int level = u32(b, 0x40);
-            int maxHp = u32(b, 0x14);
+            int maxHp = u32(b, 0x10);
             if (level <= 0 || level > 99 || maxHp <= 0 || maxHp > 999) continue;
             Member m = new Member();
             m.slot = slot;
             m.level = level;
-            m.curHp = u32(b, 0x10);
             m.maxHp = maxHp;
-            m.curMp = u32(b, 0x18);
-            m.maxMp = u32(b, 0x1c);
+            m.curHp = u32(b, 0x14);
+            m.maxMp = u32(b, 0x18);
+            m.curMp = u32(b, 0x1c);
             m.name = readName(i);
             snap.members.add(m);
         }

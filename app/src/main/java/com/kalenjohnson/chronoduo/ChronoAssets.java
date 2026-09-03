@@ -5,7 +5,6 @@ import android.graphics.Canvas;
 import android.graphics.ColorMatrix;
 import android.graphics.ColorMatrixColorFilter;
 import android.graphics.Paint;
-import android.graphics.Rect;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -72,39 +71,6 @@ public final class ChronoAssets {
     }
 
     /**
-     * Crops a bitmap to the bounding box of its non-transparent / non-uniform
-     * pixels, measured against the top-left pixel as the assumed background
-     * color. Used for wb_mini.png, whose actual used region (roughly the
-     * top-left ~128x176 of a 256x256 sheet) isn't verified precisely enough
-     * to hardcode.
-     */
-    public static Bitmap autoCropContent(Bitmap src) {
-        int w = src.getWidth(), h = src.getHeight();
-        int[] px = new int[w * h];
-        src.getPixels(px, 0, w, 0, 0, w, h);
-        int bg = px[0];
-        int bgA = (bg >>> 24) & 0xff;
-
-        int minX = w, minY = h, maxX = -1, maxY = -1;
-        for (int y = 0; y < h; y++) {
-            int row = y * w;
-            for (int x = 0; x < w; x++) {
-                int p = px[row + x];
-                int a = (p >>> 24) & 0xff;
-                if (a < 16) continue; // transparent
-                if (colorDistance(p, bg) < 12 && Math.abs(a - bgA) < 12) continue; // near-uniform background
-                if (x < minX) minX = x;
-                if (x > maxX) maxX = x;
-                if (y < minY) minY = y;
-                if (y > maxY) maxY = y;
-            }
-        }
-        if (maxX < 0) return src; // nothing detected as content; use the whole sheet
-        Rect bounds = new Rect(minX, minY, maxX + 1, maxY + 1);
-        return Bitmap.createBitmap(src, bounds.left, bounds.top, bounds.width(), bounds.height());
-    }
-
-    /**
      * Desaturates and warms a bitmap toward aged sepia parchment: low
      * saturation, then a per-channel scale+offset that pushes cool blues
      * (ocean) down to dark brown and greens (land) to mid-brown ink instead
@@ -129,12 +95,5 @@ public final class ChronoAssets {
         p.setColorFilter(new ColorMatrixColorFilter(cm));
         c.drawBitmap(src, 0, 0, p);
         return out;
-    }
-
-    private static int colorDistance(int a, int b) {
-        int dr = ((a >> 16) & 0xff) - ((b >> 16) & 0xff);
-        int dg = ((a >> 8) & 0xff) - ((b >> 8) & 0xff);
-        int db = (a & 0xff) - (b & 0xff);
-        return Math.abs(dr) + Math.abs(dg) + Math.abs(db);
     }
 }

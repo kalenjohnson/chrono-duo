@@ -16,12 +16,16 @@ import android.view.View;
 import java.util.Random;
 
 /**
- * DS-style bottom screen: compact navy HP/MP boxes in the top-left (portrait,
- * HP xx/ xx, MP xx/ xx) and a parchment map panel as the centerpiece, showing
- * the live location name and — once ChronoAssets finishes its background
- * extraction from resources.bin — the game's own portrait and world-map art.
- * Colored-initial portraits and a hand-drawn marker remain as fallbacks when
- * that art isn't available yet (or at all).
+ * DS-style bottom screen. Before any party member has been read (no game
+ * attached yet, or nothing has passed the sanity check), the whole panel is
+ * skipped in favor of a minimal black-screen "CHRONO DUO" wordmark — see
+ * {@link #drawWordmark}. Once a party exists: compact navy HP/MP boxes in the
+ * top-left (portrait, HP xx/ xx, MP xx/ xx) and a torn-edge parchment map
+ * panel as the centerpiece, showing the live location name and — once
+ * ChronoAssets finishes its background extraction from resources.bin — the
+ * game's own portrait and world-map art. Colored-initial portraits and a
+ * hand-drawn marker remain as fallbacks when that art isn't available yet
+ * (or at all).
  */
 public final class PartyPanelView extends View implements ChronoAssets.Listener {
     // face.png layout: 4x2 grid of 96x88 tiles, char-id order (Crono..Magus,
@@ -60,6 +64,13 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private final Paint markerPaint = new Paint();
     private final Path speckles = new Path();
     private int speckleW, speckleH;
+    // torn-paper outline: dark-edge path is the full parchment rect walked
+    // and jittered; paper path is the same walk on the inset paper rect, so
+    // the "deckled" fill sits a few px inside the ripped dark edge, same as
+    // the old rounded-rect version's 7px inset.
+    private final Path tornEdge = new Path();
+    private final Path tornPaper = new Path();
+    private int tornW, tornH;
 
     public PartyPanelView(Context context) {
         super(context);
@@ -204,15 +215,70 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         }
     }
 
-    /** Base parchment sheet (dark edge + paper fill) only, drawn before the map so the aging overlay below can sit on top of it. */
-    private void drawParchmentBase(Canvas c, RectF r) {
-        fill.setShader(null);
-        fill.setColor(PAPER_EDGE);
-        c.drawRoundRect(r, 26, 26, fill);
+    /**
+     * Walks a rect's perimeter in ~16px steps, nudging each point inward or
+     * outward by a few px of seeded noise along the local edge normal, and
+     * closes the result into a jagged "torn/deckled paper" outline. Same
+     * deterministic-cache spirit as {@link #buildSpeckles}: called with a
+     * fixed seed so the tear pattern doesn't crawl frame to frame.
+     */
+    private static void buildTornPath(Path out, RectF r, long seed, float amplitude, float step) {
+        Random rnd = new Random(seed);
+        float[][] edges = {
+                {r.left, r.top, r.right, r.top},
+                {r.right, r.top, r.right, r.bottom},
+                {r.right, r.bottom, r.left, r.bottom},
+                {r.left, r.bottom, r.left, r.top},
+        };
+        boolean first = true;
+        for (float[] e : edges) {
+            float x0 = e[0], y0 = e[1], x1 = e[2], y1 = e[3];
+            float dx = x1 - x0, dy = y1 - y0;
+            float len = (float) Math.hypot(dx, dy);
+            int n = Math.max(1, Math.round(len / step));
+            float ux = dx / len, uy = dy / len;
+            float nx = -uy, ny = ux; // edge normal, for inward/outward jitter
+            for (int i = 0; i < n; i++) {
+                float t = i / (float) n;
+                float px = x0 + dx * t, py = y0 + dy * t;
+                float noise = (rnd.nextFloat() * 2f - 1f) * amplitude;
+                px += nx * noise;
+                py += ny * noise;
+                if (first) {
+                    out.moveTo(px, py);
+                    first = false;
+                } else {
+                    out.lineTo(px, py);
+                }
+            }
+        }
+        out.close();
+    }
+
+    private void buildTornPaths(RectF r) {
+        int w = getWidth(), h = getHeight();
+        if (w == tornW && h == tornH) return;
+        tornW = w;
+        tornH = h;
+        tornEdge.reset();
+        buildTornPath(tornEdge, r, 4242L, 3.5f, 16f);
         RectF paper = new RectF(r);
         paper.inset(7, 7);
+        tornPaper.reset();
+        // smaller amplitude than tornEdge, and independently seeded — kept
+        // low so the two outlines (edge amplitude 3.5, 7px apart at rest)
+        // can't wander close enough to pinch the dark border to ~0px
+        buildTornPath(tornPaper, paper, 4243L, 1.5f, 16f);
+    }
+
+    /** Base parchment sheet (dark edge + paper fill) only, drawn before the map so the aging overlay below can sit on top of it. */
+    private void drawParchmentBase(Canvas c, RectF r) {
+        buildTornPaths(r);
+        fill.setShader(null);
+        fill.setColor(PAPER_EDGE);
+        c.drawPath(tornEdge, fill);
         fill.setColor(PAPER);
-        c.drawRoundRect(paper, 20, 20, fill);
+        c.drawPath(tornPaper, fill);
     }
 
     /**
@@ -223,18 +289,19 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private void drawParchmentOverlay(Canvas c, RectF r) {
         RectF paper = new RectF(r);
         paper.inset(7, 7);
+        buildTornPaths(r);
         // aged vignette toward the edges (strengthened so it reads through the map)
         fill.setShader(new RadialGradient(paper.centerX(), paper.centerY(),
                 Math.max(paper.width(), paper.height()) * 0.62f,
                 new int[]{Color.TRANSPARENT, Color.argb(90, 60, 40, 10)},
                 null, Shader.TileMode.CLAMP));
-        c.drawRoundRect(paper, 20, 20, fill);
+        c.drawPath(tornPaper, fill);
         fill.setShader(null);
         // speckles
         buildSpeckles(getWidth(), getHeight());
         fill.setColor(Color.argb(34, 80, 55, 20));
         c.save();
-        c.clipRect(paper);
+        c.clipPath(tornPaper);
         c.drawPath(speckles, fill);
         c.restore();
         // inner ink frame line, hand-drawn-map vibe
@@ -245,8 +312,27 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         c.drawRoundRect(frame, 12, 12, stroke);
     }
 
+    /**
+     * Before any party data has arrived (no members yet), skip the whole
+     * parchment/DS-panel rendering and show a minimal black-screen wordmark
+     * instead — no boxes, no subtitle, nothing else to imply readiness that
+     * isn't there yet.
+     */
+    private void drawWordmark(Canvas c) {
+        int w = getWidth(), h = getHeight();
+        c.drawColor(Color.BLACK);
+        setText(h * 0.09f, Color.WHITE, true, Paint.Align.CENTER, true);
+        text.setTypeface(Typeface.create(Typeface.DEFAULT_BOLD, Typeface.BOLD));
+        c.drawText("CHRONO DUO", w / 2f, h / 2f + h * 0.03f, text);
+    }
+
     @Override
     protected void onDraw(Canvas c) {
+        if (snap.members.isEmpty()) {
+            drawWordmark(c);
+            return;
+        }
+
         int w = getWidth(), h = getHeight();
         float pad = w * 0.02f;
 
@@ -259,10 +345,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // Leene Square, etc. — the DS game doesn't show the world map
         // there, and neither should this view).
         boolean overworld = snap.mapName == null || snap.mapName.isEmpty();
-        String title = overworld
-                ? (snap.members.isEmpty() ? "— uncharted —" : "World Map")
-                : snap.mapName;
+        String title = overworld ? "World Map" : snap.mapName;
 
+        // clip the map/title content to the torn-paper path so nothing draws
+        // past the ripped edge (drawParchmentBase() above already built it)
+        c.save();
+        c.clipPath(tornPaper);
         if (overworld) {
             // small title above the map
             setText(h * 0.045f, INK, true, Paint.Align.CENTER, false);
@@ -275,11 +363,16 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 // area between the title and the gold/time corner text
                 RectF area = new RectF(parchment.left + w * 0.06f, parchment.top + h * 0.13f,
                         parchment.right - w * 0.06f, parchment.bottom - h * 0.09f);
-                // single uniform scale factor applied to both dimensions —
-                // this is what keeps the map's aspect ratio intact (letterboxed
-                // inside `area`) instead of stretching it to fill the box.
-                float scale = Math.min(area.width() / map.getWidth(), area.height() / map.getHeight());
-                float dw = map.getWidth() * scale, dh = map.getHeight() * scale;
+                // wb_mini.png's cropped map content is stored at half its
+                // displayed width (the game's own map view is landscape
+                // ~1.5:1, not the bitmap's raw 96:128 = 0.75:1), so the target
+                // aspect used for letterboxing is 1.5, not map.getWidth()/
+                // map.getHeight(). drawBitmap below maps the full (undoubled)
+                // source into a dst rect built from the doubled width, which
+                // is what stretches it 2x horizontally.
+                float effW = map.getWidth() * 2f, effH = map.getHeight();
+                float scale = Math.min(area.width() / effW, area.height() / effH);
+                float dw = effW * scale, dh = effH * scale;
                 RectF dst = new RectF(area.centerX() - dw / 2f, area.centerY() - dh / 2f,
                         area.centerX() + dw / 2f, area.centerY() + dh / 2f);
                 c.drawBitmap(map, null, dst, mapPaint);
@@ -315,24 +408,21 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
             c.drawText(title, parchment.centerX(), parchment.centerY() + h * 0.025f, text);
         }
+        c.restore();
 
         // aged-paper vignette/speckles/frame ON TOP of the map so it reads
         // as ink on old parchment rather than a clean printed minimap
         drawParchmentOverlay(c, parchment);
 
-        // DS-style status boxes along the top, one per party member
+        // DS-style status boxes along the top, one per party member (n > 0
+        // here — onDraw returns early via drawWordmark() otherwise)
         int n = snap.members.size();
-        if (n > 0) {
-            float boxH = h * 0.145f;
-            float boxW = Math.min(w * 0.31f, (w - pad * (n + 1)) / n);
-            float x = pad;
-            for (PartySnapshot.Member m : snap.members) {
-                drawStatusBox(c, m, x, pad, boxW, boxH);
-                x += boxW + pad;
-            }
-        } else {
-            setText(h * 0.03f, Color.WHITE, true, Paint.Align.LEFT, true);
-            c.drawText("CHRONO DUO — waiting for party…", pad, pad + h * 0.045f, text);
+        float boxH = h * 0.145f;
+        float boxW = Math.min(w * 0.31f, (w - pad * (n + 1)) / n);
+        float x = pad;
+        for (PartySnapshot.Member m : snap.members) {
+            drawStatusBox(c, m, x, pad, boxW, boxH);
+            x += boxW + pad;
         }
 
         // gold + time inked into the parchment's bottom corners

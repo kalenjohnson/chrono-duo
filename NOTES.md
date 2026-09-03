@@ -102,9 +102,13 @@ Verified live on device (values matched Crono/Marle/Lucca/… canonical stats):
   at canvas+0x40** (from `ChronoCanvas::setupSfcWork` disasm).
 - **Character records: cSfcWork+0x10, stride 0x120, 7 entries** (from
   `cSfcWork::GetEquipParam` disasm + live calibration). u32 LE fields:
-  +0x00 char id, +0x04/+0x08 ? (xp-ish), +0x10 curHP, +0x14 maxHP, +0x18 curMP,
-  +0x1c maxMP, +0x20 baseMaxHP, +0x24 Pow, +0x28 Sta, +0x2c Spd, +0x30 Mag,
+  +0x00 char id, +0x04/+0x08 ? (xp-ish), +0x10 maxHP, +0x14 curHP, +0x18 maxMP,
+  +0x1c curMP, +0x20 baseMaxHP, +0x24 Pow, +0x28 Sta, +0x2c Spd, +0x30 Mag,
   +0x34 Hit, +0x38 Evd, +0x3c MDef, +0x40 level.
+  CORRECTED (2026-09-03): live testing after a lost fight showed the panel
+  reading "70/1" (70 = Crono's max HP), proving HP order is max-then-cur, not
+  cur-then-max as originally logged here. MP order (+0x18 max, +0x1c cur) is
+  inferred to mirror HP's and is unverified.
   NOTE: all 7 records hold default join stats even before recruitment — need the
   party list to filter (open question below).
 - **Names: two libc++ std::string tables** (SSO, stride 0x18, 8 entries:
@@ -137,8 +141,30 @@ Verified live on device (values matched Crono/Marle/Lucca/… canonical stats):
   the game re-shows the node, or find_running_scene picks a stale Scene at
   hide-time. Debug later (log the per-tick hit count first). Dev trigger
   exists: `adb shell am broadcast -a com.kalenjohnson.chronoduo.SCENE_DUMP`.
-- **Still open:** current map/area id, battle state, character portraits
-  (need resources.bin decryption à la ChronoMod).
+- **resources.bin: SOLVED.** "ARC1" archive, no real key: XOR stream seeded by
+  region start offset (tmp=0x19000000+off; tmp=tmp*0x41c64e6d+0x3039; ^=tmp>>24)
+  + gzip; table gzip'd at header_offset (BE length prefixes). Offline tool:
+  scratchpad/ctres.py + resources_listing.txt (9,494 entries). Runtime:
+  ChronoResources.java extracts via the game AssetManager, cached by game
+  versionCode. Key assets: Extension/face.png (4×2 grid of 96×88 portraits,
+  char-id order + Epoch), Game/common/wb_mini.png (mini world map on a
+  256×256 sheet; content measured at x 16–111, y 48–175 = 96×128, cropped
+  exactly in AppActivity.cropWorldMap — stored half-width, drawn stretched 2x
+  horizontally by PartyPanelView for the game's landscape ~1.5:1 map aspect),
+  Game/common/minimap_mark.png (3×16×16: 0 empty, 1 green/blue =
+  position, 2 yellow = POI), Extension/menu_win.png (window panel at
+  198,134–500,304, 9-sliceable, inset 16).
+- **Sleep/wake black screen: SOLVED.** Root cause: after wake the display
+  reports ready ~1ms before its compositor surface is live; a Presentation
+  created then claims isShowing() but is permanently black (invalidate can't
+  fix a dead surface). Fix: forceUpdate() (dismiss+recreate) once ~700ms after
+  resume, gated by an ACTION_SCREEN_OFF receiver registered for the manager's
+  lifetime (registering in onResume misses the broadcast — it fires pre-resume).
+  Ungated recreates caused visible panel flashes on every ordinary resume.
+- **Still open:** player world coordinates (for a live map marker — diff dumps
+  standing at two known overworld spots), current map/area id, battle state
+  (SfcBattleWork; capture dumps during a Gato fight), battle layout for the
+  second screen.
   For gold: diff before/after buying something. For play time: two dumps with
   everything else idle. Battle info: `SfcBattleWork` / `SceneBattle::getwork8`
   (reads a buffer pointer at SceneBattle+0x8) is the entry point.
