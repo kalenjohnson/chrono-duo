@@ -58,20 +58,27 @@ public final class GameState {
     public static native void nativeSetHideBattleUi(boolean hide);
 
     private static boolean frameEnforcerStarted;
-    // Self-reposting Runnable: calls the cheap native tick, then re-queues
-    // itself on the GL surface so it runs again next rendered frame. Queued
-    // (not run) directly via Cocos2dxGLSurfaceView -- Cocos2dxHelper.
-    // runOnGLThread would work too (it delegates to the same queueEvent) but
-    // going straight to the surface view avoids an extra indirection on the
-    // hot per-frame repost.
+    private static final android.os.Handler sEnforcerHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    // Per-frame tick. CRITICAL: the repost must bounce through the MAIN
+    // thread with a frame's delay — a Runnable that re-queues itself from
+    // inside the GL thread's event drain starves rendering completely
+    // (GLSurfaceView drains its event queue before drawing; a self-reposting
+    // event means the queue never empties and the first frame never renders —
+    // this hung the app at the splash screen when done the "obvious" way).
     private static final Runnable FRAME_ENFORCER_TICK = new Runnable() {
         @Override public void run() {
             nativeEnforceUiTick();
-            org.cocos2dx.lib.Cocos2dxGLSurfaceView view =
-                    org.cocos2dx.lib.Cocos2dxGLSurfaceView.getInstance();
-            if (view != null) view.queueEvent(this);
+            sEnforcerHandler.postDelayed(GameState::queueEnforcerTick, 16);
         }
     };
+
+    private static void queueEnforcerTick() {
+        org.cocos2dx.lib.Cocos2dxGLSurfaceView view =
+                org.cocos2dx.lib.Cocos2dxGLSurfaceView.getInstance();
+        if (view != null) view.queueEvent(FRAME_ENFORCER_TICK);
+        else sEnforcerHandler.postDelayed(GameState::queueEnforcerTick, 100);
+    }
 
     /**
      * Starts the per-frame UI enforcer loop. Idempotent (a second call is a
@@ -86,7 +93,7 @@ public final class GameState {
         if (frameEnforcerStarted || !isAttached()) return;
         if (!nativeStartFrameEnforcer()) return;
         frameEnforcerStarted = true;
-        org.cocos2dx.lib.Cocos2dxHelper.runOnGLThread(FRAME_ENFORCER_TICK);
+        queueEnforcerTick();
     }
 
     /** Scene-graph node type/name patterns hidden by the "clean UI" tick. */
