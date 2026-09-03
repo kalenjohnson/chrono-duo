@@ -135,6 +135,22 @@ public final class PartySnapshot {
     public int listKind = -1;
     public final List<ListRow> listRows = new ArrayList<>();
     public boolean listOpen;
+
+    // Live battle-results accumulator (see GameState.nativeGetBattleResults),
+    // filled in read() only while inBattle. resultsStep mirrors the native
+    // comment_out2 step index (sb+0x22f4): -1 = unknown/not read, 0 = EXP
+    // message, 2 = TP, 4 = Gold, 8/16/24 = item drops, 32 = idle. resultsExp/
+    // Gold/Tp/Items come back as -1/-1/-1/empty when the battlework pointer
+    // itself wasn't readable (see nativeGetBattleResults's fallback). resultsActive
+    // mirrors the native battle_results_phase() predicate (every enemy in
+    // {@link #enemies} dead) but is computed here from the already-parsed
+    // enemy list, gated additionally on resultsStep being in [0, 30] (32 =
+    // idle/done) so the panel stops showing the results window once the
+    // native state machine itself has wound down.
+    public int resultsStep = -1;
+    public int resultsExp, resultsGold, resultsTp;
+    public int[] resultsItems = new int[0];
+    public boolean resultsActive;
     public int gold;        // cSfcWork+0x1a04 (u32), found by differential dump
     public int playSeconds; // cSfcWork+0x1a10 (u32), monotonically rising
     public String mapName = ""; // cached from ChronoCanvas::getFieldMapName()
@@ -293,6 +309,25 @@ public final class PartySnapshot {
                 snap.listKind = kind;
             }
             snap.listOpen = snap.listKind >= 0;
+
+            int[] results = GameState.nativeGetBattleResults();
+            if (results != null && results.length >= 6) {
+                snap.resultsStep = results[0];
+                snap.resultsExp = results[1];
+                snap.resultsGold = results[2];
+                snap.resultsTp = results[3];
+                int itemCount = Math.max(0, Math.min(8, results[5]));
+                int avail = results.length - 6;
+                itemCount = Math.min(itemCount, avail);
+                snap.resultsItems = new int[itemCount];
+                System.arraycopy(results, 6, snap.resultsItems, 0, itemCount);
+            }
+            boolean allEnemiesDead = !snap.enemies.isEmpty();
+            for (Enemy e : snap.enemies) {
+                if (e.curHp != 0) { allEnemiesDead = false; break; }
+            }
+            snap.resultsActive = allEnemiesDead
+                    && snap.resultsStep >= 0 && snap.resultsStep <= 30;
         }
         return snap;
     }
@@ -318,6 +353,10 @@ public final class PartySnapshot {
         if (inBattle != o.inBattle || enemies.size() != o.enemies.size()) return false;
         if (menuOpen != o.menuOpen || commandTargets.size() != o.commandTargets.size()) return false;
         if (listKind != o.listKind || listRows.size() != o.listRows.size()) return false;
+        if (resultsActive != o.resultsActive || resultsStep != o.resultsStep
+                || resultsExp != o.resultsExp || resultsGold != o.resultsGold
+                || resultsTp != o.resultsTp
+                || !java.util.Arrays.equals(resultsItems, o.resultsItems)) return false;
         for (int i = 0; i < members.size(); i++) {
             Member a = members.get(i), b = o.members.get(i);
             if (!a.name.equals(b.name) || a.level != b.level

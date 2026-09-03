@@ -375,6 +375,7 @@ public class AppActivity extends Cocos2dxActivity {
                         "Localize/en/msg/tech.txt",
                         "Localize/en/msg/item.txt",
                         "Localize/en/msg/sfc_item.txt",
+                        "Localize/en/msg/battle.txt",
                         "Game/battle/tblb/MonsterNameData.dat",
                         "Game/common/TechnicMpTable.dat",
                         "Game/common/TechnicBaseDataTable.dat",
@@ -397,6 +398,7 @@ public class AppActivity extends Cocos2dxActivity {
                 final String[] itemNames = readNameTable(files.get("Localize/en/msg/item.txt"));
                 final java.util.Map<String, String> itemCategoryNames =
                         readSfcItemTable(files.get("Localize/en/msg/sfc_item.txt"));
+                final String[] battleMessages = readNameTable(files.get("Localize/en/msg/battle.txt"));
                 final byte[] monsterFlags = readRawBytes(files.get("Game/battle/tblb/MonsterNameData.dat"));
                 final int[] techMp = readTechMpTable(
                         files.get("Game/common/TechnicMpTable.dat"),
@@ -415,6 +417,7 @@ public class AppActivity extends Cocos2dxActivity {
                     if (techNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setTechNames(techNames);
                     if (itemNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setItemNames(itemNames);
                     if (itemCategoryNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setItemCategoryNames(itemCategoryNames);
+                    if (battleMessages != null) com.kalenjohnson.chronoduo.ChronoAssets.setBattleMessages(battleMessages);
                     if (monsterFlags != null) com.kalenjohnson.chronoduo.ChronoAssets.setMonsterFlags(monsterFlags);
                     if (techMp != null) com.kalenjohnson.chronoduo.ChronoAssets.setTechMpTable(techMp);
                 });

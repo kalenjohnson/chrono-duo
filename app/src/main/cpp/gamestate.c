@@ -12,6 +12,7 @@
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <errno.h>
@@ -448,6 +449,156 @@ typedef struct {
 static pixel_teximg_seen_t g_pixel_teximg_seen[PIXEL_TEXIMG_SEEN_MAX];
 static int g_pixel_teximg_seen_count;
 
+// ---------------------------------------------------------------------------
+// Pixel graphics, mechanism 4: 2x2 decimation of pre-upscaled art on upload.
+//
+// The game's art assets ship pre-upscaled ~2x with smoothing baked in
+// (512x512 RGBA sprite sheets, 32x32 map chips for what were 16x16 SNES
+// tiles, and the CPU-composited 768x448 field index texture). GL_NEAREST
+// alone (mechanism 1/2 above) stops the *filtering* from blurring things
+// further, but it can't undo the smoothing already baked into the upscaled
+// pixels themselves. Decimating every RGBA/UNSIGNED_BYTE upload down to one
+// texel per 2x2 block approximates the original 1x pixel art.
+//
+// RenderTexture framebuffers create their backing texture via glTexImage2D
+// with pixels == NULL (no initial data) -- the NULL check below skips those,
+// so framebuffer sizes are left intact. glTexSubImage2D is not imported by
+// libchrono (checked against its import list), so partial updates can't
+// bypass this; every glTexImage2D upload of a given texture is decimated
+// the same way, so re-uploads stay consistent.
+// ---------------------------------------------------------------------------
+
+#define GL_RGBA           0x1908
+#define GL_UNSIGNED_BYTE  0x1401
+
+// Set by nativeSetPixelDecimate; default off. Java flips it on right after
+// nativeSetPixelGraphics() when the pixel-graphics pref is enabled -- see
+// GameState.applyPixelGraphicsPref.
+static int g_pixel_decimate;
+
+// Known font/UI atlases that should NOT be decimated (e.g. sizes that are
+// already 1x, or that don't tolerate losing half their resolution). Empty
+// for now -- fill in from observation (logcat "pixel-gfx: decimated ..."
+// lines vs. in-game visual inspection) if a specific WxH turns out to need
+// exemption.
+typedef struct { GLsizei width, height; } pixel_decimate_exempt_t;
+static const pixel_decimate_exempt_t g_pixel_decimate_exempt[] = {
+    // Placeholder -- {0,0} never matches a real texture (decimation only
+    // ever considers width,height >= 64), so the list is effectively empty.
+    // Add real { width, height } entries here as they're identified.
+    {0, 0},
+};
+#define PIXEL_DECIMATE_EXEMPT_COUNT \
+    (sizeof(g_pixel_decimate_exempt) / sizeof(g_pixel_decimate_exempt[0]))
+
+static int pixel_decimate_is_exempt(GLsizei width, GLsizei height) {
+    for (size_t i = 0; i < PIXEL_DECIMATE_EXEMPT_COUNT; i++) {
+        if (g_pixel_decimate_exempt[i].width == width &&
+            g_pixel_decimate_exempt[i].height == height) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// 0 = take the 2x2 block's top-left texel (pixel (2x,2y)); 1 = take the
+// block's most common color (majority vote across the 4 texels), falling
+// back to top-left when no color repeats.
+#define PIXEL_DECIMATE_MODE 0
+
+// Picks the output color for one 2x2 source block. `p` holds the 4 texels
+// in row-major order: p[0]=(2x,2y), p[1]=(2x+1,2y), p[2]=(2x,2y+1),
+// p[3]=(2x+1,2y+1).
+static uint32_t pixel_decimate_pick(const uint32_t p[4]) {
+#if PIXEL_DECIMATE_MODE == 1
+    int best_count = 0;
+    uint32_t best = p[0];
+    for (int i = 0; i < 4; i++) {
+        int count = 0;
+        for (int j = 0; j < 4; j++) {
+            if (p[j] == p[i]) count++;
+        }
+        if (count > best_count) {
+            best_count = count;
+            best = p[i];
+        }
+    }
+    // No repeated color anywhere in the block (best_count == 1, all four
+    // distinct) -- no real majority, fall back to top-left.
+    if (best_count < 2) return p[0];
+    return best;
+#else
+    (void) p[1]; (void) p[2]; (void) p[3]; // unused in top-left mode
+    return p[0];
+#endif
+}
+
+// Heap scratch buffer for the decimated (width/2 x height/2 x 4 bytes)
+// output, grown as needed and kept (not freed) between calls -- textures
+// only get bigger up to the game's largest asset, so steady-state this
+// allocates once.
+static uint8_t *g_pixel_decimate_buf;
+static size_t   g_pixel_decimate_buf_cap;
+
+static uint8_t *pixel_decimate_scratch(size_t needed) {
+    if (needed > g_pixel_decimate_buf_cap) {
+        uint8_t *grown = (uint8_t *) realloc(g_pixel_decimate_buf, needed);
+        if (!grown) return NULL;
+        g_pixel_decimate_buf = grown;
+        g_pixel_decimate_buf_cap = needed;
+    }
+    return g_pixel_decimate_buf;
+}
+
+// Fills `dst` (width/2 * height/2 RGBA texels, tightly packed) from `src`
+// (width * height RGBA texels, tightly packed -- true for RGBA/
+// UNSIGNED_BYTE regardless of GL_UNPACK_ALIGNMENT since 4-byte texels are
+// always 4-byte-row-aligned).
+static void pixel_decimate_rgba(const uint8_t *src, GLsizei width, GLsizei height,
+                                 uint8_t *dst) {
+    const uint32_t *src32 = (const uint32_t *) src;
+    uint32_t *dst32 = (uint32_t *) dst;
+    GLsizei out_w = width / 2;
+    GLsizei out_h = height / 2;
+    for (GLsizei y = 0; y < out_h; y++) {
+        const uint32_t *row0 = src32 + (size_t) (2 * y) * width;
+        const uint32_t *row1 = src32 + (size_t) (2 * y + 1) * width;
+        uint32_t *out_row = dst32 + (size_t) y * out_w;
+        for (GLsizei x = 0; x < out_w; x++) {
+            uint32_t block[4] = { row0[2 * x], row0[2 * x + 1], row1[2 * x], row1[2 * x + 1] };
+            out_row[x] = pixel_decimate_pick(block);
+        }
+    }
+}
+
+// Rate-limited logging for decimated uploads, same style/budget as the
+// existing texImage2D size log above: first 40 calls logged unconditionally,
+// then dedup'd per distinct (width,height).
+static uint32_t g_pixel_decimate_calls;
+#define PIXEL_DECIMATE_SEEN_MAX 64
+typedef struct { GLsizei width, height; } pixel_decimate_seen_t;
+static pixel_decimate_seen_t g_pixel_decimate_seen[PIXEL_DECIMATE_SEEN_MAX];
+static int g_pixel_decimate_seen_count;
+
+static void pixel_decimate_log_once(GLsizei width, GLsizei height) {
+    g_pixel_decimate_calls++;
+    if (g_pixel_decimate_calls <= 40) {
+        LOGI("pixel-gfx: decimated %dx%d -> %dx%d", width, height, width / 2, height / 2);
+        return;
+    }
+    for (int i = 0; i < g_pixel_decimate_seen_count; i++) {
+        if (g_pixel_decimate_seen[i].width == width && g_pixel_decimate_seen[i].height == height) {
+            return;
+        }
+    }
+    if (g_pixel_decimate_seen_count < PIXEL_DECIMATE_SEEN_MAX) {
+        g_pixel_decimate_seen[g_pixel_decimate_seen_count].width = width;
+        g_pixel_decimate_seen[g_pixel_decimate_seen_count].height = height;
+        g_pixel_decimate_seen_count++;
+    }
+    LOGI("pixel-gfx: decimated %dx%d -> %dx%d", width, height, width / 2, height / 2);
+}
+
 static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat,
                                  GLsizei width, GLsizei height, GLint border,
                                  GLenum format, GLenum type, const void *pixels) {
@@ -481,6 +632,34 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
         LOGI("pixel-gfx: stats texImage2D_calls=%u texParam_rewrites=%u",
              g_pixel_teximage_calls, g_pixel_texparami_rewrites);
     }
+    // Decimate: keep one texel of every 2x2 block so pre-upscaled ~2x art
+    // approximates the original 1x pixel art. Only for fresh (level 0),
+    // real (pixels != NULL, so RenderTexture's empty-framebuffer allocation
+    // is left alone), plain RGBA/UNSIGNED_BYTE uploads that are large enough
+    // to be real art (skip tiny UI textures / 16x1 palettes) and evenly
+    // sized (so width/2, height/2 is exact), and not on the exemption list.
+    if (g_pixel_decimate && level == 0 && pixels != NULL &&
+        format == GL_RGBA && type == GL_UNSIGNED_BYTE &&
+        width >= 64 && height >= 64 &&
+        (width % 2) == 0 && (height % 2) == 0 &&
+        !pixel_decimate_is_exempt(width, height)) {
+        GLsizei out_w = width / 2;
+        GLsizei out_h = height / 2;
+        size_t needed = (size_t) out_w * (size_t) out_h * 4;
+        uint8_t *scratch = pixel_decimate_scratch(needed);
+        if (scratch) {
+            pixel_decimate_rgba((const uint8_t *) pixels, width, height, scratch);
+            pixel_decimate_log_once(width, height);
+            if (p_real_glTexImage2D) {
+                p_real_glTexImage2D(target, level, internalformat, out_w, out_h, border, format,
+                                     type, scratch);
+            }
+            return;
+        }
+        LOGE("pixel-gfx: decimate scratch alloc failed (%dx%d, %zu bytes) -- uploading full-size",
+             width, height, needed);
+    }
+
     if (p_real_glTexImage2D) {
         p_real_glTexImage2D(target, level, internalformat, width, height, border, format,
                              type, pixels);
@@ -655,6 +834,19 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetPixelGraphics(JNIEnv *env, jc
          (void *) g_pixel_texpi_slot, (void *) g_pixel_texpf_slot,
          (void *) g_pixel_teximg_slot, (void *) g_pixel_genmip_slot);
     return JNI_TRUE;
+}
+
+// Enables/disables the 2x2 decimation done inside hooked_glTexImage2D (see
+// the "mechanism 4" block above). Independent of nativeSetPixelGraphics's
+// GOT patching -- this only flips a flag the hook already in place checks --
+// so it's safe to call whether or not the glTexImage2D hook is installed
+// (the flag is simply inert if it isn't). Off by default. Java flips it on
+// right after nativeSetPixelGraphics() in applyPixelGraphicsPref.
+JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeSetPixelDecimate(JNIEnv *env, jclass cls,
+                                                                   jboolean on) {
+    g_pixel_decimate = on ? 1 : 0;
+    LOGI("pixel-gfx: decimate %s", g_pixel_decimate ? "enabled" : "disabled");
 }
 
 // Dumps the running pixel-graphics diagnostic counters (glTexImage2D calls,
@@ -1688,6 +1880,7 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetHideBattleSubmenus(JNIEnv *en
 #define BTLRES_MAXHP_OFFSET  0x05
 #define BTLRES_PARTY_SLOTS   3 // slots 0-2 are party; 3+ are enemies
 
+static int g_results_unhide = 0;
 static int g_battle_results_phase; // current per-tick predicate value, read by enforce_battle_ui_hide
 static int g_battle_results_was;   // previous value, for edge-triggered enter/leave logging
 
@@ -1805,7 +1998,11 @@ static void enforce_battle_ui_hide(void) {
         // prior ticks) instead of re-blanking. cocos2d::Menu (hide_type from
         // the "4MenuE" check above) is not in is_battle_results_child, so it
         // still falls through to the setOpacity(0) below and stays hidden.
-        if (g_battle_results_phase && is_battle_results_child(tn)) {
+        // Results-phase unhide is OFF: the Earned EXP/TP/G windows are now
+        // mirrored on the bottom screen from the battle work struct (see
+        // nativeGetBattleResults), so the cell layer stays blanked and the
+        // party HP box never reappears. Flip g_results_unhide to restore.
+        if (g_results_unhide && g_battle_results_phase && is_battle_results_child(tn)) {
             if (p_node_setOpacity) p_node_setOpacity(child, 255);
             continue;
         }
@@ -1985,6 +2182,156 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeReadBattleActors(JNIEnv *env, jc
     jbyteArray arr = (*env)->NewByteArray(env, (jsize)len);
     if (!arr) return NULL;
     (*env)->SetByteArrayRegion(env, arr, 0, (jsize)len, (const jbyte *)buf);
+    return arr;
+}
+
+// ---------------------------------------------------------------------------
+// Battle results accumulator (EXP/Gold/TP/item drops), read from the native
+// "battlework" struct at *(SceneBattle+0x60) -- a separate allocation from
+// both the SNES-emulated Asm memory (*(sb+0x8)) and the actor array
+// (sb+0x68, see nativeReadBattleActors). See scratchpad/battle_results_report.md
+// for the disassembly this is derived from (SceneBattle::exp_get/comment_out2).
+// Layout, all offsets relative to bw = *(u64*)(sb+0x60):
+//   +0x1640 u32 total EXP gained this fight
+//   +0x1694 u32 total Gold gained
+//   +0x1758 u32 total TP gained
+//   +0x16b8 u8  step-enable bitfield (bit meanings per comment_out2's guards)
+//   +0x16b0 i32[] item-drop list, walked forward here (up to 8 slots)
+// sb+0x22f4 (i32) is comment_out2's own results-phase step index (0=EXP,
+// 2=TP, 4=Gold, 8/16/24=items, ... 32=idle) -- see battle_results_phase()
+// above, which reads the same field for a different purpose (party/enemy
+// scene visibility, not the message content itself).
+// ---------------------------------------------------------------------------
+
+// Sanity bounds for the candidate exp/gold/tp values tried below -- plainly
+// implausible results screens (garbage memory misread as these fields) blow
+// past these, a real fight never will.
+static const uint32_t RESULTS_EXP_MAX  = 100000u;
+static const uint32_t RESULTS_GOLD_MAX = 1000000u;
+static const uint32_t RESULTS_TP_MAX   = 1000u;
+
+// Reads the candidate exp/gold/tp/flags fields at the same fixed relative
+// offsets (+0x1640/+0x1694/+0x1758/+0x16b8) off `base`, whatever `base`
+// turns out to actually be for a given candidate. Returns 1 and fills
+// *exp/*gold/*tp/*flags only when all three of exp/gold/tp read cleanly and
+// fall within the sanity bounds above; 0 otherwise (candidate rejected).
+static int results_try_base(uint8_t *base, uint32_t *exp, uint32_t *gold, uint32_t *tp,
+                             uint8_t *flags) {
+    uint32_t e = 0, g = 0, t = 0;
+    if (!safe_read(base + 0x1640, &e, sizeof(e))) return 0;
+    if (!safe_read(base + 0x1694, &g, sizeof(g))) return 0;
+    if (!safe_read(base + 0x1758, &t, sizeof(t))) return 0;
+    if (e > RESULTS_EXP_MAX || g > RESULTS_GOLD_MAX || t > RESULTS_TP_MAX) return 0;
+    uint8_t f = 0;
+    safe_read(base + 0x16b8, &f, sizeof(f));
+    *exp = e; *gold = g; *tp = t; *flags = f;
+    return 1;
+}
+
+// Returns NULL when there's no active battle node or SceneBattle can't be
+// resolved. Otherwise an int array [step, exp, gold, tp, flags, itemCount,
+// items...].
+//
+// The battlework base at *(sb+0x60) fails plausible_ptr in practice (see
+// battle_results_report.md), so this tries three candidate interpretations
+// of "where the accumulator struct actually is", in order, and uses the
+// first one whose exp/gold/tp come out sane:
+//   A: the raw u64 at sb+0x60, treated as a pointer, if it passes
+//      plausible_ptr (the original assumption).
+//   B: an embedded struct living directly at sb+0x60 itself (no extra
+//      indirection) -- i.e. exp read from sb+0x60+0x1640, etc.
+//   C: the pointer at sb+0x8, the SNES-emulated Asm memory base already
+//      used elsewhere (see nativeReadBattleActors's comment) -- the
+//      accumulator might live in that emulated RAM at the same relative
+//      offsets.
+// If none is sane, returns [step, -1, -1, -1, 0, 0] (flags 0, itemCount 0)
+// with step still populated, so callers can distinguish "not in results
+// yet" from "results active but accumulator unreadable". Safe to call from
+// any thread -- plain safe_read chase off the cached g_battle_node pointer,
+// like nativeReadBattleActors/battle_results_phase.
+JNIEXPORT jintArray JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleResults(JNIEnv *env, jclass cls) {
+    if (!g_battle_node) return NULL;
+
+    uint8_t *sb = NULL;
+    if (!safe_read((uint8_t *)g_battle_node + 0x320, &sb, sizeof(sb)) || !plausible_any(sb)) {
+        return NULL;
+    }
+
+    int32_t step = 0;
+    if (!safe_read(sb + 0x22f4, &step, sizeof(step))) return NULL;
+
+    static int32_t g_last_logged_results_step = INT32_MIN;
+    int step_changed = (step != g_last_logged_results_step);
+
+    uint64_t raw_bw = 0;
+    safe_read(sb + 0x60, &raw_bw, sizeof(raw_bw));
+    if (step_changed) {
+        LOGI("battle-results: step=%d raw(sb+0x60)=0x%016llx", step,
+             (unsigned long long) raw_bw);
+    }
+
+    uint64_t asm_ptr = 0;
+    safe_read(sb + 0x8, &asm_ptr, sizeof(asm_ptr));
+
+    uint8_t *candidates[3] = {NULL, NULL, NULL};
+    if (plausible_any((void *)raw_bw)) candidates[0] = (uint8_t *)raw_bw;
+    candidates[1] = sb + 0x60;
+    if (plausible_ptr((void *)asm_ptr)) candidates[2] = (uint8_t *)asm_ptr;
+
+    static const char kLabels[3] = {'A', 'B', 'C'};
+    uint32_t exp = 0, gold = 0, tp = 0;
+    uint8_t flags = 0;
+    uint8_t *bwp = NULL;
+    char used = 0;
+
+    for (int i = 0; i < 3; i++) {
+        if (!candidates[i]) continue;
+        if (results_try_base(candidates[i], &exp, &gold, &tp, &flags)) {
+            bwp = candidates[i];
+            used = kLabels[i];
+            break;
+        }
+    }
+
+    if (!bwp) {
+        jint fallback[6] = {step, -1, -1, -1, 0, 0};
+        jintArray arr = (*env)->NewIntArray(env, 6);
+        if (!arr) return NULL;
+        (*env)->SetIntArrayRegion(env, arr, 0, 6, fallback);
+        if (step_changed) {
+            LOGI("battle-results: step=%d (no candidate base sane)", step);
+            g_last_logged_results_step = step;
+        }
+        return arr;
+    }
+
+    int32_t items[8];
+    int itemCount = 0;
+    for (int i = 0; i < 8; i++) {
+        int32_t v;
+        if (!safe_read(bwp + 0x16b0 + (size_t)i * 4, &v, sizeof(v))) break;
+        if (v <= 0 || v > 0xFFFF) break;
+        items[itemCount++] = v;
+    }
+
+    if (step_changed) {
+        LOGI("battle-results: base=%c exp=%u gold=%u tp=%u", used, exp, gold, tp);
+        g_last_logged_results_step = step;
+    }
+
+    jint buf[6 + 8];
+    buf[0] = step;
+    buf[1] = (jint) exp;
+    buf[2] = (jint) gold;
+    buf[3] = (jint) tp;
+    buf[4] = flags;
+    buf[5] = itemCount;
+    for (int i = 0; i < itemCount; i++) buf[6 + i] = items[i];
+
+    jintArray arr = (*env)->NewIntArray(env, 6 + itemCount);
+    if (!arr) return NULL;
+    (*env)->SetIntArrayRegion(env, arr, 0, 6 + itemCount, buf);
     return arr;
 }
 

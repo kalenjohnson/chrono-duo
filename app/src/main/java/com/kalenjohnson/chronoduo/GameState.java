@@ -40,6 +40,15 @@ public final class GameState {
     public static native boolean nativeSetPixelGraphics(boolean enable);
 
     /**
+     * Enables/disables 2x2 decimation of texture uploads inside the
+     * glTexImage2D hook (the game's art ships pre-upscaled ~2x with
+     * smoothing baked in; GL_NEAREST alone can't undo that). Independent of
+     * nativeSetPixelGraphics's GOT patching -- see gamestate.c. Off by
+     * default; called right after nativeSetPixelGraphics() below.
+     */
+    public static native void nativeSetPixelDecimate(boolean on);
+
+    /**
      * Diagnostic: dumps the running pixel-graphics counters (glTexImage2D
      * calls, glGenerateMipmap calls, glTexParameteri LINEAR->NEAREST
      * rewrites) to logcat as one line. See gamestate.c.
@@ -76,6 +85,7 @@ public final class GameState {
     public static boolean applyPixelGraphicsPref(Context ctx) {
         boolean enable = getPixelGraphicsPref(ctx);
         nativeSetPixelGraphics(enable);
+        nativeSetPixelDecimate(false); // decimation experiment: breaks texel-space map sampling, off until fixed
         return enable;
     }
 
@@ -148,6 +158,21 @@ public final class GameState {
     // is mirroring nativeGetBattleList's rows on the second screen. Default
     // false. Any thread (plain flag write).
     public static native void nativeSetHideBattleSubmenus(boolean hide);
+
+    // Live battle-results accumulator (EXP/Gold/TP/item drops), read from
+    // *(SceneBattle+0x60) -- see gamestate.c's nativeGetBattleResults comment
+    // block for the full offset table. Null when there's no active battle
+    // node or SceneBattle can't be resolved. Otherwise an int array:
+    //   [step, exp, gold, tp, flags, itemCount, item0, item1, ...]
+    // step is comment_out2's own results-phase state index (sb+0x22f4; 0=EXP
+    // message, 2=TP, 4=Gold, 8/16/24=item drops, 32=idle -- see
+    // battle_results_phase() in the native code, which reads the same field
+    // for scene-visibility purposes). When the battlework pointer itself
+    // isn't readable/plausible, exp/gold/tp/itemCount come back as
+    // [-1, -1, -1, 0] (flags 0) with step still populated. itemCount is at
+    // most 8; item ids are plain item.txt indices. Any thread; uses the
+    // cached g_battle_node pointer like nativeReadBattleActors.
+    public static native int[] nativeGetBattleResults();
 
     // --- frame-perfect UI enforcer -----------------------------------------
     // Idempotent start gate (native side) for the per-rendered-frame GL tick

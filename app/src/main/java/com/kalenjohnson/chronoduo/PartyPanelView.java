@@ -69,6 +69,26 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private String fadingOutTitle;
     private long titleFadeStart = -1L;
 
+    // Battle-results single-message crossfade (see drawResultsWindow):
+    // resultsMessage is the current big line ("Earned N EXP." / "Found N
+    // G." / "<Name> leveled up!" / etc), chosen from snap.resultsStep by
+    // computeResultsMessage. resultsFadingMessage/resultsMessageFadeStart
+    // mirror fadingOutTitle/titleFadeStart above (reuses TITLE_FADE_NANOS)
+    // -- when the step machine advances to a new message, the old one fades
+    // out while the new one fades in, drawing the eye down toward the panel.
+    // A step with no message of its own (the per-actor bookkeeping steps
+    // between the documented ones) leaves resultsMessage unchanged, per
+    // computeResultsMessage returning null. resultsBaseLevels snapshots
+    // each party member's level (by members-list index, matching slot
+    // order) at the moment resultsActive first turns true, so a later
+    // level-up step can tell which member's level rose -- see
+    // leveledMemberName. All four are cleared whenever resultsActive drops
+    // (results screen closed or the battle itself ended) -- see update().
+    private String resultsMessage;
+    private String resultsFadingMessage;
+    private long resultsMessageFadeStart = -1L;
+    private int[] resultsBaseLevels;
+
     // Field-mode area-map bitmap crossfade: kept separate from the title
     // fade above since the two triggers don't always coincide (fieldMapId
     // can change while the location name stays the same -- distinct
@@ -735,8 +755,94 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             // (Tech <-> Item): start the panel-owned row selection back at 0.
             listSel = 0;
         }
+        if (s.resultsActive) {
+            if (!snap.resultsActive) {
+                // results screen just started: baseline levels for
+                // leveledMemberName, and start clean (no message from a
+                // previous fight can carry over).
+                resultsBaseLevels = levelsOf(snap);
+                resultsMessage = null;
+                resultsFadingMessage = null;
+                resultsMessageFadeStart = -1L;
+            }
+            String newMsg = computeResultsMessage(s);
+            if (newMsg != null && !newMsg.equals(resultsMessage)) {
+                if (resultsMessage != null) {
+                    resultsFadingMessage = resultsMessage;
+                    resultsMessageFadeStart = System.nanoTime();
+                }
+                resultsMessage = newMsg;
+            }
+        } else if (snap.resultsActive || snap.inBattle != s.inBattle) {
+            // results screen just ended, or the battle itself ended --
+            // clear all results-message state (item 3: resultsActive
+            // already gates the window's visibility; this clears the
+            // crossfade/level-baseline state behind it).
+            resultsMessage = null;
+            resultsFadingMessage = null;
+            resultsMessageFadeStart = -1L;
+            resultsBaseLevels = null;
+        }
         snap = s;
         invalidate();
+    }
+
+    private static int[] levelsOf(PartySnapshot s) {
+        int[] a = new int[s.members.size()];
+        for (int i = 0; i < a.length; i++) a[i] = s.members.get(i).level;
+        return a;
+    }
+
+    /**
+     * Which message {@link #drawResultsWindow} should show for {@code
+     * s.resultsStep}, per the disassembly report's step ranges: 0-1 EXP,
+     * 2-3 TP, 4-7 Gold, 8-9/16-17/24-25 item drop (index = step/8 - 1 into
+     * {@code s.resultsItems}), 10-15/18-23/26-31 level-up. Any other step
+     * (the per-actor bookkeeping steps between those ranges, or -1/32+ idle)
+     * returns null so the caller keeps showing the last message. Numeric
+     * placeholders come from {@link ChronoAssets#getBattleMessage}, which
+     * falls back to a literal template when the battle.txt table isn't
+     * loaded.
+     */
+    private String computeResultsMessage(PartySnapshot s) {
+        int step = s.resultsStep;
+        if (step == 0 || step == 1) {
+            return ChronoAssets.getBattleMessage(37, Math.max(0, s.resultsExp));
+        } else if (step == 2 || step == 3) {
+            return ChronoAssets.getBattleMessage(38, Math.max(0, s.resultsTp));
+        } else if (step >= 4 && step <= 7) {
+            return ChronoAssets.getBattleMessage(39, Math.max(0, s.resultsGold));
+        } else if (step == 8 || step == 9 || step == 16 || step == 17 || step == 24 || step == 25) {
+            int idx = step / 8 - 1;
+            String name = (idx >= 0 && idx < s.resultsItems.length)
+                    ? resultsItemName(s.resultsItems[idx]) : null;
+            if (name == null) return null;
+            return "Obtained " + name + ".";
+        } else if ((step >= 10 && step <= 15) || (step >= 18 && step <= 23) || (step >= 26 && step <= 31)) {
+            String member = leveledMemberName(s);
+            return member != null ? (member + " leveled up!") : "Level up!";
+        }
+        return null;
+    }
+
+    /** Item name for a battle-results drop id: flat item.txt line index first (these ids come from the flat drop list), then the encoded-id lookup, then "#id" -- mirrors the old drawResultsWindow's per-row lookup. */
+    private String resultsItemName(int id) {
+        String[] itemNames = ChronoAssets.getItemNames();
+        if (itemNames != null && id >= 0 && id < itemNames.length && !itemNames[id].trim().isEmpty()) {
+            return itemNames[id];
+        }
+        String name = ChronoAssets.getItemName(id);
+        if (name == null || name.trim().isEmpty()) name = "#" + id;
+        return name;
+    }
+
+    /** Which party member's level rose since {@link #resultsBaseLevels} was captured (results-screen start), or null if none/unknown (baseline missing, or a leveled member's slot changed). */
+    private String leveledMemberName(PartySnapshot s) {
+        if (resultsBaseLevels == null) return null;
+        for (int i = 0; i < s.members.size() && i < resultsBaseLevels.length; i++) {
+            if (s.members.get(i).level > resultsBaseLevels[i]) return s.members.get(i).name;
+        }
+        return null;
     }
 
     @Override
@@ -758,6 +864,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         prevAreaMapBitmap = null;
         prevAreaMapId = -1;
         areaMapFadeStart = -1L;
+        resultsMessage = null;
+        resultsFadingMessage = null;
+        resultsMessageFadeStart = -1L;
+        resultsBaseLevels = null;
         targetingUntil = -1L;
         pendingMenuClose = false;
         pendingMenuCloseAt = -1L;
@@ -806,10 +916,17 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         }
 
         // portrait square: real art from face.png when available, else a
-        // colored-initial placeholder
+        // colored-initial placeholder. Side length normally fills the box
+        // height (minus ppad on top/bottom); findStatusLayout may shrink it
+        // one step (see STATUS_PORTRAIT_SHRINK) when even the font floor
+        // can't fit CT's worst-case "HP 999/999"/"MP 99/99" readouts at full
+        // portrait size -- see that method's doc.
         float ppad = h * 0.1f;
-        RectF portrait = new RectF(box.left + ppad, box.top + ppad,
-                box.left + ppad + (h - 2 * ppad), box.bottom - ppad);
+        float valRight = box.right - w * 0.03f;
+        StatusFontFit fit = findStatusFontFit(box, h, w, ppad, valRight);
+        float ps = fit.portraitSide;
+        RectF portrait = new RectF(box.left + ppad, box.top + (h - ps) / 2f,
+                box.left + ppad + ps, box.top + (h - ps) / 2f + ps);
         fill.setColor(Color.BLACK);
         c.drawRect(portrait, fill);
         RectF pin = new RectF(portrait);
@@ -827,10 +944,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         }
 
         float tx = portrait.right + w * 0.035f;
-        float valRight = box.right - w * 0.03f;
         float row1 = box.top + h * 0.42f;
         float row2 = box.top + h * 0.82f;
-        float fs = h * 0.26f;
+        float fs = fit.fontSize;
         setText(fs, Color.rgb(190, 200, 255), true, Paint.Align.LEFT, true);
         c.drawText("HP", tx, row1, text);
         int hpCur = snap.inBattle ? m.battleCurHp : m.curHp;
@@ -845,6 +961,72 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         c.drawText("MP", tx, row2, text);
         setText(fs, Color.WHITE, false, Paint.Align.RIGHT, true);
         c.drawText(mpCur + "/" + mpMax, valRight, row2, text);
+    }
+
+    /** Result of {@link #findStatusFontFit}: the font size and portrait side length to use for one status box. */
+    private static final class StatusFontFit {
+        final float fontSize, portraitSide;
+        StatusFontFit(float fontSize, float portraitSide) {
+            this.fontSize = fontSize;
+            this.portraitSide = portraitSide;
+        }
+    }
+
+    // Worst-case label+value strings CT can actually produce: HP tops out at
+    // 999 (3 digits, e.g. Frog's late-game max), MP at 99. "HP 999/999" is
+    // the longer of the two and drives the fit; "MP 99/99" is checked too
+    // since a narrow font family could in principle make it wider (it never
+    // is with the monospace face this panel uses, but the check is cheap).
+    private static final String STATUS_WORST_HP = "HP 999/999";
+    private static final String STATUS_WORST_MP = "MP 99/99";
+    private static final float STATUS_FONT_MAX_FRAC = 0.26f; // current/legacy default size, as a ceiling
+    private static final float STATUS_FONT_MIN_FRAC = 0.15f; // floor below which digits stop being readable
+    private static final float STATUS_FONT_STEP_FRAC = 0.01f;
+    private static final float STATUS_PORTRAIT_SHRINK = 0.8f; // one-step fallback when the font floor still overflows
+
+    /**
+     * Picks the largest font size (as a fraction of box height, between
+     * {@link #STATUS_FONT_MIN_FRAC} and {@link #STATUS_FONT_MAX_FRAC}) whose
+     * measured width for CT's worst-case HP/MP readouts ({@link
+     * #STATUS_WORST_HP}/{@link #STATUS_WORST_MP}, i.e. "HP 999/999") still
+     * fits between the portrait's right edge and the box's right inner
+     * margin -- measured with {@link #text} directly (not hardcoded), using
+     * the same bold monospace face {@link #setText} draws the HP/MP labels
+     * with, so the fit matches what's actually painted. If even the font
+     * floor doesn't fit at the normal portrait size, retries once with the
+     * portrait shrunk by {@link #STATUS_PORTRAIT_SHRINK} (freeing horizontal
+     * room) before falling back to the floor size regardless -- see the
+     * class-level follow-up note in the caller for why (never shrink below
+     * readable text; the portrait is the one allowed to give ground first).
+     */
+    private StatusFontFit findStatusFontFit(RectF box, float h, float w, float ppad, float valRight) {
+        float fullSide = h - 2 * ppad;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            float ps = attempt == 0 ? fullSide : fullSide * STATUS_PORTRAIT_SHRINK;
+            float tx = box.left + ppad + ps + w * 0.035f;
+            float avail = valRight - tx;
+            float maxFs = h * STATUS_FONT_MAX_FRAC;
+            float minFs = h * STATUS_FONT_MIN_FRAC;
+            float fs = maxFs;
+            while (fs > minFs) {
+                text.setTextSize(fs);
+                text.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
+                float wgt = Math.max(text.measureText(STATUS_WORST_HP), text.measureText(STATUS_WORST_MP));
+                if (wgt <= avail) break;
+                fs -= h * STATUS_FONT_STEP_FRAC;
+            }
+            fs = Math.max(fs, minFs);
+            // Accept immediately once it fits at max-or-shrunk size, or once
+            // we're out of fallback attempts (last attempt always accepted,
+            // clamped to the floor above).
+            text.setTextSize(fs);
+            text.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
+            float wgt = Math.max(text.measureText(STATUS_WORST_HP), text.measureText(STATUS_WORST_MP));
+            if (wgt <= avail || attempt == 1) {
+                return new StatusFontFit(fs, ps);
+            }
+        }
+        return new StatusFontFit(h * STATUS_FONT_MIN_FRAC, fullSide * STATUS_PORTRAIT_SHRINK);
     }
 
     /**
@@ -1019,9 +1201,13 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // the single-row command band (see listBandRect).
         long now = System.nanoTime();
         boolean listShowing = live && s.listOpen && !s.listRows.isEmpty();
+        boolean resultsShowing = live && s.resultsActive;
         boolean reserveBand = s.menuOpen || (live && isTargetingActive(now));
         float areaBottom;
-        if (listShowing) {
+        if (resultsShowing) {
+            int visRows = resultsVisibleRowCount(s);
+            areaBottom = listBandRect(parchment, visRows).top;
+        } else if (listShowing) {
             int visRows = computeListVisibleRows(parchment, s.listRows.size());
             areaBottom = listBandRect(parchment, visRows).top;
         } else if (reserveBand) {
@@ -1327,6 +1513,126 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             setText(box.height() * 0.38f, color, false, Paint.Align.RIGHT, true);
             c.drawText(extra, box.right - box.width() * 0.03f, box.centerY() + box.height() * 0.14f, text);
         }
+    }
+
+    // Fixed band height for the results window, in submenu-list "rows" (see
+    // listBandRect) -- no longer driven by item count now that only one
+    // message shows at a time; three rows' worth of height gives the big
+    // message room to wrap to two lines without the band feeling cramped.
+    private static final int RESULTS_BAND_ROWS = 3;
+
+    private int resultsVisibleRowCount(PartySnapshot s) {
+        return RESULTS_BAND_ROWS;
+    }
+
+    /**
+     * Battle-results window: replaces the command/targeting/list bands once
+     * {@code snap.resultsActive} holds (every enemy dead and the native
+     * comment_out2 step machine -- {@code snap.resultsStep} -- still mid-
+     * sequence). Shows ONE big message at a time -- "Earned N EXP.",
+     * "Earned N TP.", "Found N G.", "Obtained <item>.", or "<Name> leveled
+     * up!" -- chosen from the live step by {@link #computeResultsMessage}
+     * and cached in {@link #resultsMessage} (a step with no message of its
+     * own leaves the last one showing). When the step machine advances to a
+     * new message, {@link #resultsMessageFadeStart} drives a crossfade
+     * (reusing {@link #TITLE_FADE_NANOS}, same timing as the field-mode
+     * location-title fade) between {@link #resultsFadingMessage} (out) and
+     * {@link #resultsMessage} (in), drawing the eye down toward the panel.
+     * A small dim "A: continue" hint sits below the window. Drawn in the
+     * same 9-sliced window style and band position as the old list (see
+     * {@link #listBandRect}). Never consumes controller A -- see {@link
+     * #onControllerConfirm}, which only reacts to {@link #commandNavActive}/
+     * {@link #listNavActive}, both false here (menuOpen/listOpen are false
+     * during results), so the confirm press reaches the game unchanged.
+     */
+    private void drawResultsWindow(Canvas c, RectF parchment) {
+        RectF band = listBandRect(parchment, resultsVisibleRowCount(snap));
+
+        Bitmap winTex = ChronoAssets.getWindowTex();
+        if (winTex != null) {
+            float destInset = Math.min(band.width(), band.height()) * 0.08f;
+            drawNinePatch(c, winTex, ChronoAssets.WINDOW_TEX_INSET, band, destInset);
+        } else {
+            fill.setShader(null);
+            fill.setColor(BOX_BORDER_OUT);
+            c.drawRect(band, fill);
+            RectF inner = new RectF(band);
+            inner.inset(3, 3);
+            fill.setColor(BOX_BORDER_IN);
+            c.drawRect(inner, fill);
+            inner.inset(2, 2);
+            fill.setColor(BOX_BG);
+            c.drawRect(inner, fill);
+        }
+
+        float msgY = band.centerY() - band.height() * 0.08f;
+        if (resultsMessageFadeStart >= 0) {
+            long elapsed = System.nanoTime() - resultsMessageFadeStart;
+            float t = Math.min(1f, elapsed / (float) TITLE_FADE_NANOS);
+            if (t < 1f) {
+                drawResultsMessage(c, band, resultsFadingMessage, msgY, 1f - t);
+                drawResultsMessage(c, band, resultsMessage, msgY, t);
+            } else {
+                // fade finished this frame -- settle and fall through to a plain draw
+                resultsMessageFadeStart = -1L;
+                resultsFadingMessage = null;
+                drawResultsMessage(c, band, resultsMessage, msgY, 1f);
+            }
+        } else {
+            drawResultsMessage(c, band, resultsMessage, msgY, 1f);
+        }
+
+        setText(band.height() * 0.09f, Color.argb(200, 230, 230, 210), false, Paint.Align.CENTER, true);
+        c.drawText("A: continue", band.centerX(), band.bottom + band.height() * 0.12f, text);
+    }
+
+    /**
+     * Draws one results message, word-wrapped and centred within {@code
+     * band} around {@code baselineY} (mirrors {@link #drawTitleWrapped}'s
+     * centred-block layout), at about the location title's size ({@code h *
+     * 0.075} at full band height, scaled down slightly to leave headroom
+     * for two-line wraps) and {@code alpha} opacity -- used by {@link
+     * #drawResultsWindow} to crossfade the outgoing/incoming message. A
+     * null/empty message or zero alpha draws nothing (covers the brief
+     * window before the first message is computed).
+     */
+    private void drawResultsMessage(Canvas c, RectF band, String msg, float baselineY, float alpha) {
+        if (msg == null || msg.isEmpty() || alpha <= 0f) return;
+        int h = getHeight();
+        setText(Math.min(band.height() * 0.34f, h * 0.06f), Color.WHITE, true, Paint.Align.CENTER, true);
+        text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        // Fade via a canvas layer so the shadow layer fades with the glyphs
+        // (Paint alpha alone left a black shadow ghost during crossfades).
+        float a = clamp01(alpha);
+        int saved = -1;
+        if (a < 1f) {
+            saved = c.saveLayerAlpha(band.left, band.top - h * 0.1f, band.right, band.bottom + h * 0.1f,
+                    (int) (255 * a));
+        }
+
+        float maxW = band.width() * 0.88f;
+        java.util.List<String> lines = new java.util.ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        for (String word : msg.split(" ")) {
+            if (word.isEmpty()) continue;
+            String candidate = cur.length() == 0 ? word : cur + " " + word;
+            if (text.measureText(candidate) <= maxW || cur.length() == 0) {
+                cur.setLength(0);
+                cur.append(candidate);
+            } else {
+                lines.add(cur.toString());
+                cur.setLength(0);
+                cur.append(word);
+            }
+        }
+        if (cur.length() > 0) lines.add(cur.toString());
+        float lineH = text.getTextSize() * 1.15f;
+        float y = baselineY - lineH * (lines.size() - 1) * 0.5f;
+        for (String line : lines) {
+            c.drawText(line, band.centerX(), y, text);
+            y += lineH;
+        }
+        if (saved >= 0) c.restoreToCount(saved);
     }
 
     /**
@@ -2013,12 +2319,19 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // which is why the eye toggle is placed here too. Only ever drawn/
         // hit-testable against the live snapshot, never the fading-out one.
         long bandNow = System.nanoTime();
-        boolean targeting = snap.inBattle && isTargetingActive(bandNow);
-        boolean listMode = snap.inBattle && snap.listOpen && !snap.listRows.isEmpty();
+        boolean resultsMode = snap.inBattle && snap.resultsActive;
+        boolean targeting = !resultsMode && snap.inBattle && isTargetingActive(bandNow);
+        boolean listMode = !resultsMode && snap.inBattle && snap.listOpen && !snap.listRows.isEmpty();
         if (snap.inBattle) {
             gearHitBox.setEmpty();
             drawEyeToggle(c, parchment);
-            if (targeting) {
+            if (resultsMode) {
+                drawResultsWindow(c, parchment);
+                commandCount = 0;
+                targetCount = 0;
+                listVisibleCount = 0;
+                listBackHitBox.setEmpty();
+            } else if (targeting) {
                 drawTargetingButtons(c, parchment);
                 commandCount = 0;
                 listVisibleCount = 0;

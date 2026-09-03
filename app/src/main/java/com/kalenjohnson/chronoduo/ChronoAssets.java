@@ -42,6 +42,14 @@ public final class ChronoAssets {
     // glyph; kept as-is. Null until extraction finishes.
     private static String[] techNames;
     private static String[] itemNames;
+    // 0-based line index into Localize/en/msg/battle.txt == battle message
+    // id (line 37 "Earned <NUMBER> EXP.", 38 TP, 39 G, 40 "Obtained
+    // <NAME_ITM>.", 41 level-up, 42-44 tech-learned -- see
+    // battle_results_report.md). Placeholders are literal tokens
+    // ("<NUMBER>", "<NAME_ITM>", ...), not printf-style. Null until
+    // extraction finishes; getBattleMessage falls back to a literal string
+    // when this table or the requested id is missing.
+    private static String[] battleMessages;
     // Battle item-list row id encoding: (category << 14) | indexWithinCategory
     // -- item.txt's flat line-index table (itemNames above) does NOT cover
     // these ids (Potion arrived as 16385 = 0x4001, category 1). Parsed from
@@ -124,6 +132,39 @@ public final class ChronoAssets {
     public static byte[] getMonsterFlags() { return monsterFlags; }
     public static String[] getTechNames() { return techNames; }
     public static String[] getItemNames() { return itemNames; }
+    public static String[] getBattleMessages() { return battleMessages; }
+
+    // Literal fallback strings (mirroring battle.txt lines 37-40) used by
+    // getBattleMessage when battleMessages isn't loaded yet -- keeps
+    // PartyPanelView's results window readable even before extraction
+    // finishes or if the table is missing from this ROM dump.
+    private static final String[] BATTLE_MESSAGE_FALLBACK = {
+            "Earned <NUMBER> EXP.",   // 37
+            "Earned <NUMBER> TP.",    // 38
+            "Found <NUMBER> G.",      // 39
+            "Obtained <NAME_ITM>.",   // 40
+    };
+    private static final int BATTLE_MESSAGE_FALLBACK_BASE = 37;
+
+    /**
+     * Resolves battle.txt line {@code id}, substituting the first literal
+     * {@code <NUMBER>} token (if any) with {@code value} formatted as a
+     * plain decimal. Falls back to {@link #BATTLE_MESSAGE_FALLBACK} when the
+     * real table isn't loaded or doesn't cover {@code id}; if even that
+     * fails, returns {@code null} so the caller can keep its last message.
+     */
+    public static String getBattleMessage(int id, int value) {
+        String template = null;
+        if (battleMessages != null && id >= 0 && id < battleMessages.length) {
+            template = battleMessages[id];
+        }
+        if (template == null || template.trim().isEmpty()) {
+            int fi = id - BATTLE_MESSAGE_FALLBACK_BASE;
+            if (fi >= 0 && fi < BATTLE_MESSAGE_FALLBACK.length) template = BATTLE_MESSAGE_FALLBACK[fi];
+        }
+        if (template == null) return null;
+        return template.replace("<NUMBER>", String.valueOf(value));
+    }
 
     /**
      * Resolves a battle item-list row id (encoded as
@@ -189,6 +230,9 @@ public final class ChronoAssets {
 
     /** Stores the item name table (line index == item id) and notifies listeners, mirroring {@link #setMonsterNames}. */
     public static void setItemNames(String[] names) { itemNames = names; notifyListeners(); }
+
+    /** Stores the battle-message table (line index == message id, see {@link #getBattleMessage}) and notifies listeners, mirroring {@link #setMonsterNames}. */
+    public static void setBattleMessages(String[] messages) { battleMessages = messages; notifyListeners(); }
 
     /** Stores the sfc_item.txt-derived category name map (key "<CATEGORY>_<NNN>") used by {@link #getItemName(int)}, and notifies listeners. */
     public static void setItemCategoryNames(Map<String, String> names) { itemCategoryNames = names; notifyListeners(); }
