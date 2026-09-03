@@ -1,0 +1,3 @@
+/home/kalenj/Work/chrono-trigger/app/.cxx/Debug/f1t416n5/arm64-v8a/CMakeFiles/chronoduo.dir
+/home/kalenj/Work/chrono-trigger/app/.cxx/Debug/f1t416n5/arm64-v8a/CMakeFiles/edit_cache.dir
+/home/kalenj/Work/chrono-trigger/app/.cxx/Debug/f1t416n5/arm64-v8a/CMakeFiles/rebuild_cache.dir

@@ -1,0 +1,13 @@
+# ninja log v5
+0	36	1788428253540797705	CMakeFiles/chronoduo.dir/gamestate.c.o	5d4fb8416697bee
+37	56	1788428253561798284	/home/kalenj/Work/chrono-trigger/app/build/intermediates/cxx/Debug/f1t416n5/obj/arm64-v8a/libchronoduo.so	9212787f9d1fdf19
+1	22	1788428556714448955	CMakeFiles/chronoduo.dir/gamestate.c.o	5d4fb8416697bee
+22	38	1788428556730445496	/home/kalenj/Work/chrono-trigger/app/build/intermediates/cxx/Debug/f1t416n5/obj/arm64-v8a/libchronoduo.so	9212787f9d1fdf19
+0	24	1788428716400937684	CMakeFiles/chronoduo.dir/gamestate.c.o	5d4fb8416697bee
+24	40	1788428716416935860	/home/kalenj/Work/chrono-trigger/app/build/intermediates/cxx/Debug/f1t416n5/obj/arm64-v8a/libchronoduo.so	9212787f9d1fdf19
+0	43	1788428811446937491	CMakeFiles/chronoduo.dir/gamestate.c.o	5d4fb8416697bee
+43	72	1788428811478935010	/home/kalenj/Work/chrono-trigger/app/build/intermediates/cxx/Debug/f1t416n5/obj/arm64-v8a/libchronoduo.so	9212787f9d1fdf19
+0	26	1788428942265089535	CMakeFiles/chronoduo.dir/gamestate.c.o	5d4fb8416697bee
+27	43	1788428942282088768	/home/kalenj/Work/chrono-trigger/app/build/intermediates/cxx/Debug/f1t416n5/obj/arm64-v8a/libchronoduo.so	9212787f9d1fdf19
+0	37	1788429271176218524	CMakeFiles/chronoduo.dir/gamestate.c.o	5d4fb8416697bee
+37	55	1788429271195218333	/home/kalenj/Work/chrono-trigger/app/build/intermediates/cxx/Debug/f1t416n5/obj/arm64-v8a/libchronoduo.so	9212787f9d1fdf19

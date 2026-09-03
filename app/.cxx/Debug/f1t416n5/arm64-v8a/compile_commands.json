@@ -1,0 +1,7 @@
+[
+{
+  "directory": "/home/kalenj/Work/chrono-trigger/app/.cxx/Debug/f1t416n5/arm64-v8a",
+  "command": "/home/kalenj/Android/Sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=aarch64-none-linux-android26 --sysroot=/home/kalenj/Android/Sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dchronoduo_EXPORTS -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -fno-limit-debug-info  -fPIC -o CMakeFiles/chronoduo.dir/gamestate.c.o -c /home/kalenj/Work/chrono-trigger/app/src/main/cpp/gamestate.c",
+  "file": "/home/kalenj/Work/chrono-trigger/app/src/main/cpp/gamestate.c"
+}
+]

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Package visibility (API 30+): we need to see the official game install. -->
+    <queries>
+        <package android:name="com.square_enix.android_googleplay.chrono" />
+    </queries>
+
+    <application
+        android:label="ChronoDuo"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:hardwareAccelerated="true">
+
+        <activity
+            android:name="org.cocos2dx.cpp.AppActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
