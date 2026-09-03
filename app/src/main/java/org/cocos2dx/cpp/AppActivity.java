@@ -93,6 +93,11 @@ public class AppActivity extends Cocos2dxActivity {
         extractCompanionAssets();
 
         com.kalenjohnson.chronoduo.GameState.attach();
+        // Frame-perfect menu parking: a per-rendered-frame GL tick that kills
+        // the residual field-MENU flash the 700ms backstop tick (below) can
+        // still miss between its own runs, plus opacity-hides the battle
+        // top-UI. Started once; safe before the GL surface exists.
+        com.kalenjohnson.chronoduo.GameState.startFrameEnforcer();
         // periodic full-memory dumps for offline layout analysis (dev only)
         File dumpDir = getExternalFilesDir(null);
         if (dumpDir != null) {
@@ -132,10 +137,13 @@ public class AppActivity extends Cocos2dxActivity {
             // controller covers them (Y = menu). Re-applied every 700ms because
             // scene transitions rebuild the UI nodes (FieldMenu) and the
             // overworld re-asserts its own button visibility every frame
-            // (WorldMenu) -- a shorter interval keeps the post-transition
-            // flash brief. SecondScreenPresentation's poll also fires this
-            // immediately on a detected scene change, so this tick is really
-            // just the steady-state backstop.
+            // (WorldMenu). Now purely a steady-state backstop for whatever the
+            // per-frame enforcer (GameState.startFrameEnforcer(), started
+            // above) might miss -- the enforcer's own depth<=2 park sweep runs
+            // every rendered frame and is what actually kills the flash, so
+            // SecondScreenPresentation's old post-scene-change "hide burst" was
+            // removed as redundant (a once-per-frame sweep already beats its
+            // 150ms cadence by roughly an order of magnitude).
             Runnable cleanUi = new Runnable() {
                 @Override public void run() {
                     com.kalenjohnson.chronoduo.GameState.queueHiddenUiPatterns();

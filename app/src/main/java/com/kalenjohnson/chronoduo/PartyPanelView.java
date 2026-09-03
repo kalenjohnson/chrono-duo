@@ -714,6 +714,19 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         int count = Math.min(commandHitBoxes.length, s.commandTargets.size());
         if (count == 0) return;
 
+        // Mirror the game's own cursor: highlight whichever command target
+        // reports selected == true (see PartySnapshot.CommandTarget), falling
+        // back to index 0 (the old hardcoded default) when none does -- e.g.
+        // the read raced a transition, or the selection offsets ever prove
+        // unreliable.
+        int highlightIdx = 0;
+        for (int i = 0; i < count; i++) {
+            if (s.commandTargets.get(i).selected) {
+                highlightIdx = i;
+                break;
+            }
+        }
+
         float bandTop = parchment.bottom - h * 0.235f;
         float bandBottom = parchment.bottom - h * 0.115f;
         float gap = w * 0.02f;
@@ -726,11 +739,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             RectF box = new RectF(x, bandTop, x + btnW, bandBottom);
             boolean pressed = live && pressedCommand == i
                     && pressedAt >= 0 && System.nanoTime() - pressedAt < PRESS_FEEDBACK_NANOS;
-            // Attack (index 0) gets a subtle default-selected treatment,
+            // The live-selected command (falling back to Attack/index 0 when
+            // none reports selected) gets a subtle highlight treatment,
             // matching the game's own touchscreen default highlighting --
             // purely cosmetic, suppressed while the pressed-feedback flash
             // is showing so the two don't visually compete.
-            drawCommandButton(c, box, COMMAND_LABELS[i], winTex, pressed, i == 0);
+            drawCommandButton(c, box, COMMAND_LABELS[i], winTex, pressed, i == highlightIdx);
             if (live) commandHitBoxes[i].set(box);
             x += btnW + gap;
         }

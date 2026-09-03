@@ -65,9 +65,15 @@ public final class PartySnapshot {
      */
     public static final class CommandTarget {
         public final float x, y;
-        public CommandTarget(float x, float y) {
+        // Mirrors the game's own cursor: true when this toggle's live
+        // _selected flag (see GameState.nativeGetBattleToggles) was set at
+        // read time. At most one CommandTarget in a snapshot is selected;
+        // PartyPanelView falls back to highlighting index 0 when none is.
+        public final boolean selected;
+        public CommandTarget(float x, float y, boolean selected) {
             this.x = x;
             this.y = y;
+            this.selected = selected;
         }
     }
 
@@ -174,15 +180,18 @@ public final class PartySnapshot {
             }
 
             float[] toggles = GameState.nativeGetBattleToggles();
-            if (toggles != null && toggles.length >= 3) {
+            // Quintuples: [x, y, visible, selected, selectedIndex] per toggle
+            // -- widened from triples to carry the live selection flag (see
+            // CommandTarget.selected / GameState.nativeGetBattleToggles).
+            if (toggles != null && toggles.length >= 5) {
                 List<float[]> candidates = new ArrayList<>();
-                for (int i = 0; i + 2 < toggles.length; i += 3) {
+                for (int i = 0; i + 4 < toggles.length; i += 5) {
                     float vis = toggles[i + 2];
                     if (vis < 0.5f) continue;
                     float sx = CMD_SX_A + CMD_SX_B * toggles[i];
                     float sy = CMD_SY_A + CMD_SY_B * toggles[i + 1];
                     if (sx > CMD_MIN_X && sy >= CMD_MIN_Y && sy <= CMD_MAX_Y) {
-                        candidates.add(new float[]{sx, sy});
+                        candidates.add(new float[]{sx, sy, toggles[i + 3]});
                     }
                 }
                 // Only trust the band when it holds exactly the 3 command
@@ -193,7 +202,7 @@ public final class PartySnapshot {
                 candidates.sort((a, b) -> Float.compare(a[1], b[1]));
                 if (candidates.size() == CMD_MAX_TARGETS) {
                     for (float[] p : candidates) {
-                        snap.commandTargets.add(new CommandTarget(p[0], p[1]));
+                        snap.commandTargets.add(new CommandTarget(p[0], p[1], p[2] >= 0.5f));
                     }
                 }
             }
@@ -233,7 +242,7 @@ public final class PartySnapshot {
         }
         for (int i = 0; i < commandTargets.size(); i++) {
             CommandTarget a = commandTargets.get(i), b = o.commandTargets.get(i);
-            if (a.x != b.x || a.y != b.y) return false;
+            if (a.x != b.x || a.y != b.y || a.selected != b.selected) return false;
         }
         return true;
     }

@@ -34,6 +34,12 @@ static void *(*p_node_getChildren)(void *);  // returns cocos2d::Vector<Node*>&
 static int   (*p_node_isVisible)(void *);
 static void  (*p_node_setVisible)(void *, int);
 static void  (*p_node_setPosition)(void *, const void *); // (this, const Vec2*)
+// nsSpriteUtils::setCascadeOpacityEnabledRecursive(Node*, bool) -- plain free
+// function (not a Node member): recursively flips cascade-opacity on so a
+// later setOpacity() on the container actually propagates to its children
+// instead of only dimming the container itself.
+static void  (*p_setCascadeOpacityEnabledRecursive)(void *, int);
+static void  (*p_node_setOpacity)(void *, uint8_t); // instance: (this, GLubyte)
 
 // cocos2d::Size/Vec2 are HFAs (two floats) -- returned in s0/s1 per the arm64
 // AAPCS, so plain C struct-by-value declarations match the real ABI.
@@ -136,6 +142,9 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeAttach(JNIEnv *env, jclass cls) 
     p_node_getContentSize = (const void *(*)(void *)) dlsym(h, "_ZNK7cocos2d4Node14getContentSizeEv");
     p_node_convertToWorldSpace = (CCVec2 (*)(void *, const CCVec2 *))
         dlsym(h, "_ZNK7cocos2d4Node19convertToWorldSpaceERKNS_4Vec2E");
+    p_setCascadeOpacityEnabledRecursive = (void (*)(void *, int))
+        dlsym(h, "_ZN13nsSpriteUtils33setCascadeOpacityEnabledRecursiveEPN7cocos2d4NodeEb");
+    p_node_setOpacity = (void (*)(void *, uint8_t)) dlsym(h, "_ZN7cocos2d4Node10setOpacityEh");
     LOGI("attach: getInstance=%p canvas=%p asm_slot=%p director=%p", (void *)p_getInstance,
          p_getInstance ? p_getInstance() : NULL, (void *)g_asm_mem_slot,
          (void *)p_dir_getInstance);
@@ -282,6 +291,7 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeGetMapName(JNIEnv *env, jclass c
 static int g_in_battle;
 static void *g_battle_node;   // cached SceneBattle instance ptr (GL thread writes, any thread reads)
 static int g_battle_was;      // previous g_in_battle value, for edge-triggered "started/ended" logging
+static int g_last_logged_selected = -1; // toggle index last logged as selected, for on-change-only logging
 
 // ---------------------------------------------------------------------------
 // Scene-graph access (must run on the GL thread via Cocos2dxHelper.runOnGLThread)
@@ -415,8 +425,13 @@ static void *find_node_by_type(void *root, const char *pat, int max_depth) {
 // only -- called from nativeUpdateBattleFlag, which already runs there.
 // ---------------------------------------------------------------------------
 
+// MenuItemToggle member offsets (arm64, from setter disasm): _selected (bool,
+// u8) at +0x2F8, _selectedIndex (u32) at +0x330.
+#define TOGGLE_SELECTED_OFFSET       0x2F8
+#define TOGGLE_SELECTED_INDEX_OFFSET 0x330
+
 #define MAX_BATTLE_TOGGLES 24
-typedef struct { float x, y; int visible; } BattleToggle;
+typedef struct { float x, y; int visible; int selected; uint32_t selectedIndex; } BattleToggle;
 static BattleToggle g_battle_toggles[MAX_BATTLE_TOGGLES];
 static int g_battle_toggle_count;
 
@@ -431,9 +446,15 @@ static void collect_toggles_rec(void *node, int depth, int max_depth, int ancest
     if (strstr(tn, "MenuItemToggle")) {
         float wx, wy;
         if (node_world_center(node, &wx, &wy)) {
+            uint8_t selb = 0;
+            uint32_t selIdx = 0;
+            safe_read((uint8_t *)node + TOGGLE_SELECTED_OFFSET, &selb, 1);
+            safe_read((uint8_t *)node + TOGGLE_SELECTED_INDEX_OFFSET, &selIdx, 4);
             g_battle_toggles[g_battle_toggle_count].x = wx;
             g_battle_toggles[g_battle_toggle_count].y = wy;
             g_battle_toggles[g_battle_toggle_count].visible = this_visible ? 1 : 0;
+            g_battle_toggles[g_battle_toggle_count].selected = selb ? 1 : 0;
+            g_battle_toggles[g_battle_toggle_count].selectedIndex = selIdx;
             g_battle_toggle_count++;
         }
         return; // toggles have no meaningful children to recurse into
@@ -478,6 +499,20 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeUpdateBattleFlag(JNIEnv *env, jc
                      g_battle_toggles[i].x, g_battle_toggles[i].y);
             }
         }
+        // Selection mirroring verification: log (battle only, on change
+        // only) which toggle index reports _selected, so a dpad move on the
+        // controller's cursor can be confirmed to reach the panel's
+        // highlight within one poll tick.
+        int sel_idx = -1;
+        for (int i = 0; i < g_battle_toggle_count; i++) {
+            if (g_battle_toggles[i].selected) { sel_idx = i; break; }
+        }
+        if (sel_idx != g_last_logged_selected) {
+            LOGI("battle selection: toggle[%d] selected (was %d)", sel_idx, g_last_logged_selected);
+            g_last_logged_selected = sel_idx;
+        }
+    } else {
+        g_last_logged_selected = -1; // battle ended/not found -- reset so re-entry logs fresh
     }
     if (g_in_battle != g_battle_was) {
         LOGI("battle %s", g_in_battle ? "started" : "ended");
@@ -490,23 +525,27 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleFlag(JNIEnv *env, jclas
     return g_in_battle ? JNI_TRUE : JNI_FALSE;
 }
 
-// Cached battle command toggles, as flat [x0,y0,vis0, x1,y1,vis1, ...] triples
-// (vis is 0.0/1.0). Empty array when not in battle. Populated on the GL
-// thread by nativeUpdateBattleFlag; safe to call from any thread (plain read
-// of the cached array, single-writer/racy-reader like the rest of this file).
+// Cached battle command toggles, as flat [x0,y0,vis0,sel0,selIdx0, ...]
+// quintuples (vis/sel are 0.0/1.0; selIdx is the toggle's raw _selectedIndex,
+// cast to float -- exact for the small ints this field ever holds). Empty
+// array when not in battle. Populated on the GL thread by
+// nativeUpdateBattleFlag; safe to call from any thread (plain read of the
+// cached array, single-writer/racy-reader like the rest of this file).
 JNIEXPORT jfloatArray JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleToggles(JNIEnv *env, jclass cls) {
     int count = g_battle_toggle_count;
-    jfloatArray arr = (*env)->NewFloatArray(env, count * 3);
+    jfloatArray arr = (*env)->NewFloatArray(env, count * 5);
     if (!arr) return NULL;
     if (count > 0) {
-        float buf[MAX_BATTLE_TOGGLES * 3];
+        float buf[MAX_BATTLE_TOGGLES * 5];
         for (int i = 0; i < count; i++) {
-            buf[i * 3 + 0] = g_battle_toggles[i].x;
-            buf[i * 3 + 1] = g_battle_toggles[i].y;
-            buf[i * 3 + 2] = g_battle_toggles[i].visible ? 1.0f : 0.0f;
+            buf[i * 5 + 0] = g_battle_toggles[i].x;
+            buf[i * 5 + 1] = g_battle_toggles[i].y;
+            buf[i * 5 + 2] = g_battle_toggles[i].visible ? 1.0f : 0.0f;
+            buf[i * 5 + 3] = g_battle_toggles[i].selected ? 1.0f : 0.0f;
+            buf[i * 5 + 4] = (float) g_battle_toggles[i].selectedIndex;
         }
-        (*env)->SetFloatArrayRegion(env, arr, 0, count * 3, buf);
+        (*env)->SetFloatArrayRegion(env, arr, 0, count * 5, buf);
     }
     return arr;
 }
@@ -620,6 +659,139 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetVisibleByPattern(JNIEnv *env,
     if (scene) hide_walk(scene, 0, pat, visible);
     (*env)->ReleaseStringUTFChars(env, jpat, pat);
     return g_hide_hits;
+}
+
+// ---------------------------------------------------------------------------
+// Frame-perfect enforcer: a per-rendered-frame GL-thread tick, queued from
+// Java as a self-reposting Runnable (see GameState.startFrameEnforcer/
+// FRAME_ENFORCER_TICK) via Cocos2dxGLSurfaceView.queueEvent -- C code here
+// cannot queue GL runnables itself, only Java can. nativeStartFrameEnforcer
+// is just an idempotent start-once gate so a repeat call from Java (e.g. a
+// second attach) is a harmless no-op instead of stacking a second repost
+// loop. The tick itself (nativeEnforceUiTick) is kept deliberately cheap:
+// depth<=2 park sweep for FieldMenu/WorldMenu (a handful of nodes near the
+// scene root, not a full tree walk like nativeSceneDump/hide_walk), plus,
+// when in battle and enabled, a direct-children-only sweep of the battle
+// node's command menus.
+// ---------------------------------------------------------------------------
+
+static int g_frame_enforcer_started;
+
+JNIEXPORT jboolean JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeStartFrameEnforcer(JNIEnv *env, jclass cls) {
+    if (g_frame_enforcer_started) return JNI_FALSE;
+    g_frame_enforcer_started = 1;
+    LOGI("frame enforcer: starting");
+    return JNI_TRUE;
+}
+
+// FieldMenu/WorldMenu park sweep for the per-frame tick: same park action as
+// hide_walk's hide path (setVisible false + offscreen setPosition, logged
+// once per address via the same g_moved_ring), but shallow on purpose --
+// depth 0 (scene) through depth 2 (grandchildren) only, matching
+// node_or_children_is_battle's max_depth convention (a node AT max_depth is
+// still checked, just not descended past).
+static void enforce_park_walk(void *node, int depth, int max_depth) {
+    char tb[96], nb[64];
+    const char *tn = type_name(node, tb, sizeof(tb));
+    if (!tn) return;
+    const char *nm = p_node_getName ? sso_cstr(p_node_getName(node), nb, sizeof(nb)) : "";
+    if (strstr(tn, "FieldMenu") || strstr(tn, "WorldMenu")
+            || (nm[0] && (strstr(nm, "FieldMenu") || strstr(nm, "WorldMenu")))) {
+        if (vtable_in_libchrono(node)) {
+            if (p_node_setVisible) p_node_setVisible(node, 0);
+            if (p_node_setPosition) {
+                CCVec2 off = { OFFSCREEN_X, OFFSCREEN_Y };
+                p_node_setPosition(node, &off);
+            }
+            if (!already_logged_move(node)) {
+                LOGI("clean-ui: parked %s '%s' (%p) off-screen [enforcer]", tn, nm, node);
+            }
+        }
+        return;
+    }
+    if (depth >= max_depth || !p_node_getChildren) return;
+    void *vecp = p_node_getChildren(node);
+    void *ptrs[2];
+    if (!safe_read(vecp, ptrs, 16)) return;
+    void **begin = (void **)ptrs[0], **end = (void **)ptrs[1];
+    if (!plausible_any(begin) || !plausible_any(end) || end < begin
+            || (end - begin) > 512) return;
+    for (void **c = begin; c < end; c++) {
+        void *child;
+        if (safe_read(c, &child, 8)) enforce_park_walk(child, depth + 1, max_depth);
+    }
+}
+
+// Ring of node addresses already handed to setCascadeOpacityEnabledRecursive,
+// so that (expensive, and only needed once) call fires at most once per node
+// -- separate from g_moved_ring since these are different nodes (battle
+// command menus) hit by a different sweep.
+#define OPACITY_RING_CAP 16
+static void *g_opacity_ring[OPACITY_RING_CAP];
+static int g_opacity_ring_pos;
+static int already_cascade_set(void *node) {
+    for (int i = 0; i < OPACITY_RING_CAP; i++) {
+        if (g_opacity_ring[i] == node) return 1;
+    }
+    g_opacity_ring[g_opacity_ring_pos] = node;
+    g_opacity_ring_pos = (g_opacity_ring_pos + 1) % OPACITY_RING_CAP;
+    return 0;
+}
+
+// Battle top-UI hiding toggle (Java-settable, see nativeSetHideBattleUi).
+// Defaults to enabled.
+static int g_hide_battle_ui = 1;
+
+JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeSetHideBattleUi(JNIEnv *env, jclass cls,
+                                                                 jboolean hide) {
+    g_hide_battle_ui = hide ? 1 : 0;
+}
+
+// Opacity (not visibility/position) hiding of the battle command menus:
+// touch hit-testing and the controller cursor both need the real node graph
+// untouched (visible, at its real position) for the game's own input/tap-
+// injection targeting to keep working -- only the pixels are hidden. Direct
+// children of g_battle_node only (no recursion): the cocos2d::Menu of
+// command toggles and the Tech/Item/List submenus all sit there. Every
+// matching node whose type name contains "Menu" (covers cocos2d::Menu,
+// BattleTechMenu, BattleItemMenu, BattleListMenu -- all contain that
+// substring) gets cascade-opacity enabled once (so setOpacity below actually
+// propagates to children instead of only dimming the container), then
+// setOpacity(0) applied EVERY tick, since the game may reassert its own
+// opacity whenever the menu (re)opens.
+static void enforce_battle_ui_hide(void) {
+    if (!g_hide_battle_ui || !g_battle_node || !vtable_in_libchrono(g_battle_node)
+            || !p_node_getChildren) {
+        return;
+    }
+    void *vecp = p_node_getChildren(g_battle_node);
+    void *ptrs[2];
+    if (!safe_read(vecp, ptrs, 16)) return;
+    void **begin = (void **)ptrs[0], **end = (void **)ptrs[1];
+    if (!plausible_any(begin) || !plausible_any(end) || end < begin
+            || (end - begin) > 512) return;
+    for (void **c = begin; c < end; c++) {
+        void *child;
+        if (!safe_read(c, &child, 8)) continue;
+        char tb[96];
+        const char *tn = type_name(child, tb, sizeof(tb));
+        if (!tn || !strstr(tn, "Menu")) continue;
+        if (!vtable_in_libchrono(child)) continue;
+        if (p_setCascadeOpacityEnabledRecursive && !already_cascade_set(child)) {
+            p_setCascadeOpacityEnabledRecursive(child, 1);
+            LOGI("battle-ui: cascade-opacity enabled on %s (%p)", tn, child);
+        }
+        if (p_node_setOpacity) p_node_setOpacity(child, 0);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeEnforceUiTick(JNIEnv *env, jclass cls) {
+    void *scene = find_running_scene();
+    if (scene) enforce_park_walk(scene, 0, 2);
+    enforce_battle_ui_hide();
 }
 
 // Dump whole regions to files for offline analysis (adb pull + python).

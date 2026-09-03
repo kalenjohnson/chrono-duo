@@ -34,11 +34,60 @@ public final class GameState {
     // Live battle actor array (10 * 0x80-byte slots), or null if not in battle
     // or any pointer in the chase is bad. Any thread; uses cached node ptr.
     public static native byte[] nativeReadBattleActors();
-    // Battle command button (MenuItemToggle) positions/visibility, cached by
-    // nativeUpdateBattleFlag: flat [x0,y0,vis0, x1,y1,vis1, ...] triples in
-    // worldspace pixels, vis 0.0/1.0. Empty array when not in battle. Any
-    // thread; uses the cached array populated on the GL thread.
+    // Battle command button (MenuItemToggle) positions/visibility/selection,
+    // cached by nativeUpdateBattleFlag: flat [x0,y0,vis0,sel0,selIdx0, ...]
+    // quintuples in worldspace pixels; vis/sel are 0.0/1.0, selIdx is the
+    // toggle's raw _selectedIndex cast to float. Empty array when not in
+    // battle. Any thread; uses the cached array populated on the GL thread.
     public static native float[] nativeGetBattleToggles();
+
+    // --- frame-perfect UI enforcer -----------------------------------------
+    // Idempotent start gate (native side) for the per-rendered-frame GL tick
+    // below -- see startFrameEnforcer(). Returns true only the first time.
+    public static native boolean nativeStartFrameEnforcer();
+    // Cheap per-frame GL-thread tick: depth<=2 park sweep for FieldMenu/
+    // WorldMenu (kills the field-MENU flash the 700ms tick can still miss
+    // between ticks), plus -- when in battle and nativeSetHideBattleUi(true)
+    // (the default) -- an opacity-only sweep of the battle node's command
+    // menus. Must run on the GL thread; queued every frame via
+    // FRAME_ENFORCER_TICK below.
+    public static native void nativeEnforceUiTick();
+    // Toggles the battle top-UI opacity hiding done by nativeEnforceUiTick.
+    // Default true; expose an off switch in case it ever misbehaves. Any
+    // thread (plain flag write).
+    public static native void nativeSetHideBattleUi(boolean hide);
+
+    private static boolean frameEnforcerStarted;
+    // Self-reposting Runnable: calls the cheap native tick, then re-queues
+    // itself on the GL surface so it runs again next rendered frame. Queued
+    // (not run) directly via Cocos2dxGLSurfaceView -- Cocos2dxHelper.
+    // runOnGLThread would work too (it delegates to the same queueEvent) but
+    // going straight to the surface view avoids an extra indirection on the
+    // hot per-frame repost.
+    private static final Runnable FRAME_ENFORCER_TICK = new Runnable() {
+        @Override public void run() {
+            nativeEnforceUiTick();
+            org.cocos2dx.lib.Cocos2dxGLSurfaceView view =
+                    org.cocos2dx.lib.Cocos2dxGLSurfaceView.getInstance();
+            if (view != null) view.queueEvent(this);
+        }
+    };
+
+    /**
+     * Starts the per-frame UI enforcer loop. Idempotent (a second call is a
+     * no-op, guarded natively so even a call racing the Java-side flag can't
+     * stack a duplicate repost loop) and safe to call before the GL surface
+     * exists -- queueEvent() just buffers the Runnable until the render
+     * thread is ready to run it. No stop path: the tick is a no-op whenever
+     * nothing currently matches its patterns, so leaving it running forever
+     * costs nothing extra once idle.
+     */
+    public static void startFrameEnforcer() {
+        if (frameEnforcerStarted || !isAttached()) return;
+        if (!nativeStartFrameEnforcer()) return;
+        frameEnforcerStarted = true;
+        org.cocos2dx.lib.Cocos2dxHelper.runOnGLThread(FRAME_ENFORCER_TICK);
+    }
 
     /** Scene-graph node type/name patterns hidden by the "clean UI" tick. */
     public static final String[] HIDDEN_UI_PATTERNS = {"FieldMenu", "WorldMenu"};

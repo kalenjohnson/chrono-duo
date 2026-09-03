@@ -17,36 +17,13 @@ public final class SecondScreenPresentation extends Presentation {
     // read snapshot was mid-battle, and fall back to POLL_MS otherwise.
     private static final long POLL_MS_BATTLE = 150;
 
-    // "Flash burst": a mapName change re-hides the UI immediately (see below),
-    // but the game keeps re-asserting FieldMenu/WorldMenu visibility for a
-    // short window right after the scene rebuild, so one immediate call can
-    // still lose to a re-show that lands before AppActivity's 700ms backstop
-    // tick fires -- that's the on-screen flash this burst closes. Once
-    // started, it re-fires queueHiddenUiPatterns() every BURST_INTERVAL_MS
-    // until BURST_DURATION_MS has elapsed; a new mapName change cancels
-    // whatever burst is in flight and starts a fresh one, so at most one
-    // burst is ever pending. The steady-state 700ms tick in AppActivity is
-    // untouched -- this burst is purely an extra, denser pass right after a
-    // scene change.
-    private static final long BURST_INTERVAL_MS = 150;
-    private static final long BURST_DURATION_MS = 3000;
-    private long burstEndAtMs = -1L;
-    private final Runnable burstTick = new Runnable() {
-        @Override public void run() {
-            GameState.queueHiddenUiPatterns();
-            if (System.currentTimeMillis() < burstEndAtMs) {
-                handler.postDelayed(this, BURST_INTERVAL_MS);
-            }
-        }
-    };
-
-    private void startHideBurst() {
-        // Cancel any burst already in flight so only the newest one keeps
-        // ticking -- "stop early if another burst starts."
-        handler.removeCallbacks(burstTick);
-        burstEndAtMs = System.currentTimeMillis() + BURST_DURATION_MS;
-        burstTick.run(); // fires immediately, then reschedules itself
-    }
+    // The old post-scene-change "hide burst" (a denser 150ms re-hide pass for
+    // a few seconds after a mapName change) was removed: GameState's per-
+    // frame enforcer (see AppActivity.startFrameEnforcer /
+    // nativeEnforceUiTick) now re-parks FieldMenu/WorldMenu every rendered
+    // frame, which closes the same post-transition flash window faster than
+    // any polling burst could. A mapName change no longer needs a special
+    // reaction here at all.
 
     private PartyPanelView panel;
     private PartySnapshot last;
@@ -60,16 +37,6 @@ public final class SecondScreenPresentation extends Presentation {
                 org.cocos2dx.lib.Cocos2dxHelper.runOnGLThread(GameState::nativeUpdateBattleFlag);
             }
             PartySnapshot snap = PartySnapshot.read();
-            // A mapName change means a scene switch just happened (field<->
-            // field, or field<->overworld) -- the game rebuilds its menu UI
-            // nodes on that transition, so re-hide them immediately instead
-            // of waiting for AppActivity's next 700ms tick, and keep re-
-            // hiding at a denser cadence for a few seconds (see
-            // startHideBurst) since the rebuild can re-show the UI again
-            // right after this poll's single immediate call.
-            if (last == null || !snap.mapName.equals(last.mapName)) {
-                startHideBurst();
-            }
             if (last == null || !snap.sameAs(last)) {
                 last = snap;
                 panel.update(snap);
@@ -101,7 +68,6 @@ public final class SecondScreenPresentation extends Presentation {
     @Override
     protected void onStop() {
         handler.removeCallbacks(poll);
-        handler.removeCallbacks(burstTick);
         super.onStop();
     }
 
