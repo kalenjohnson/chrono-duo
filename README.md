@@ -43,3 +43,12 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 ## How it works
 
 See `NOTES.md` for the research and design record.
+
+## License
+
+ChronoDuo is released under the [MIT License](LICENSE).
+
+The vendored `org.cocos2dx.lib` Java classes are from cocos2d-x 3.14.1
+(MIT). No Square Enix assets or code are included: the app loads the
+official Chrono Trigger Android game you have installed, and the optional
+indoor maps are decoded on your device from your own Chrono Trigger DS ROM.
