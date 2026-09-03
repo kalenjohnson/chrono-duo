@@ -28,6 +28,10 @@ public final class GameState {
     public static native void nativeUpdateMapName();              // GL thread only
     public static native String nativeGetMapName();
 
+    public static native void nativeUpdateBattleFlag();           // GL thread only
+    public static native boolean nativeGetBattleFlag();
+    public static native void nativeDumpBattleBuffers(String dir); // any thread; uses cached node ptr
+
     /** Scene-graph node type/name patterns hidden by the "clean UI" tick. */
     public static final String[] HIDDEN_UI_PATTERNS = {"FieldMenu", "WorldMenu"};
 

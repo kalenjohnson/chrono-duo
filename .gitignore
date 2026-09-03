@@ -5,3 +5,5 @@ local.properties
 *.iml
 reference/
 .claude/
+*.nds
+app/.cxx/

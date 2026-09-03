@@ -23,6 +23,8 @@
 #define SFC_WORK_OFFSET   0x40
 #define CHARA_BASE        0x6924
 #define CHARA_STRIDE      0x154
+// cSfcWork::GetSendBtlDataa(): ldr x0, [x0, 0xc0f0]; ret -- heap ptr to battle data.
+#define GETSENDBTLDATA_OFFSET 0xc0f0
 
 static void *(*p_getInstance)(void);
 static uint8_t **g_asm_mem_slot;  // libchrono base + 0xbeeba8: virtual SNES memory ptr
@@ -209,6 +211,16 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeGetMapName(JNIEnv *env, jclass c
 }
 
 // ---------------------------------------------------------------------------
+// Battle flag: is the running scene (or a shallow child) a battle scene?
+// Must run on the GL thread (scene graph unsafe off-thread) -- cached like
+// the map name above.
+// ---------------------------------------------------------------------------
+
+static int g_in_battle;
+static void *g_battle_node;   // cached SceneBattle instance ptr (GL thread writes, any thread reads)
+static int g_battle_was;      // previous g_in_battle value, for edge-triggered "started/ended" logging
+
+// ---------------------------------------------------------------------------
 // Scene-graph access (must run on the GL thread via Cocos2dxHelper.runOnGLThread)
 // ---------------------------------------------------------------------------
 
@@ -277,6 +289,87 @@ static void *find_running_scene(void) {
         }
     }
     return NULL;
+}
+
+// Depth-<=2 check: the scene itself (depth 0) or a direct child (depth 1)
+// with an RTTI type name containing "Battle". Cheap and shallow on purpose --
+// no full tree walk needed just to answer "are we in a battle".
+static int node_or_children_is_battle(void *node, int depth, int max_depth) {
+    char tb[96];
+    const char *tn = type_name(node, tb, sizeof(tb));
+    if (tn && strstr(tn, "Battle")) return 1;
+    if (depth >= max_depth || !p_node_getChildren) return 0;
+    void *vecp = p_node_getChildren(node);
+    void *ptrs[2];
+    if (!safe_read(vecp, ptrs, 16)) return 0;
+    void **begin = (void **)ptrs[0], **end = (void **)ptrs[1];
+    if (!plausible_any(begin) || !plausible_any(end) || end < begin
+            || (end - begin) > 512) return 0;
+    for (void **c = begin; c < end; c++) {
+        void *child;
+        if (safe_read(c, &child, 8) &&
+                node_or_children_is_battle(child, depth + 1, max_depth)) return 1;
+    }
+    return 0;
+}
+
+// Recursive scene-graph search for a node whose RTTI type name contains
+// `pat` (e.g. "SceneBattle"). Same child-walking shape as hide_walk/
+// node_or_children_is_battle above. GL thread only -- the scene graph is
+// unsafe to touch off-thread.
+static void *find_node_by_type_rec(void *node, const char *pat, int depth, int max_depth) {
+    char tb[96];
+    const char *tn = type_name(node, tb, sizeof(tb));
+    if (tn && strstr(tn, pat)) return node;
+    if (depth >= max_depth || !p_node_getChildren) return NULL;
+    void *vecp = p_node_getChildren(node);
+    void *ptrs[2];
+    if (!safe_read(vecp, ptrs, 16)) return NULL;
+    void **begin = (void **)ptrs[0], **end = (void **)ptrs[1];
+    if (!plausible_any(begin) || !plausible_any(end) || end < begin
+            || (end - begin) > 512) return NULL;
+    for (void **c = begin; c < end; c++) {
+        void *child;
+        if (safe_read(c, &child, 8)) {
+            void *found = find_node_by_type_rec(child, pat, depth + 1, max_depth);
+            if (found) return found;
+        }
+    }
+    return NULL;
+}
+
+static void *find_node_by_type(void *root, const char *pat, int max_depth) {
+    return find_node_by_type_rec(root, pat, 0, max_depth);
+}
+
+// Live battle HP/state lives behind a pointer at SceneBattle+0x8 (getwork8/
+// getwork16 both do `x8 = *(this+0x8); return *(this_type*)(x8+idx)`), and
+// SceneBattle::getNChara16 reads a second pointer at +0x68. CT battles are
+// field-layer -- no dedicated battle Scene is pushed -- so the way to find
+// the SceneBattle instance is a shallow scene-graph search for a node whose
+// RTTI type name contains "SceneBattle" somewhere under the running scene.
+// (An earlier heuristic read a flag byte at cSfcWork+0x7651; that proved
+// wrong -- it read 0 during a real battle -- and is replaced by this.)
+JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeUpdateBattleFlag(JNIEnv *env, jclass cls) {
+    void *scene = find_running_scene();
+    void *node = scene ? find_node_by_type(scene, "Battle", 2) : NULL;
+    g_battle_node = node;
+    g_in_battle = (node != NULL);
+    if (node) {
+        char tb[96];
+        const char *tn = type_name(node, tb, sizeof(tb));
+        LOGI("battle node: %p type=%s", node, tn ? tn : "?");
+    }
+    if (g_in_battle != g_battle_was) {
+        LOGI("battle %s", g_in_battle ? "started" : "ended");
+        g_battle_was = g_in_battle;
+    }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleFlag(JNIEnv *env, jclass cls) {
+    return g_in_battle ? JNI_TRUE : JNI_FALSE;
 }
 
 static int g_walk_count;
@@ -357,6 +450,38 @@ static void dump_file(const char *path, uint8_t *base, int len) {
     LOGI("dumped %d bytes to %s", len, path);
 }
 
+// Like dump_file, but reads via safe_read in 4KB chunks and zero-fills any
+// chunk that faults, instead of direct-memcpy'ing an uncertain-sized region.
+static void dump_file_safe(const char *path, uint8_t *base, size_t len) {
+    // range-only guard: safe_read tolerates bad memory per-chunk, and real
+    // game pointers can be 4-byte aligned (plausible_ptr would reject them)
+    if (!plausible_any(base)) { LOGI("dump: bad base %p for %s", (void *)base, path); return; }
+    FILE *f = fopen(path, "wb");
+    if (!f) { LOGI("dump: cannot open %s", path); return; }
+    uint8_t chunk[4096];
+    size_t off = 0;
+    size_t fail_chunks = 0, total_chunks = 0;
+    size_t first_fail_off = (size_t)-1;
+    while (off < len) {
+        size_t n = (len - off < sizeof(chunk)) ? (len - off) : sizeof(chunk);
+        total_chunks++;
+        if (!safe_read(base + off, chunk, n)) {
+            memset(chunk, 0, n);
+            fail_chunks++;
+            if (first_fail_off == (size_t)-1) first_fail_off = off;
+        }
+        fwrite(chunk, 1, n, f);
+        off += n;
+    }
+    fclose(f);
+    if (fail_chunks) {
+        LOGI("dumped %zu bytes (safe) to %s: %zu/%zu chunks failed, first fail @0x%zx",
+             len, path, fail_chunks, total_chunks, first_fail_off);
+    } else {
+        LOGI("dumped %zu bytes (safe) to %s: all %zu chunks ok", len, path, total_chunks);
+    }
+}
+
 JNIEXPORT void JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeDumpToFiles(JNIEnv *env, jclass cls, jstring jdir) {
     const char *dir = (*env)->GetStringUTFChars(env, jdir, NULL);
@@ -370,6 +495,80 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeDumpToFiles(JNIEnv *env, jclass 
         snprintf(path, sizeof(path), "%s/asmmem.bin", dir);
         dump_file(path, *g_asm_mem_slot, 0x30000);
     }
+    // asmmem2.bin: Asm buffer bytes 0x30000..0x80000 -- cSfcWork::GetBattleRam(int)
+    // maps battle indexes in here, just past where asmmem.bin stops. Size beyond
+    // the real buffer is uncertain, so read safely in 4KB chunks.
+    if (g_asm_mem_slot && plausible_ptr(*g_asm_mem_slot)) {
+        uint8_t *mem = *g_asm_mem_slot;
+        LOGI("asmmem2 src: asm_base=%p asm_base+0x30000=%p", (void *)mem, (void *)(mem + 0x30000));
+        snprintf(path, sizeof(path), "%s/asmmem2.bin", dir);
+        dump_file_safe(path, mem + 0x30000, 0x50000);
+    }
+    // btldata.bin: cSfcWork::GetSendBtlDataa() = *(cSfcWork + 0xc0f0), a heap
+    // pointer to the live battle data block.
+    if (sfc) {
+        uint8_t *btl_ptr = NULL;
+        int got = safe_read(sfc + GETSENDBTLDATA_OFFSET, &btl_ptr, sizeof(btl_ptr));
+        LOGI("btldata src: sfc+0xc0f0=%p -> ptr=%p (read_ok=%d plausible=%d)",
+             (void *)(sfc + GETSENDBTLDATA_OFFSET), (void *)btl_ptr, got,
+             got ? plausible_ptr(btl_ptr) : 0);
+        // the live pointer is only 4-byte aligned (observed 0x...17fc), so
+        // plausible_ptr's 8-byte alignment test wrongly rejects it — check
+        // range with 4-byte alignment here instead.
+        uintptr_t v = (uintptr_t)btl_ptr & 0x00ffffffffffffffull;
+        if (got && v > 0x1000000ull && v < (1ull << 48) && (v & 3) == 0) {
+            snprintf(path, sizeof(path), "%s/btldata.bin", dir);
+            dump_file_safe(path, btl_ptr, 0x8000);
+        } else {
+            LOGI("btldata: skipped, implausible pointer");
+        }
+    }
+    (*env)->ReleaseStringUTFChars(env, jdir, dir);
+}
+
+// Dump the live battle work buffers, using the SceneBattle node cached by
+// nativeUpdateBattleFlag. Plain safe_read on cached pointers -- does NOT
+// need the GL thread (only touching the scene graph itself does).
+#define BTLWORK_OFFSET  0x8
+#define BTLCHARA_OFFSET 0x68
+
+JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeDumpBattleBuffers(JNIEnv *env, jclass cls,
+                                                                   jstring jdir) {
+    if (!g_battle_node) { LOGI("dumpBattleBuffers: no battle node cached"); return; }
+    const char *dir = (*env)->GetStringUTFChars(env, jdir, NULL);
+    char path[512];
+
+    // Battle (the cocos node) is a facade; the engine object is SceneBattle at
+    // Battle+0x320 (Battle::update/isActive/setField all delegate through it).
+    // SceneBattle+0x8 = work buffer (getwork8/16), +0x68 = chara buffer
+    // (getNChara16); the object itself extends past +0x31D1 (isActive flag).
+    uint8_t *sb = NULL;
+    int got_sb = safe_read((uint8_t *)g_battle_node + 0x320, &sb, sizeof(sb));
+    if (!got_sb || !plausible_any(sb)) {
+        LOGI("battle buffers: SceneBattle ptr bad (ok=%d %p)", got_sb, (void *)sb);
+        (*env)->ReleaseStringUTFChars(env, jdir, dir);
+        return;
+    }
+    uint8_t *work_ptr = NULL, *chara_ptr = NULL;
+    int got_work = safe_read(sb + BTLWORK_OFFSET, &work_ptr, sizeof(work_ptr));
+    int got_chara = safe_read(sb + BTLCHARA_OFFSET, &chara_ptr, sizeof(chara_ptr));
+    LOGI("battle buffers: node=%p scenebattle=%p work=%p(ok=%d p=%d) chara=%p(ok=%d p=%d)",
+         g_battle_node, (void *)sb,
+         (void *)work_ptr, got_work, got_work && plausible_any(work_ptr),
+         (void *)chara_ptr, got_chara, got_chara && plausible_any(chara_ptr));
+
+    snprintf(path, sizeof(path), "%s/btlobj.bin", dir);
+    dump_file_safe(path, sb, 0x4000);
+    if (got_work && plausible_any(work_ptr)) {
+        snprintf(path, sizeof(path), "%s/btlwork.bin", dir);
+        dump_file_safe(path, work_ptr, 0x10000);
+    }
+    if (got_chara && plausible_any(chara_ptr)) {
+        snprintf(path, sizeof(path), "%s/btlchara.bin", dir);
+        dump_file_safe(path, chara_ptr, 0x8000);
+    }
+
     (*env)->ReleaseStringUTFChars(env, jdir, dir);
 }
 

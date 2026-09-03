@@ -50,7 +50,19 @@ public final class ChronoAssets {
     public static void setFace(Bitmap b) { facePng = b; notifyListeners(); }
 
     /** Stores the world-map bitmap after tinting it once to a weathered sepia parchment look (see {@link #sepiaTint}). */
-    public static void setWorldMap(Bitmap b) { worldMap = b != null ? sepiaTint(b) : null; notifyListeners(); }
+    // true when the map bitmap is already at display aspect (HD override);
+    // false for wb_mini.png, which is stored at half its display width
+    private static boolean worldMapNaturalAspect;
+
+    public static void setWorldMap(Bitmap b) { setWorldMap(b, false); }
+
+    public static void setWorldMap(Bitmap b, boolean naturalAspect) {
+        worldMap = b != null ? sepiaTint(b) : null;
+        worldMapNaturalAspect = naturalAspect;
+        notifyListeners();
+    }
+
+    public static boolean isWorldMapNaturalAspect() { return worldMapNaturalAspect; }
     public static void setMinimapMark(Bitmap b) { minimapMark = b; notifyListeners(); }
     public static void setWindowTex(Bitmap b) { windowTex = b; notifyListeners(); }
 

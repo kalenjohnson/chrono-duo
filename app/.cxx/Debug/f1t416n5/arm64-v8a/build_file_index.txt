@@ -1,1 +1,0 @@
-/home/kalenj/Work/chrono-trigger/app/src/main/cpp/CMakeLists.txt

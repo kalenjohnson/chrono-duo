@@ -85,13 +85,35 @@ public class AppActivity extends Cocos2dxActivity {
         if (dumpDir != null) {
             android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
             String dir = dumpDir.getAbsolutePath();
+            final long FIELD_INTERVAL_MS = 8000;
+            final long BATTLE_INTERVAL_MS = 4000;
+            final String[] DUMP_NAMES = {"sfcwork.bin", "asmmem.bin", "asmmem2.bin", "btldata.bin",
+                    "btlwork.bin", "btlchara.bin", "btlobj.bin"};
+            final int MAX_GENERATIONS = 8; // seq wraps at 8 -> max 8*4 = 32 battle-tagged files
             Runnable dump = new Runnable() {
+                int battleSeq = 0;
                 @Override public void run() {
                     com.kalenjohnson.chronoduo.GameState.dumpToFiles(dir);
-                    h.postDelayed(this, 8000);
+                    Cocos2dxHelper.runOnGLThread(com.kalenjohnson.chronoduo.GameState::nativeUpdateBattleFlag);
+                    boolean inBattle = com.kalenjohnson.chronoduo.GameState.nativeGetBattleFlag();
+                    if (inBattle) {
+                        com.kalenjohnson.chronoduo.GameState.nativeDumpBattleBuffers(dir);
+                        // seq cycles 0..MAX_GENERATIONS-1; each copy overwrites the file
+                        // from MAX_GENERATIONS ticks ago, so at most 8 generations
+                        // (32 files) of battle-tagged dumps ever exist on disk.
+                        int seq = battleSeq;
+                        battleSeq = (battleSeq + 1) % MAX_GENERATIONS;
+                        for (String name : DUMP_NAMES) {
+                            File src = new File(dir, name);
+                            if (!src.exists()) continue;
+                            File dst = new File(dir, "battle_" + seq + "_" + name);
+                            copyFile(src, dst);
+                        }
+                    }
+                    h.postDelayed(this, inBattle ? BATTLE_INTERVAL_MS : FIELD_INTERVAL_MS);
                 }
             };
-            h.postDelayed(dump, 8000);
+            h.postDelayed(dump, FIELD_INTERVAL_MS);
 
             // "clean UI": keep the game's on-screen touch buttons hidden — the
             // controller covers them (Y = menu). Re-applied every 2s because
@@ -186,13 +208,23 @@ public class AppActivity extends Cocos2dxActivity {
                         com.kalenjohnson.chronoduo.ChronoResources.extractAll(appCtx, gameAssets, names);
 
                 final android.graphics.Bitmap face = decodeBitmap(files.get("Extension/face.png"));
-                final android.graphics.Bitmap map = cropWorldMap(files.get("Game/common/wb_mini.png"));
+                // an HD map render pushed to the external files dir wins over
+                // the low-res wb_mini texture (user-local file, never shipped)
+                File hd = new File(getExternalFilesDir(null), "worldmap_hd.png");
+                final android.graphics.Bitmap hdMap =
+                        hd.isFile() ? android.graphics.BitmapFactory.decodeFile(hd.getAbsolutePath()) : null;
+                final android.graphics.Bitmap map =
+                        hdMap != null ? null : cropWorldMap(files.get("Game/common/wb_mini.png"));
                 final android.graphics.Bitmap mark = cropMarkerTile(files.get("Game/common/minimap_mark.png"));
                 final android.graphics.Bitmap windowTex = cropWindowTexture(files.get("Extension/menu_win.png"));
 
                 new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                     if (face != null) com.kalenjohnson.chronoduo.ChronoAssets.setFace(face);
-                    if (map != null) com.kalenjohnson.chronoduo.ChronoAssets.setWorldMap(map);
+                    if (hdMap != null) {
+                        com.kalenjohnson.chronoduo.ChronoAssets.setWorldMap(hdMap, true);
+                    } else if (map != null) {
+                        com.kalenjohnson.chronoduo.ChronoAssets.setWorldMap(map);
+                    }
                     if (mark != null) com.kalenjohnson.chronoduo.ChronoAssets.setMinimapMark(mark);
                     if (windowTex != null) com.kalenjohnson.chronoduo.ChronoAssets.setWindowTex(windowTex);
                 });
@@ -272,6 +304,18 @@ public class AppActivity extends Cocos2dxActivity {
         } catch (Exception e) {
             Log.w(TAG, "marker tile crop failed", e);
             return null;
+        }
+    }
+
+    // Plain Java byte copy used by the battle-snapshot archiver above.
+    private static void copyFile(File src, File dst) {
+        try (java.io.FileInputStream in = new java.io.FileInputStream(src);
+             java.io.FileOutputStream out = new java.io.FileOutputStream(dst)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        } catch (java.io.IOException e) {
+            Log.w(TAG, "battle snapshot copy failed: " + src + " -> " + dst, e);
         }
     }
 

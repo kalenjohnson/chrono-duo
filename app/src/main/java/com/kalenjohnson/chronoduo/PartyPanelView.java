@@ -370,20 +370,25 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 // map.getHeight(). drawBitmap below maps the full (undoubled)
                 // source into a dst rect built from the doubled width, which
                 // is what stretches it 2x horizontally.
-                float effW = map.getWidth() * 2f, effH = map.getHeight();
+                float effW = ChronoAssets.isWorldMapNaturalAspect()
+                        ? map.getWidth() : map.getWidth() * 2f;
+                float effH = map.getHeight();
                 float scale = Math.min(area.width() / effW, area.height() / effH);
                 float dw = effW * scale, dh = effH * scale;
                 RectF dst = new RectF(area.centerX() - dw / 2f, area.centerY() - dh / 2f,
                         area.centerX() + dw / 2f, area.centerY() + dh / 2f);
                 c.drawBitmap(map, null, dst, mapPaint);
-                mx = dst.centerX();
-                my = dst.centerY();
+                // live position: overworld tiles (0..255 each axis) map
+                // linearly onto the drawn map rect
+                if (snap.worldX >= 0 && snap.worldY >= 0) {
+                    mx = dst.left + dst.width() * (snap.worldX / 256f);
+                    my = dst.top + dst.height() * (snap.worldY / 256f);
+                } else {
+                    mx = dst.centerX();
+                    my = dst.centerY();
+                }
             }
 
-            // placeholder "current position" pin at the map's center — we
-            // don't have real player coordinates yet, so this is a stand-in
-            // rather than an actual fix, same spirit as the old hand-drawn
-            // diamond it replaces when real art is loaded
             Bitmap mark = ChronoAssets.getMinimapMark();
             if (mark != null) {
                 float ms = h * 0.03f;

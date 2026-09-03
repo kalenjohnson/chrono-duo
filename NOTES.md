@@ -71,6 +71,19 @@ catalogued in ct_nx `source/jni_fake.c` — our vendored real classes cover it.
 - Not yet verified: touch input in-game, physical controller, FMV playback,
   menus/battles, saves, onPause/onResume cycling.
 
+## Device/testing gotchas (learned the hard way)
+
+- After `adb shell am start`, the game window can come up with
+  `mCurrentFocus=null`; Cocos2dxActivity gates `mGLSurfaceView.onResume()` on
+  `onWindowFocusChanged(true)`, so the game sits alive-but-black until a TAP
+  (`input tap 960 540`) focuses it — injected key events don't.
+- KEYCODE_BACK at the title = the game's quit path (clean exit, no crash log).
+- The intro/attract FMV fails in our host ("Can't play this video" —
+  Cocos2dxVideoHelper/VideoView vs the game's .dat assets; on the fix list).
+  It's dismissible; the game continues.
+- A backgrounded lime3DS emulator can hold its own Presentation on display 4
+  and fight ours for the panel.
+
 ## Known risks / first-run watch list (logcat)
 
 - `UnsatisfiedLinkError` on a `nativeX` the .so doesn't export, or

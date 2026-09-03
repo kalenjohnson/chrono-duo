@@ -30,6 +30,9 @@ public final class PartySnapshot {
     public int gold;        // cSfcWork+0x1a04 (u32), found by differential dump
     public int playSeconds; // cSfcWork+0x1a10 (u32), monotonically rising
     public String mapName = ""; // cached from ChronoCanvas::getFieldMapName()
+    // Overworld tile position (Asm mem 0x2E102/0x2E103, u8 each; world is
+    // 256x256 tiles). Valid only when on the overworld (mapName empty).
+    public int worldX = -1, worldY = -1;
 
     private static int u32(byte[] b, int off) {
         if (b == null || off + 4 > b.length) return 0;
@@ -45,6 +48,13 @@ public final class PartySnapshot {
         snap.playSeconds = u32(misc, 0x10);
         String mn = GameState.nativeGetMapName();
         snap.mapName = mn != null ? mn : "";
+        if (snap.mapName.isEmpty()) {
+            byte[] pos = GameState.nativeReadAsmMem(0x2E102, 2);
+            if (pos != null) {
+                snap.worldX = pos[0] & 0xff;
+                snap.worldY = pos[1] & 0xff;
+            }
+        }
         for (int i = 0; i < 7; i++) {
             byte[] b = GameState.nativeReadSfc(CHARA_BASE + i * CHARA_STRIDE, 0x120);
             if (b == null) break;
@@ -81,7 +91,8 @@ public final class PartySnapshot {
     public boolean sameAs(PartySnapshot o) {
         if (o == null || o.members.size() != members.size()) return false;
         if (gold != o.gold || playSeconds != o.playSeconds
-                || !mapName.equals(o.mapName)) return false;
+                || !mapName.equals(o.mapName)
+                || worldX != o.worldX || worldY != o.worldY) return false;
         for (int i = 0; i < members.size(); i++) {
             Member a = members.get(i), b = o.members.get(i);
             if (!a.name.equals(b.name) || a.level != b.level
