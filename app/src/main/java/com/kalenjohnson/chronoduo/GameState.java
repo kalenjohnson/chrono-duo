@@ -1,5 +1,6 @@
 package com.kalenjohnson.chronoduo;
 
+import android.content.Context;
 import android.util.Log;
 
 /**
@@ -16,6 +17,68 @@ public final class GameState {
     }
 
     public static native boolean nativeAttach();
+
+    // --- pixel graphics (GOT-patch cocos2d::Texture2D's default GL_LINEAR
+    // filter to GL_NEAREST) -------------------------------------------------
+    // Shared with PartyPanelView's settings-screen toggle -- same prefs file
+    // (PREFS_NAME) PartyPanelView already uses for its own "chronoduo_prefs",
+    // just a different key, so the pref lives here where AppActivity's boot
+    // path can reach it without depending on PartyPanelView.
+    private static final String PREFS_NAME = "chronoduo_prefs";
+    private static final String KEY_PIXEL_GRAPHICS = "pixel_graphics";
+
+    /**
+     * GOT-patches libchrono.so's Texture2D::setAntiAliasTexParameters JUMP_SLOT
+     * to redirect to setAliasTexParameters (enable=true, GL_NEAREST/"pixel
+     * graphics") or restores the original slot value (enable=false,
+     * GL_LINEAR). See gamestate.c for the ELF relocation walk. Only affects
+     * textures bound after the call -- already-loaded textures keep whatever
+     * filter they were bound with, hence the "restart to fully apply" note in
+     * the settings UI. Returns false (with a LOGE on the native side) if the
+     * patch could not be applied (symbols/slot not found, mprotect failure).
+     */
+    public static native boolean nativeSetPixelGraphics(boolean enable);
+
+    /**
+     * Diagnostic: dumps the running pixel-graphics counters (glTexImage2D
+     * calls, glGenerateMipmap calls, glTexParameteri LINEAR->NEAREST
+     * rewrites) to logcat as one line. See gamestate.c.
+     */
+    public static native void nativeLogPixelStats();
+
+    /** Reads the persisted pixel-graphics preference. Default true (crisp/GL_NEAREST). */
+    public static boolean getPixelGraphicsPref(Context ctx) {
+        return ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(KEY_PIXEL_GRAPHICS, true);
+    }
+
+    /**
+     * Persists {@code enable} and applies it immediately (called from the
+     * settings-screen toggle -- see PartyPanelView#drawSettingsScreen).
+     * Returns whether the native patch call itself succeeded.
+     */
+    public static boolean setPixelGraphicsPref(Context ctx, boolean enable) {
+        ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putBoolean(KEY_PIXEL_GRAPHICS, enable)
+                .apply();
+        return nativeSetPixelGraphics(enable);
+    }
+
+    /**
+     * Applies the persisted preference at boot. Called from AppActivity's
+     * onLoadNativeLibraries override, immediately after libchrono.so is
+     * System.load()ed and well before the GL surface/nativeInit runs, so the
+     * patch is in place before the game binds its first texture. Referencing
+     * this class here is also what triggers GameState's own static
+     * System.loadLibrary("chronoduo") if it hasn't run yet. Returns the
+     * preference value (regardless of whether the native patch succeeded).
+     */
+    public static boolean applyPixelGraphicsPref(Context ctx) {
+        boolean enable = getPixelGraphicsPref(ctx);
+        nativeSetPixelGraphics(enable);
+        return enable;
+    }
+
     public static native byte[] nativeReadChara(int idx);
     public static native byte[] nativeProbeWork(int slotOff, int memOff, int len);
     public static native byte[] nativeReadSfc(int off, int len);

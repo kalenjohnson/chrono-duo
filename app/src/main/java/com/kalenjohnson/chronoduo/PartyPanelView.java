@@ -103,7 +103,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // report on-screen positions to calibrate AreaMapCalib's per-map
     // transforms. Cheap (a single formatted string per draw) -- see
     // drawFieldContent.
-    private static final boolean SHOW_FIELD_POS = true;
+    private static final boolean SHOW_FIELD_POS = false; // calibration readout, off now
     private static final int PAPER = Color.rgb(214, 197, 158);
     private static final int PAPER_DARK = Color.rgb(150, 128, 88);
     private static final int PAPER_EDGE = Color.rgb(94, 74, 44);
@@ -259,6 +259,14 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private final RectF importButtonHitBox = new RectF();
     private final RectF settingsBackHitBox = new RectF();
 
+    // Pixel-graphics toggle row (GOT-patches libchrono.so's Texture2D default
+    // filter -- see GameState.nativeSetPixelGraphics). Persisted via
+    // GameState's own pref helpers (shared "chronoduo_prefs" file, different
+    // key than KEY_ENEMY_HP_MODE above), initialized from the current pref in
+    // the constructor and re-applied to the running game immediately on tap.
+    private boolean pixelGraphicsOn;
+    private final RectF pixelGraphicsHitBox = new RectF();
+
     /**
      * Pushes live DS-ROM-import progress/result to the settings screen (see
      * {@link #drawSettingsScreen}); called from AppActivity on the main
@@ -331,6 +339,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         markerPaint.setDither(false);
         SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         honorHiddenHp = !MODE_FULL.equals(prefs.getString(KEY_ENEMY_HP_MODE, MODE_HONOR));
+        pixelGraphicsOn = GameState.getPixelGraphicsPref(context);
     }
 
     /** Toggles and persists the enemy hidden-HP display setting; called from the eye-glyph tap handler in {@link #onTouchEvent}. */
@@ -360,6 +369,13 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             if (!importing && !importButtonHitBox.isEmpty()
                     && importButtonHitBox.contains(event.getX(), event.getY())) {
                 if (settingsHost != null) settingsHost.requestRomImport();
+                return true;
+            }
+            if (!pixelGraphicsHitBox.isEmpty()
+                    && pixelGraphicsHitBox.contains(event.getX(), event.getY())) {
+                pixelGraphicsOn = !pixelGraphicsOn;
+                GameState.setPixelGraphicsPref(getContext(), pixelGraphicsOn);
+                invalidate();
                 return true;
             }
             if (!settingsBackHitBox.isEmpty()
@@ -689,7 +705,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             // changing (or vice versa). An ordinary position update or a
             // re-read with the same id leaves fieldMapId untouched, so it
             // never lands here.
-            prevAreaMapBitmap = ChronoAssets.getAreaMap(snap.fieldMapId);
+            prevAreaMapBitmap = ChronoAssets.getAreaMap(snap.fieldMapId, snap.fieldX, snap.fieldY);
             prevAreaMapId = snap.fieldMapId;
             areaMapFadeStart = System.nanoTime();
         }
@@ -1588,10 +1604,22 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             importButtonHitBox.set(importBtn);
         }
 
+        float pixelBtnW = parchment.width() * 0.6f;
+        float pixelBtnH = h * 0.08f;
+        RectF pixelBtn = new RectF(parchment.centerX() - pixelBtnW / 2f, parchment.top + h * 0.54f,
+                parchment.centerX() + pixelBtnW / 2f, parchment.top + h * 0.54f + pixelBtnH);
+        drawCommandButton(c, pixelBtn, "Pixel graphics: " + (pixelGraphicsOn ? "On" : "Off"), winTex, false);
+        pixelGraphicsHitBox.set(pixelBtn);
+
+        setText(h * 0.022f, Color.argb(190, Color.red(INK), Color.green(INK), Color.blue(INK)),
+                false, Paint.Align.CENTER, false);
+        c.drawText("Takes full effect after restarting the game",
+                parchment.centerX(), pixelBtn.bottom + h * 0.032f, text);
+
         float backW = parchment.width() * 0.4f;
         float backH = h * 0.08f;
-        RectF backBtn = new RectF(parchment.centerX() - backW / 2f, parchment.bottom - h * 0.15f,
-                parchment.centerX() + backW / 2f, parchment.bottom - h * 0.15f + backH);
+        RectF backBtn = new RectF(parchment.centerX() - backW / 2f, parchment.bottom - h * 0.1f,
+                parchment.centerX() + backW / 2f, parchment.bottom - h * 0.1f + backH);
         drawCommandButton(c, backBtn, "Back", winTex, false);
         settingsBackHitBox.set(backBtn);
     }
@@ -1696,7 +1724,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      */
     private void drawFieldContent(Canvas c, RectF parchment, PartySnapshot s, String title, boolean live) {
         int w = getWidth(), h = getHeight();
-        Bitmap areaMap = ChronoAssets.getAreaMap(s.fieldMapId);
+        Bitmap areaMap = ChronoAssets.getAreaMap(s.fieldMapId, s.fieldX, s.fieldY);
 
         setText(h * (areaMap != null ? 0.045f : 0.075f), INK, true, Paint.Align.CENTER, false);
         text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
@@ -1732,9 +1760,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             float t = Math.min(1f, elapsed / (float) TITLE_FADE_NANOS);
             if (t < 1f) {
                 text.setAlpha((int) (255 * (1f - t)));
-                c.drawText(fadingLabel, parchment.centerX(), ty, text);
+                drawTitleWrapped(c, fadingLabel, parchment, ty, areaMap != null);
                 text.setAlpha((int) (255 * t));
-                c.drawText(label, parchment.centerX(), ty, text);
+                drawTitleWrapped(c, label, parchment, ty, areaMap != null);
                 text.setAlpha(255);
                 drawAreaMapWithFade(c, parchment, s, w, h, areaMap, areaMapFading, mapT);
                 return;
@@ -1743,8 +1771,41 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             titleFadeStart = -1L;
             fadingOutTitle = null;
         }
-        c.drawText(label, parchment.centerX(), ty, text);
+        drawTitleWrapped(c, label, parchment, ty, areaMap != null);
         drawAreaMapWithFade(c, parchment, s, w, h, areaMap, areaMapFading, mapT);
+    }
+
+    /**
+     * Draws a location title with {@link #text}'s current paint, word-wrapped
+     * to the parchment's inner width (long names like "Manolia Cathedral"
+     * used to run off both edges). Lines are centred horizontally; when the
+     * title is the panel's centrepiece (no map), the block is centred on
+     * {@code baselineY}, otherwise it grows downward from it.
+     */
+    private void drawTitleWrapped(Canvas c, String s, RectF parchment, float baselineY, boolean topAligned) {
+        if (s == null || s.isEmpty()) return;
+        float maxW = parchment.width() * 0.86f;
+        java.util.List<String> lines = new java.util.ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        for (String word : s.split(" ")) {
+            if (word.isEmpty()) continue;
+            String candidate = cur.length() == 0 ? word : cur + " " + word;
+            if (text.measureText(candidate) <= maxW || cur.length() == 0) {
+                cur.setLength(0);
+                cur.append(candidate);
+            } else {
+                lines.add(cur.toString());
+                cur.setLength(0);
+                cur.append(word);
+            }
+        }
+        if (cur.length() > 0) lines.add(cur.toString());
+        float lineH = text.getTextSize() * 1.15f;
+        float y = topAligned ? baselineY : baselineY - lineH * (lines.size() - 1) * 0.5f;
+        for (String line : lines) {
+            c.drawText(line, parchment.centerX(), y, text);
+            y += lineH;
+        }
     }
 
     /**

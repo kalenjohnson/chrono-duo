@@ -322,6 +322,15 @@ public class AppActivity extends Cocos2dxActivity {
         System.load(new File(runtime.getLibDir(), "libc++_shared.so").getAbsolutePath());
         System.load(new File(runtime.getLibDir(), "libchrono.so").getAbsolutePath());
         Log.i(TAG, "libchrono.so loaded from " + runtime.getLibDir());
+        // Must run right here, before this method returns: this is called
+        // from Cocos2dxActivity.onCreate() well before the GL surface is
+        // created (nativeInit runs later, asynchronously, on the GL thread
+        // once the surface view is attached), so every texture the game
+        // loads gets the current pixel-graphics preference from its very
+        // first bind. Referencing GameState here also triggers its own
+        // System.loadLibrary("chronoduo") if that hasn't happened yet.
+        boolean pixelGraphics = com.kalenjohnson.chronoduo.GameState.applyPixelGraphicsPref(this);
+        Log.i(TAG, "pixel graphics: " + (pixelGraphics ? "on" : "off (or native patch failed)"));
     }
 
     @Override

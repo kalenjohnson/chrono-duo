@@ -14,12 +14,16 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <errno.h>
+#include <elf.h>
+#include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #include <android/log.h>
 
 #define TAG "ChronoDuoNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 #define SFC_WORK_OFFSET   0x40
 #define CHARA_BASE        0x6924
@@ -187,6 +191,479 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeAttach(JNIEnv *env, jclass cls) 
          p_getInstance ? p_getInstance() : NULL, (void *)g_asm_mem_slot,
          (void *)p_dir_getInstance);
     return p_getInstance != NULL;
+}
+
+// ---------------------------------------------------------------------------
+// Pixel graphics: GOT-patch cocos2d::Texture2D::setAntiAliasTexParameters()'s
+// R_AARCH64_JUMP_SLOT relocation to redirect to Texture2D::
+// setAliasTexParameters() instead. cocos2d-x calls the AntiAlias (GL_LINEAR)
+// path by default for every texture it loads (mapchips, character sheets,
+// battle art, ...); redirecting that one JUMP_SLOT makes every such call set
+// GL_NEAREST instead, with zero reimplementation of GL state logic -- see
+// pixel_filter_report.md. cocos2d::FontAtlas has its own separate alias/
+// antialias pair (not Texture2D's), so text glyph rendering is untouched.
+// ---------------------------------------------------------------------------
+
+#define PIXEL_SYM_ANTIALIAS "_ZN7cocos2d9Texture2D25setAntiAliasTexParametersEv"
+#define PIXEL_SYM_ALIAS     "_ZN7cocos2d9Texture2D21setAliasTexParametersEv"
+// Sanity-log-only expectation from the disassembly report (libchrono.so
+// v2.1.5) -- NOT relied on; the real slot is always found by walking the
+// ELF's own JUMP_SLOT relocations at runtime (below).
+#define PIXEL_EXPECTED_GOT_OFFSET 0xbd65b8UL
+
+static uint8_t   *g_pixel_lib_base;    // load bias (== dli_fbase, same convention as g_lib_base)
+static uintptr_t *g_pixel_got_slot;    // resolved GOT slot address, or NULL until first call
+static uintptr_t  g_pixel_orig_value;  // slot's original value (setAntiAliasTexParameters' address)
+static int        g_pixel_orig_saved;
+static void       *g_pixel_alias_addr; // live address of setAliasTexParameters (redirect target)
+
+// Reads /proc/self/maps to find the rwx protection currently applied to the
+// page containing `addr`. Returns -1 if the address isn't found in any
+// mapping (caller should fall back to a conservative PROT_READ).
+static int pixel_page_prot_at(uintptr_t addr) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return -1;
+    char line[512];
+    int prot = -1;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long start, end;
+        char perms[8] = {0};
+        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) continue;
+        if (addr >= start && addr < end) {
+            prot = 0;
+            if (perms[0] == 'r') prot |= PROT_READ;
+            if (perms[1] == 'w') prot |= PROT_WRITE;
+            if (perms[2] == 'x') prot |= PROT_EXEC;
+            break;
+        }
+    }
+    fclose(f);
+    return prot;
+}
+
+// Walks the ELF image mapped at `base` (load bias == base, the same
+// assumption g_lib_base/ASM_MEM_GLOBAL already rely on elsewhere in this
+// file) to find the PT_DYNAMIC segment, then its DT_JMPREL/DT_PLTRELSZ/
+// DT_SYMTAB/DT_STRTAB entries, and returns the runtime address of the
+// R_AARCH64_JUMP_SLOT relocation whose symbol name equals `sym_name` (NULL
+// if not found or the ELF/dynamic structure looks wrong).
+static uintptr_t *pixel_find_jump_slot(uint8_t *base, const char *sym_name) {
+    Elf64_Ehdr *eh = (Elf64_Ehdr *) base;
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) {
+        LOGE("pixel-gfx: bad ELF magic at base %p", (void *) base);
+        return NULL;
+    }
+    Elf64_Phdr *ph = (Elf64_Phdr *) (base + eh->e_phoff);
+    Elf64_Dyn *dyn = NULL;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == PT_DYNAMIC) {
+            dyn = (Elf64_Dyn *) (base + ph[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) {
+        LOGE("pixel-gfx: no PT_DYNAMIC segment found");
+        return NULL;
+    }
+
+    Elf64_Rela *jmprel = NULL;
+    Elf64_Sym *symtab = NULL;
+    const char *strtab = NULL;
+    size_t pltrelsz = 0;
+    for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+            case DT_JMPREL:   jmprel = (Elf64_Rela *) (base + d->d_un.d_ptr); break;
+            case DT_PLTRELSZ: pltrelsz = (size_t) d->d_un.d_val; break;
+            case DT_SYMTAB:   symtab = (Elf64_Sym *) (base + d->d_un.d_ptr); break;
+            case DT_STRTAB:   strtab = (const char *) (base + d->d_un.d_ptr); break;
+            default: break;
+        }
+    }
+    if (!jmprel || !symtab || !strtab || !pltrelsz) {
+        LOGE("pixel-gfx: missing dynamic entries (jmprel=%p symtab=%p strtab=%p pltrelsz=%zu)",
+             (void *) jmprel, (void *) symtab, (void *) strtab, pltrelsz);
+        return NULL;
+    }
+
+    size_t count = pltrelsz / sizeof(Elf64_Rela);
+    for (size_t i = 0; i < count; i++) {
+        Elf64_Rela *r = &jmprel[i];
+        if (ELF64_R_TYPE(r->r_info) != R_AARCH64_JUMP_SLOT) continue;
+        uint32_t symidx = (uint32_t) ELF64_R_SYM(r->r_info);
+        const char *name = strtab + symtab[symidx].st_name;
+        if (strcmp(name, sym_name) == 0) {
+            LOGI("pixel-gfx: %s slot at base+0x%lx (expected 0x%lx for v2.1.5)",
+                 sym_name, (unsigned long) r->r_offset,
+                 (unsigned long) PIXEL_EXPECTED_GOT_OFFSET);
+            return (uintptr_t *) (base + r->r_offset);
+        }
+    }
+    LOGE("pixel-gfx: symbol %s not found among %zu JUMP_SLOT relocations", sym_name, count);
+    return NULL;
+}
+
+// ---------------------------------------------------------------------------
+// Pixel graphics, mechanism 2: GOT-patch glTexParameteri/glTexParameterf.
+//
+// The setAntiAliasTexParameters redirect above only covers calls that go
+// through cocos2d-x's Texture2D helper methods; the live result was that the
+// redirect applied (log confirmed) but the rendered game looked unchanged --
+// so some texture filters must be set another way (direct internal calls,
+// RenderTexture, or similar) that never touches setAntiAliasTexParameters/
+// setAliasTexParameters at all. libchrono imports glTexParameteri and
+// (maybe) glTexParameterf from libGLESv2.so; those are still ordinary
+// R_AARCH64_JUMP_SLOT relocations in libchrono's own PLT (pixel_find_jump_
+// slot walks by symbol name and doesn't care whether the target is defined
+// inside libchrono or an external import), so the same GOT-patch mechanism
+// works here: point the slot at a small trampoline that rewrites any
+// *_LINEAR* MIN/MAG filter to its *_NEAREST* equivalent, then forwards to
+// the real GL entrypoint (resolved once via dlsym before patching).
+//
+// NOTE: this rewrites every glTexParameter{i,f} call libchrono makes,
+// including text/glyph textures -- FontAtlas has its own separate alias/
+// antialias pair from Texture2D's, but if glyph textures still end up going
+// through glTexParameteri somewhere, they get nearest-filtered too. Accepted
+// for now; a per-texture exemption could be added later by tracking
+// glBindTexture/glTexImage2D texture ids/sizes and skipping the rewrite for
+// ones that look like glyph atlases.
+// ---------------------------------------------------------------------------
+
+typedef unsigned int GLenum;
+typedef int          GLint;
+typedef float         GLfloat;
+typedef int          GLsizei;
+
+#define GL_TEXTURE_MAG_FILTER      0x2800
+#define GL_TEXTURE_MIN_FILTER      0x2801
+#define GL_NEAREST                 0x2600
+#define GL_LINEAR                  0x2601
+#define GL_NEAREST_MIPMAP_NEAREST  0x2700
+#define GL_LINEAR_MIPMAP_NEAREST   0x2701
+#define GL_NEAREST_MIPMAP_LINEAR   0x2702
+#define GL_LINEAR_MIPMAP_LINEAR    0x2703
+
+#define PIXEL_SYM_TEXPARAMI "glTexParameteri"
+#define PIXEL_SYM_TEXPARAMF "glTexParameterf"
+
+static uintptr_t *g_pixel_texpi_slot;
+static uintptr_t  g_pixel_texpi_orig;
+static int        g_pixel_texpi_orig_saved;
+static uintptr_t *g_pixel_texpf_slot;
+static uintptr_t  g_pixel_texpf_orig;
+static int        g_pixel_texpf_orig_saved;
+
+static void (*p_real_glTexParameteri)(GLenum target, GLenum pname, GLint param);
+static void (*p_real_glTexParameterf)(GLenum target, GLenum pname, GLfloat param);
+
+// Rewrites a LINEAR* filter value to its NEAREST* equivalent for MIN/MAG
+// filter pnames only; everything else (including non-filter pnames such as
+// wrap modes) passes through unchanged.
+static GLint pixel_rewrite_filter(GLenum pname, GLint param) {
+    if (pname != GL_TEXTURE_MIN_FILTER && pname != GL_TEXTURE_MAG_FILTER) return param;
+    switch (param) {
+        case GL_LINEAR:                return GL_NEAREST;
+        case GL_LINEAR_MIPMAP_LINEAR:
+        case GL_LINEAR_MIPMAP_NEAREST:
+        case GL_NEAREST_MIPMAP_LINEAR: return GL_NEAREST_MIPMAP_NEAREST;
+        default:                       return param;
+    }
+}
+
+// Rate-limited (pname,param) rewrite logging -- dedup'd against a small
+// static set so the hook firing is visible in logcat (useful to confirm the
+// mechanism is live) without flooding it, since a real rewrite can happen on
+// every texture bind.
+#define PIXEL_LOG_SEEN_MAX 32
+static uint32_t g_pixel_log_seen[PIXEL_LOG_SEEN_MAX]; // (pname<<16)^orig, 0 = empty
+static int      g_pixel_log_seen_count;
+
+static void pixel_log_rewrite_once(const char *fn, GLenum pname, GLint orig, GLint rewritten) {
+    if (orig == rewritten) return; // not actually a rewrite -- nothing to log
+    uint32_t key = ((uint32_t) pname << 16) ^ (uint32_t) (orig & 0xffff);
+    for (int i = 0; i < g_pixel_log_seen_count; i++) {
+        if (g_pixel_log_seen[i] == key) return;
+    }
+    if (g_pixel_log_seen_count < PIXEL_LOG_SEEN_MAX) {
+        g_pixel_log_seen[g_pixel_log_seen_count++] = key;
+    }
+    LOGI("pixel-gfx: %s rewrote pname=0x%x 0x%x -> 0x%x", fn, pname, orig, rewritten);
+}
+
+// Total glTexParameteri calls that actually rewrote a LINEAR* filter value
+// (i.e. rewritten != original) -- diagnostic counter, see nativeLogPixelStats
+// and Java_..._nativeSetPixelGraphics's periodic dump below.
+static uint32_t g_pixel_texparami_rewrites;
+
+static void hooked_glTexParameteri(GLenum target, GLenum pname, GLint param) {
+    GLint rewritten = pixel_rewrite_filter(pname, param);
+    if (rewritten != param) g_pixel_texparami_rewrites++;
+    pixel_log_rewrite_once("glTexParameteri", pname, param, rewritten);
+    if (p_real_glTexParameteri) p_real_glTexParameteri(target, pname, rewritten);
+}
+
+static void hooked_glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
+    GLint rewritten = pixel_rewrite_filter(pname, (GLint) param);
+    pixel_log_rewrite_once("glTexParameterf", pname, (GLint) param, rewritten);
+    if (p_real_glTexParameterf) p_real_glTexParameterf(target, pname, (GLfloat) rewritten);
+}
+
+// ---------------------------------------------------------------------------
+// Pixel graphics, mechanism 3 (diagnostic only): GOT-patch glTexImage2D and
+// glGenerateMipmap, same PLT-walk mechanism as glTexParameteri/f above. These
+// don't rewrite anything -- they just forward to the real entrypoint after
+// logging what the game actually uploads, so we can see texture sizes/
+// formats/types independent of whatever glTexParameter{i,f} is doing to the
+// filter state. See Java_..._nativeSetPixelGraphics and nativeLogPixelStats.
+// ---------------------------------------------------------------------------
+
+#define PIXEL_SYM_TEXIMAGE2D  "glTexImage2D"
+#define PIXEL_SYM_GENMIPMAP   "glGenerateMipmap"
+
+static uintptr_t *g_pixel_teximg_slot;
+static uintptr_t  g_pixel_teximg_orig;
+static int        g_pixel_teximg_orig_saved;
+static uintptr_t *g_pixel_genmip_slot;
+static uintptr_t  g_pixel_genmip_orig;
+static int        g_pixel_genmip_orig_saved;
+
+static void (*p_real_glTexImage2D)(GLenum target, GLint level, GLint internalformat,
+                                    GLsizei width, GLsizei height, GLint border,
+                                    GLenum format, GLenum type, const void *pixels);
+static void (*p_real_glGenerateMipmap)(GLenum target);
+
+// Running counters, dumped periodically below and on demand via
+// nativeLogPixelStats.
+static uint32_t g_pixel_teximage_calls;
+static uint32_t g_pixel_genmipmap_calls;
+
+// After the first 40 logged calls, dedup further texImage2D logging against
+// this small table so a distinct (width,height,internalformat) still gets
+// one line without flooding logcat on every re-upload of the same texture.
+#define PIXEL_TEXIMG_SEEN_MAX 64
+typedef struct {
+    GLsizei width;
+    GLsizei height;
+    GLenum  internalformat;
+} pixel_teximg_seen_t;
+static pixel_teximg_seen_t g_pixel_teximg_seen[PIXEL_TEXIMG_SEEN_MAX];
+static int g_pixel_teximg_seen_count;
+
+static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat,
+                                 GLsizei width, GLsizei height, GLint border,
+                                 GLenum format, GLenum type, const void *pixels) {
+    g_pixel_teximage_calls++;
+    if (g_pixel_teximage_calls <= 40) {
+        LOGI("pixel-gfx: texImage2D %dx%d fmt=0x%x type=0x%x level=%d",
+             width, height, (unsigned int) internalformat, type, level);
+    } else {
+        int seen = 0;
+        for (int i = 0; i < g_pixel_teximg_seen_count; i++) {
+            if (g_pixel_teximg_seen[i].width == width &&
+                g_pixel_teximg_seen[i].height == height &&
+                g_pixel_teximg_seen[i].internalformat == (GLenum) internalformat) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
+            if (g_pixel_teximg_seen_count < PIXEL_TEXIMG_SEEN_MAX) {
+                g_pixel_teximg_seen[g_pixel_teximg_seen_count].width = width;
+                g_pixel_teximg_seen[g_pixel_teximg_seen_count].height = height;
+                g_pixel_teximg_seen[g_pixel_teximg_seen_count].internalformat =
+                    (GLenum) internalformat;
+                g_pixel_teximg_seen_count++;
+            }
+            LOGI("pixel-gfx: texImage2D %dx%d fmt=0x%x type=0x%x level=%d",
+                 width, height, (unsigned int) internalformat, type, level);
+        }
+    }
+    if (g_pixel_teximage_calls % 200 == 0) {
+        LOGI("pixel-gfx: stats texImage2D_calls=%u texParam_rewrites=%u",
+             g_pixel_teximage_calls, g_pixel_texparami_rewrites);
+    }
+    if (p_real_glTexImage2D) {
+        p_real_glTexImage2D(target, level, internalformat, width, height, border, format,
+                             type, pixels);
+    }
+}
+
+static void hooked_glGenerateMipmap(GLenum target) {
+    g_pixel_genmipmap_calls++;
+    if (g_pixel_genmipmap_calls <= 5) {
+        LOGI("pixel-gfx: glGenerateMipmap target=0x%x (call #%u)",
+             target, g_pixel_genmipmap_calls);
+    }
+    if (p_real_glGenerateMipmap) p_real_glGenerateMipmap(target);
+}
+
+// Patches (enable) or restores (disable) one already-resolved GOT slot,
+// mirroring the mprotect dance nativeSetPixelGraphics does for the
+// setAntiAliasTexParameters slot. `slot` may be NULL (e.g. libchrono doesn't
+// import glTexParameterf at all in some builds) -- silent no-op.
+static void pixel_patch_slot(uintptr_t *slot, uintptr_t *orig_value, int *orig_saved,
+                              uintptr_t hook_value, int enable) {
+    if (!slot) return;
+    uintptr_t addr = (uintptr_t) slot;
+    long pagesize = sysconf(_SC_PAGESIZE);
+    uintptr_t page = addr & ~(uintptr_t) (pagesize - 1);
+    int orig_prot = pixel_page_prot_at(addr);
+    int restore_prot = (orig_prot >= 0) ? orig_prot : PROT_READ;
+
+    if (mprotect((void *) page, (size_t) pagesize, PROT_READ | PROT_WRITE) != 0) {
+        LOGE("pixel-gfx: mprotect(RW) failed on slot %p: %s", (void *) slot, strerror(errno));
+        return;
+    }
+    if (!*orig_saved) {
+        *orig_value = *slot;
+        *orig_saved = 1;
+    }
+    *slot = enable ? hook_value : *orig_value;
+    if (mprotect((void *) page, (size_t) pagesize, restore_prot) != 0) {
+        LOGE("pixel-gfx: mprotect(restore 0x%x) failed on slot %p: %s",
+             restore_prot, (void *) slot, strerror(errno));
+    }
+}
+
+// Enables (GL_NEAREST, "pixel graphics") or disables (restores GL_LINEAR,
+// the engine's stock default) both redirects: the setAntiAliasTexParameters
+// GOT slot (Texture2D helper path) and the glTexParameteri/f GOT slots
+// (direct-call/RenderTexture path). Resolves slots on first call and caches
+// them; every call after that just flips the already-resolved pointers.
+// Must be called before the game's own textures load to have full effect on
+// them (already-loaded textures keep whichever filter they were bound with)
+// -- see AppActivity.onLoadNativeLibraries, which calls this right after
+// libchrono.so is System.load()ed and well before the GL surface's
+// nativeInit runs.
+JNIEXPORT jboolean JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeSetPixelGraphics(JNIEnv *env, jclass cls,
+                                                                   jboolean enable) {
+    if (!g_pixel_got_slot) {
+        void *h = dlopen("libchrono.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!h) {
+            LOGE("pixel-gfx: libchrono.so not loaded yet");
+            return JNI_FALSE;
+        }
+        void *antialias_fn = dlsym(h, PIXEL_SYM_ANTIALIAS);
+        void *alias_fn = dlsym(h, PIXEL_SYM_ALIAS);
+        if (!antialias_fn || !alias_fn) {
+            LOGE("pixel-gfx: symbol resolution failed (antialias=%p alias=%p)",
+                 antialias_fn, alias_fn);
+            return JNI_FALSE;
+        }
+        Dl_info info;
+        if (!dladdr(antialias_fn, &info) || !info.dli_fbase) {
+            LOGE("pixel-gfx: dladdr failed on setAntiAliasTexParameters");
+            return JNI_FALSE;
+        }
+        g_pixel_lib_base = (uint8_t *) info.dli_fbase;
+        g_pixel_alias_addr = alias_fn;
+        g_pixel_got_slot = pixel_find_jump_slot(g_pixel_lib_base, PIXEL_SYM_ANTIALIAS);
+        if (!g_pixel_got_slot) return JNI_FALSE;
+
+        // Second mechanism: glTexParameteri/f GOT slots, same base. The real
+        // GL entrypoints are resolved via RTLD_DEFAULT first (libGLESv2.so
+        // is already loaded into the process by the time this runs, since
+        // it's called after System.load("chrono"), which itself links
+        // against it); fall back to an explicit dlopen if that ever misses.
+        void *gl_h = dlopen("libGLESv2.so", RTLD_NOW | RTLD_NOLOAD);
+        p_real_glTexParameteri = (void (*)(GLenum, GLenum, GLint))
+            dlsym(RTLD_DEFAULT, PIXEL_SYM_TEXPARAMI);
+        if (!p_real_glTexParameteri && gl_h) {
+            p_real_glTexParameteri = (void (*)(GLenum, GLenum, GLint))
+                dlsym(gl_h, PIXEL_SYM_TEXPARAMI);
+        }
+        p_real_glTexParameterf = (void (*)(GLenum, GLenum, GLfloat))
+            dlsym(RTLD_DEFAULT, PIXEL_SYM_TEXPARAMF);
+        if (!p_real_glTexParameterf && gl_h) {
+            p_real_glTexParameterf = (void (*)(GLenum, GLenum, GLfloat))
+                dlsym(gl_h, PIXEL_SYM_TEXPARAMF);
+        }
+        if (!p_real_glTexParameteri) {
+            LOGE("pixel-gfx: real glTexParameteri not resolvable -- skipping tex-param hook");
+        } else {
+            g_pixel_texpi_slot = pixel_find_jump_slot(g_pixel_lib_base, PIXEL_SYM_TEXPARAMI);
+        }
+        if (!p_real_glTexParameterf) {
+            LOGI("pixel-gfx: real glTexParameterf not resolvable -- skipping (may be unused)");
+        } else {
+            g_pixel_texpf_slot = pixel_find_jump_slot(g_pixel_lib_base, PIXEL_SYM_TEXPARAMF);
+        }
+
+        // Diagnostic-only hooks: glTexImage2D / glGenerateMipmap. Same
+        // resolve-then-walk-PLT approach as the texparam hooks above.
+        p_real_glTexImage2D = (void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum,
+                                         GLenum, const void *))
+            dlsym(RTLD_DEFAULT, PIXEL_SYM_TEXIMAGE2D);
+        if (!p_real_glTexImage2D && gl_h) {
+            p_real_glTexImage2D = (void (*)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint,
+                                             GLenum, GLenum, const void *))
+                dlsym(gl_h, PIXEL_SYM_TEXIMAGE2D);
+        }
+        if (!p_real_glTexImage2D) {
+            LOGE("pixel-gfx: real glTexImage2D not resolvable -- skipping diagnostic hook");
+        } else {
+            g_pixel_teximg_slot = pixel_find_jump_slot(g_pixel_lib_base, PIXEL_SYM_TEXIMAGE2D);
+        }
+
+        p_real_glGenerateMipmap = (void (*)(GLenum)) dlsym(RTLD_DEFAULT, PIXEL_SYM_GENMIPMAP);
+        if (!p_real_glGenerateMipmap && gl_h) {
+            p_real_glGenerateMipmap = (void (*)(GLenum)) dlsym(gl_h, PIXEL_SYM_GENMIPMAP);
+        }
+        if (!p_real_glGenerateMipmap) {
+            LOGI("pixel-gfx: real glGenerateMipmap not resolvable -- skipping diagnostic hook");
+        } else {
+            g_pixel_genmip_slot = pixel_find_jump_slot(g_pixel_lib_base, PIXEL_SYM_GENMIPMAP);
+        }
+    }
+
+    uintptr_t addr = (uintptr_t) g_pixel_got_slot;
+    long pagesize = sysconf(_SC_PAGESIZE);
+    uintptr_t page = addr & ~(uintptr_t) (pagesize - 1);
+    int orig_prot = pixel_page_prot_at(addr);
+    int restore_prot = (orig_prot >= 0) ? orig_prot : PROT_READ;
+
+    if (mprotect((void *) page, (size_t) pagesize, PROT_READ | PROT_WRITE) != 0) {
+        LOGE("pixel-gfx: mprotect(RW) failed: %s", strerror(errno));
+        return JNI_FALSE;
+    }
+
+    if (!g_pixel_orig_saved) {
+        g_pixel_orig_value = *g_pixel_got_slot;
+        g_pixel_orig_saved = 1;
+    }
+    *g_pixel_got_slot = enable ? (uintptr_t) g_pixel_alias_addr : g_pixel_orig_value;
+
+    if (mprotect((void *) page, (size_t) pagesize, restore_prot) != 0) {
+        LOGE("pixel-gfx: mprotect(restore 0x%x) failed: %s", restore_prot, strerror(errno));
+        // Not fatal to the toggle itself (the write above already landed) --
+        // just means this page is left more permissive than it started.
+    }
+
+    pixel_patch_slot(g_pixel_texpi_slot, &g_pixel_texpi_orig, &g_pixel_texpi_orig_saved,
+                      (uintptr_t) hooked_glTexParameteri, enable);
+    pixel_patch_slot(g_pixel_texpf_slot, &g_pixel_texpf_orig, &g_pixel_texpf_orig_saved,
+                      (uintptr_t) hooked_glTexParameterf, enable);
+    pixel_patch_slot(g_pixel_teximg_slot, &g_pixel_teximg_orig, &g_pixel_teximg_orig_saved,
+                      (uintptr_t) hooked_glTexImage2D, enable);
+    pixel_patch_slot(g_pixel_genmip_slot, &g_pixel_genmip_orig, &g_pixel_genmip_orig_saved,
+                      (uintptr_t) hooked_glGenerateMipmap, enable);
+
+    LOGI("pixel-gfx: %s (aa-slot=%p value=%p; texpi-slot=%p texpf-slot=%p teximg-slot=%p "
+         "genmip-slot=%p)",
+         enable ? "enabled (GL_NEAREST)" : "disabled (GL_LINEAR)",
+         (void *) g_pixel_got_slot, (void *) *g_pixel_got_slot,
+         (void *) g_pixel_texpi_slot, (void *) g_pixel_texpf_slot,
+         (void *) g_pixel_teximg_slot, (void *) g_pixel_genmip_slot);
+    return JNI_TRUE;
+}
+
+// Dumps the running pixel-graphics diagnostic counters (glTexImage2D calls,
+// glGenerateMipmap calls, glTexParameteri LINEAR->NEAREST rewrites) as one
+// LOGI line, on demand from Java.
+JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeLogPixelStats(JNIEnv *env, jclass cls) {
+    LOGI("pixel-gfx: stats texImage2D_calls=%u glGenerateMipmap_calls=%u texParam_rewrites=%u",
+         g_pixel_teximage_calls, g_pixel_genmipmap_calls, g_pixel_texparami_rewrites);
 }
 
 // Read from the translated-65816 layer's virtual SNES memory ("Asm" buffer).
@@ -1188,6 +1665,77 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetHideBattleSubmenus(JNIEnv *en
     g_hide_battle_submenus = hide ? 1 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// Battle results phase: once every enemy is dead, the game draws "Earned N
+// EXP/TP/item" message windows into the same RenderTexture/Node/Label
+// children enforce_battle_ui_hide blanks every tick below -- so without this
+// the player sees a black battle screen with no results text and it looks
+// stalled. battle_results_phase() detects that state from the live actor
+// array (same pointer chase as nativeReadBattleActors: g_battle_node ->
+// +0x320 SceneBattle -> +0x68 chara array, stride 0x80/slot, u16 curHP at
+// +0x03, u16 maxHP at +0x05, party in slots 0-2, enemies in slots 3+), so
+// enforce_battle_ui_hide can stop blanking (and actively restore opacity on)
+// those specific child types while still hiding the battle cocos2d::Menu,
+// which has nothing useful to show post-victory. Local offset/stride
+// constants (not the BTLCHARA_* ones below, which are defined further down
+// the file, after this point -- statics/macros must precede use in C).
+// ---------------------------------------------------------------------------
+
+#define BTLRES_CHARA_OFFSET  0x68
+#define BTLRES_ACTOR_STRIDE  0x80
+#define BTLRES_ACTOR_SLOTS   10
+#define BTLRES_CURHP_OFFSET  0x03
+#define BTLRES_MAXHP_OFFSET  0x05
+#define BTLRES_PARTY_SLOTS   3 // slots 0-2 are party; 3+ are enemies
+
+static int g_battle_results_phase; // current per-tick predicate value, read by enforce_battle_ui_hide
+static int g_battle_results_was;   // previous value, for edge-triggered enter/leave logging
+
+// True iff the live actor array shows at least one enemy slot (index >=
+// BTLRES_PARTY_SLOTS) with maxHP>0 was observed, and every such enemy slot
+// has curHP==0 (i.e. the battle is won and results are pending). False
+// whenever any link in the safe_read chain is unreadable, or no enemy slot
+// has been populated yet -- the latter guards against a false positive at
+// battle start, before the array fills in (an all-zero fresh array would
+// otherwise read as "every enemy at 0 HP").
+static int battle_results_phase(void) {
+    if (!g_battle_node) return 0;
+    uint8_t *sb = NULL;
+    if (!safe_read((uint8_t *)g_battle_node + 0x320, &sb, sizeof(sb)) || !plausible_any(sb)) {
+        return 0;
+    }
+    uint8_t *chara_ptr = NULL;
+    if (!safe_read(sb + BTLRES_CHARA_OFFSET, &chara_ptr, sizeof(chara_ptr))
+            || !plausible_any(chara_ptr)) {
+        return 0;
+    }
+
+    int saw_enemy = 0;
+    for (int i = BTLRES_PARTY_SLOTS; i < BTLRES_ACTOR_SLOTS; i++) {
+        uint8_t *slot = chara_ptr + (size_t)i * BTLRES_ACTOR_STRIDE;
+        uint16_t curHp, maxHp;
+        if (!safe_read(slot + BTLRES_CURHP_OFFSET, &curHp, sizeof(curHp))) return 0;
+        if (!safe_read(slot + BTLRES_MAXHP_OFFSET, &maxHp, sizeof(maxHp))) return 0;
+        if (maxHp == 0) continue; // slot not present (no enemy here)
+        saw_enemy = 1;
+        if (curHp != 0) return 0; // still-living enemy -- not results phase
+    }
+    return saw_enemy;
+}
+
+// True for the specific child node types that results-phase message windows
+// draw into (RenderTexture cell layer, plain Node, Label) -- these are
+// exempted from the blanking loop below (and actively restored to opacity
+// 255) while battle_results_phase() holds. cocos2d::Menu is deliberately not
+// included here: it has nothing useful to show post-victory and stays
+// hidden.
+static int is_battle_results_child(const char *tn) {
+    if (!tn) return 0;
+    return strcmp(tn, "N7cocos2d13RenderTextureE") == 0 ||
+           strcmp(tn, "N7cocos2d4NodeE") == 0 ||
+           strcmp(tn, "N7cocos2d5LabelE") == 0;
+}
+
 static int should_hide_battle_child(const char *tn) {
     if (!tn) return 0;
     if (g_hide_battle_submenus &&
@@ -1204,6 +1752,17 @@ static int should_hide_battle_child(const char *tn) {
 }
 
 static void enforce_battle_ui_hide(void) {
+    // Computed every tick regardless of the checks below, so entering/
+    // leaving results phase is logged (and g_battle_results_phase stays
+    // current for the child loop) even on a tick where the rest of this
+    // function bails early.
+    int results_phase = battle_results_phase();
+    if (results_phase != g_battle_results_was) {
+        LOGI("battle-ui: results phase %s", results_phase ? "entered" : "left");
+        g_battle_results_was = results_phase;
+    }
+    g_battle_results_phase = results_phase;
+
     if (!g_hide_battle_ui || !g_battle_node || !vtable_in_libchrono(g_battle_node)
             || !p_node_getChildren) {
         return;
@@ -1239,6 +1798,16 @@ static void enforce_battle_ui_hide(void) {
             if (!already_cascade_set(child)) {
                 LOGI("battle-ui: cascade-opacity enabled on %s (%p)", tn ? tn : "?", child);
             }
+        }
+        // Results phase: the RenderTexture/Node/Label children are where the
+        // "Earned N EXP/TP/item" windows get drawn, so unblank (and actively
+        // restore, since the blanking loop above already forced them to 0 on
+        // prior ticks) instead of re-blanking. cocos2d::Menu (hide_type from
+        // the "4MenuE" check above) is not in is_battle_results_child, so it
+        // still falls through to the setOpacity(0) below and stays hidden.
+        if (g_battle_results_phase && is_battle_results_child(tn)) {
+            if (p_node_setOpacity) p_node_setOpacity(child, 255);
+            continue;
         }
         if (p_node_setOpacity) p_node_setOpacity(child, 0);
     }

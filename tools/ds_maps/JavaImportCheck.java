@@ -226,15 +226,7 @@ public class JavaImportCheck {
         for (String key : common) {
             Map<String, Object> a = ref.get(key);
             Map<String, Object> b = out.get(key);
-            boolean ok = true;
-            for (String numField : new String[]{"sx", "sy", "ox", "oy"}) {
-                double av = ((Number) a.get(numField)).doubleValue();
-                double bv = ((Number) b.get(numField)).doubleValue();
-                if (Math.abs(av - bv) > EPS) ok = false;
-            }
-            List<?> ar = (List<?>) a.get("rect_tiles");
-            List<?> br = (List<?>) b.get("rect_tiles");
-            if (ar == null || br == null || !ar.equals(br)) ok = false;
+            boolean ok = entriesMatch(a, b, EPS);
 
             if (!ok) {
                 mismatch++;
@@ -250,6 +242,55 @@ public class JavaImportCheck {
             String k = mismatchKeys.get(0);
             System.out.println("First mismatch " + k + ": ref=" + ref.get(k) + " out=" + out.get(k));
         }
+    }
+
+    /**
+     * Compares two calib entries (v5 schema: "file" int, either a
+     * top-level {@code sx/sy/ox/oy/rect_tiles} transform (single-floor
+     * rooms, including the no-rect/full-canvas case) or a "floors" array
+     * (multi-floor rooms) -- never both. Recurses into "floors" (each
+     * floor entry also carries its own "file"/"suffix"/transform).
+     */
+    private static boolean entriesMatch(Map<String, Object> a, Map<String, Object> b, double eps) {
+        Object af = a.get("file");
+        Object bf = b.get("file");
+        if (af == null || bf == null || ((Number) af).longValue() != ((Number) bf).longValue()) return false;
+
+        @SuppressWarnings("unchecked")
+        List<Object> aFloors = (List<Object>) a.get("floors");
+        @SuppressWarnings("unchecked")
+        List<Object> bFloors = (List<Object>) b.get("floors");
+        if ((aFloors == null) != (bFloors == null)) return false;
+
+        if (aFloors != null) {
+            if (aFloors.size() != bFloors.size()) return false;
+            for (int i = 0; i < aFloors.size(); i++) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> fa = (Map<String, Object>) aFloors.get(i);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> fb = (Map<String, Object>) bFloors.get(i);
+                if (!transformMatches(fa, fb, eps)) return false;
+                Object asuf = fa.get("suffix");
+                Object bsuf = fb.get("suffix");
+                if (asuf == null || bsuf == null || ((Number) asuf).longValue() != ((Number) bsuf).longValue()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return transformMatches(a, b, eps);
+    }
+
+    private static boolean transformMatches(Map<String, Object> a, Map<String, Object> b, double eps) {
+        for (String numField : new String[]{"sx", "sy", "ox", "oy"}) {
+            Object av = a.get(numField);
+            Object bv = b.get(numField);
+            if (av == null || bv == null) return false;
+            if (Math.abs(((Number) av).doubleValue() - ((Number) bv).doubleValue()) > eps) return false;
+        }
+        List<?> ar = (List<?>) a.get("rect_tiles");
+        List<?> br = (List<?>) b.get("rect_tiles");
+        return ar != null && br != null && ar.equals(br);
     }
 
     private static String sample(java.util.Collection<String> c) {

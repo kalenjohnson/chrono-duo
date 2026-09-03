@@ -8,15 +8,16 @@ import java.util.Map;
 /**
  * Parses the per-room minimap crop-rect tables and turns them into
  * pixel-space calibration entries, matching gen_calib.py's main() loop
- * exactly (v4 model, see Calib.java): one top-level entry per minimap
- * file ID (keyed
- * "%03d" from Table 1's map_file_id, NOT per floor-variant), with
- * multi-floor rooms carrying a nested floors[] list, and single-floor
- * file-ID collisions resolved by keeping the lowest room_id (later
- * collisions recorded, not overwritten).
+ * exactly (v4 transform model, see Calib.java; v5 schema, keyed by ROOM
+ * id, not minimap file id): one entry per ROOM id (0..668, always unique
+ * -- no file-id-collision handling needed, unlike the old file-id-keyed
+ * schema), with multi-floor rooms carrying a nested floors[] list instead
+ * of a top-level transform.
  *
  * Table 1 -- per room, 8 bytes/entry, ARM9 overlay 16 @ 0x0219efb4, N=0..668:
- *   +2 (u16) minimap file ID ("%03d" in the filename)
+ *   +2 (u16) minimap file ID for single-floor rooms ("%03d" in the
+ *          filename). Sentinel (0) for multi-floor rooms -- Table 2 has
+ *          the real per-floor file id there instead.
  *   +4 (u8)  cumulative start index into Table 2 for this room's floors
  *   +5 (u8)  floor-variant count (0 = single floor, no _1/_2 suffix)
  *   +6 (u16) background-tile streaming budget (NOT a scale)
@@ -24,12 +25,20 @@ import java.util.Map;
  * Table 2 -- per floor-variant, 12 bytes/entry, overlay 16 @ 0x0219e8c4:
  *   +0..+3 (4xu8) tile rect X0,Y0,X1,Y1 (unverified for this table, by
  *          analogy with Table 3)
- *   +6,+8 (2xu16) floor-suffix numbers for the filename (_1, _2, ...)
+ *   +6 (u16) minimap FILE id for this floor variant (confirmed against
+ *          real rendered PNGs -- e.g. room 47's four floors read file id
+ *          47 with suffixes 1..4, matching area_minimap_047_1..4.png;
+ *          rooms 482-485 each cycle through ten distinct file ids)
+ *   +8 (u16) filename suffix ("_N"; 0 = no suffix -- confirmed against
+ *          room 28, whose floors all read suffix 0 and render as a
+ *          single unsuffixed area_minimap_028.png)
  *
  * Table 3 -- per room, 20 bytes/entry, ARM9 main code @ 0x02059e04:
  *   +0x10 (u32 LE, read as 4 bytes b0..b3) tile rect X0,Y0,X1,Y1, used for
  *          rooms with Table1.floorCount == 0. If bit 0x80 of b0 is set, the
- *          room has no crop rect (renders 1:1 at 8px/tile instead).
+ *          room has no crop rect (renders 1:1 at 8px/tile instead) -- this
+ *          still gets a transform (native scale, ox=oy=0), not an omitted
+ *          one, so the ~94 rooms on this path keep getting a marker.
  */
 public final class RoomTable {
 
@@ -42,18 +51,20 @@ public final class RoomTable {
     public static final int OVERLAY_ID = 16;
 
     public static final class FloorEntry {
+        public int file;
+        public int suffix;
         public double sx, sy, ox, oy;
         public int x0, y0, x1, y1;
-        public int suffix;
-        public int floorLocalIndex;
     }
 
     public static final class CalibEntry {
-        public String key;
+        public String key; // decimal room id, e.g. "129"
+        public int roomId;
+        public int file;
+        // Present only for single-floor rooms (floors == null).
+        public boolean hasTransform;
         public double sx, sy, ox, oy;
         public int x0, y0, x1, y1;
-        public String source;
-        public int roomId;
         public List<FloorEntry> floors; // null for single-floor rooms
     }
 
@@ -84,12 +95,13 @@ public final class RoomTable {
 
     /**
      * Builds the calib table exactly as gen_calib.py's main() does: a map
-     * from "%03d" file-ID key to one CalibEntry (with a nested floors[]
-     * list for multi-floor rooms), iterating room IDs 0..668 in order.
+     * from decimal room-id key to one CalibEntry (with a nested floors[]
+     * list for multi-floor rooms instead of a top-level transform),
+     * iterating room IDs 0..668 in order.
      *
      * Rooms whose table entries fall outside the given ARM9/overlay
      * buffers are skipped (reported via skippedRoomIds, if non-null)
-     * rather than thrown -- per REPORT.md, a skip here against a correctly
+     * rather than thrown -- a skip here against a correctly
      * BLZ-decompressed ARM9/overlay 16 signals a bug upstream, not a
      * legitimately short table.
      */
@@ -106,7 +118,11 @@ public final class RoomTable {
                 int mapFileId = u16(overlay16Data, overlay16Base, a + 2);
                 int floorOff = u8(overlay16Data, overlay16Base, a + 4);
                 int floorCnt = u8(overlay16Data, overlay16Base, a + 5);
-                String key = String.format("%03d", mapFileId);
+                String key = Integer.toString(roomId);
+
+                CalibEntry e = new CalibEntry();
+                e.key = key;
+                e.roomId = roomId;
 
                 if (floorCnt == 0) {
                     int t3 = T3_BASE + roomId * 20;
@@ -116,28 +132,17 @@ public final class RoomTable {
                     int b2 = (int) ((f10 >>> 16) & 0xFF);
                     int b3 = (int) ((f10 >>> 24) & 0xFF);
 
-                    CalibEntry e = new CalibEntry();
-                    e.key = key;
-                    e.roomId = roomId;
-
                     if ((b0 & 0x80) != 0) {
                         e.x0 = 0; e.y0 = 0; e.x1 = 31; e.y1 = 23;
                         e.sx = e.sy = Calib.NATIVE_SCALE;
                         e.ox = e.oy = 0.0;
-                        e.source = "table3_full_canvas";
                     } else {
                         e.x0 = b0; e.y0 = b1; e.x1 = b2; e.y1 = b3;
                         Calib.Result c = Calib.fromRect(b0, b1, b2, b3);
                         e.sx = c.sx; e.sy = c.sy; e.ox = c.ox; e.oy = c.oy;
-                        e.source = "table3";
                     }
-
-                    if (result.containsKey(key)) {
-                        // Same minimap file ID reused by multiple distinct
-                        // rooms with DIFFERENT crop rects. Deterministically
-                        // keep the lowest room_id's transform (don't overwrite).
-                        continue;
-                    }
+                    e.file = mapFileId;
+                    e.hasTransform = true;
                     result.put(key, e);
                 } else {
                     List<FloorEntry> floors = new ArrayList<>(floorCnt);
@@ -147,27 +152,24 @@ public final class RoomTable {
                         int y0 = u8(overlay16Data, overlay16Base, t2 + 1);
                         int x1 = u8(overlay16Data, overlay16Base, t2 + 2);
                         int y1 = u8(overlay16Data, overlay16Base, t2 + 3);
-                        int suffix = u16(overlay16Data, overlay16Base, t2 + 6);
+                        int floorFileId = u16(overlay16Data, overlay16Base, t2 + 6);
+                        int suffix = u16(overlay16Data, overlay16Base, t2 + 8);
 
                         FloorEntry fe = new FloorEntry();
                         fe.x0 = x0; fe.y0 = y0; fe.x1 = x1; fe.y1 = y1;
                         Calib.Result c = Calib.fromRect(x0, y0, x1, y1);
                         fe.sx = c.sx; fe.sy = c.sy; fe.ox = c.ox; fe.oy = c.oy;
+                        fe.file = floorFileId;
                         fe.suffix = suffix;
-                        fe.floorLocalIndex = local;
                         floors.add(fe);
                     }
 
-                    // Top-level entry = first floor variant's rect/transform,
-                    // plus the full floors[] list. Unconditional overwrite,
-                    // same as the Python (no conflict tracking on this path).
-                    FloorEntry first = floors.get(0);
-                    CalibEntry e = new CalibEntry();
-                    e.key = key;
-                    e.roomId = roomId;
-                    e.x0 = first.x0; e.y0 = first.y0; e.x1 = first.x1; e.y1 = first.y1;
-                    e.sx = first.sx; e.sy = first.sy; e.ox = first.ox; e.oy = first.oy;
-                    e.source = "table2_unverified";
+                    // Top-level "file" = the first floor's file id (a
+                    // reasonable default when no live position is known
+                    // yet). No top-level transform -- floors[] is the
+                    // only source of truth for multi-floor rooms.
+                    e.file = floors.get(0).file;
+                    e.hasTransform = false;
                     e.floors = floors;
                     result.put(key, e);
                 }

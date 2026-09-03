@@ -2,9 +2,58 @@
 """
 Generate a per-room pixel-calibration table for the Chrono Trigger DS
 bottom-screen area minimaps (256x192 PNGs rendered from
-menu/bg/minimap_<ID>_{ncg,ncl,nsc}.bin).
+menu/bg/minimap_<ID>_{ncg,ncl,nsc}.bin, see render_all.py).
 
 Formula used by consumers:  px = ox + sx*tileX ; py = oy + sy*tileY
+
+===========================================================================
+SCHEMA (v5 -- keyed by ROOM id, not minimap file id)
+===========================================================================
+
+Earlier versions of this script keyed the output JSON by the minimap
+*file* id (the "%03d" in the rendered PNG's name). That silently broke
+for any room whose Table 1 entry maps to a file id that isn't the room's
+own id -- e.g. Cathedral (room id 129) has no `area_minimap_129.png`;
+its content lives under a different file id, and the old file-id-keyed
+JSON had no way to represent "room 129 -> file NNN" at all, plus it had
+to arbitrarily drop ~76 rooms that shared a file id with another room
+(the CONFLICTING_FILE_IDS problem from earlier sessions).
+
+The output is now keyed by decimal ROOM id string (e.g. "129"), which is
+always unique (no conflict-resolution logic needed at all -- that whole
+code path from the file-id-keyed version is gone). Each entry:
+
+    {
+      "file": <minimap file id, int>,   # the "%03d" component of the
+                                         # rendered PNG's name
+      "sx": .., "sy": .., "ox": .., "oy": ..,   # present for every
+                                         # single-floor room (including
+                                         # the "no crop rect" case, which
+                                         # still gets an identity-ish
+                                         # native-scale transform -- see
+                                         # caveat below); ABSENT for
+                                         # multi-floor rooms (use
+                                         # floors[0] as the fallback)
+      "rect_tiles": [x0,y0,x1,y1],      # present alongside sx/sy/ox/oy
+      "floors": [                       # present ONLY for multi-floor
+        {                               # rooms (Table1.floorCount > 0)
+          "file": <int>,                # each floor variant can have a
+                                         # genuinely different minimap
+                                         # file id -- see Table 2 below
+          "suffix": <int>,              # 0 = filename has no _N suffix
+          "rect_tiles": [x0,y0,x1,y1],
+          "sx": .., "sy": .., "ox": .., "oy": ..
+        }, ...
+      ]
+    }
+
+CAVEAT on the "may be absent" wording some callers may expect: only
+multi-floor rooms omit the top-level sx/sy/ox/oy (they carry per-floor
+transforms instead). The "no crop rect" single-floor case (Table3 b0 bit
+0x80) still EMITS a transform (native 8px/tile, ox=oy=0) rather than
+omitting one -- dropping it would silently regress marker rendering for
+the ~94 rooms that hit this path, which already worked under the old
+schema. Only genuinely-multi-floor entries lack a top-level transform.
 
 ===========================================================================
 MODEL (v4 -- two fixed-size boxes, non-ISO 8/7 vertical stretch)
@@ -45,65 +94,29 @@ better fit than any single-box or unconditional-ladder attempt:
     s_large(tw,th) = largest s in {4,2,1} with tw*s<=194 and th*s<=135
     s = s_small if (s_small is not None and s_small >= s_large) else s_large
 
-The critical fix vs. v3: **pick whichever box gives the larger valid
-scale** (not "try small first, only fall back to large if small totally
-fails" -- that was tried and left ~250 violations, since e.g. a 48-wide
-room always satisfies the small box at s=2 and never gets a chance to
-try s=4 in the large box). With this "max across both boxes" rule and a
-capped {4,2}/{4,2,1} ladder (never 8 or 16), predicted content-rect
-edges (using KY on the Y axis) are an upper bound on the measured PNG
-bbox for the entire sample: **median excess 0px, mean 0.69px, only 3/374
-rooms exceed by more than 6px** -- room 021 (independently known to be
-ARM-code special-cased, dynamic content dispatch around overlay 16's
-0x2199930), room 580 (a tiny, likely-anomalous room already flagged in
-v3), and room 231 (tw=51, just outside LARGE_BOX's width threshold --
-the roughest remaining edge case).
-
 Placement is centred, per class, on a FIXED point (not the raw 256x192
-canvas centre -- see caveat below):
+canvas centre):
 
     SMALL_CENTER = (127.5, 98.2)   -- fit directly from room 434
     LARGE_CENTER = (126.0, 88.142857..)  -- fit directly from room 5
 
     ox = center_x - (X0+X1+1)/2 * sx    (note: +1, using INCLUSIVE
-    oy = center_y - (Y0+Y1+1)/2 * sy     rect-tile-count centring, i.e.
-                                          the true pixel-space midpoint
-                                          of tiles X0..X1 inclusive)
-
-IMPORTANT: the DS centres the RECT, not the drawn content. Room 434's
-own rect-centre formula gives cy=98.2, but its PNG content bbox itself
-is centred at only y=94.0 -- a real ~4px gap, because this room's drawn
-walls have asymmetric empty space (more room above the counter than
-below the exit) inside its own rect. Averaging many rooms' raw bbox
-centres (as v3 did) is therefore the WRONG signal -- it mixes genuine
-box-centre information with per-room content asymmetry noise. SMALL_
-CENTER/LARGE_CENTER are fit directly from the two live-verified rooms
-instead, once class+scale is otherwise pinned down by the bbox sample.
-
-**Room 5 is no longer a hard-coded exception.** Because SMALL_CENTER
-and LARGE_CENTER above were fit directly from rooms 434 and 5, the
-general rule reproduces both exactly by construction (0px residual) --
-there is nothing left for `rect_to_calib()`'s caller to override.
+    oy = center_y - (Y0+Y1+1)/2 * sy     rect-tile-count centring)
 
 *** CONFIDENCE CAVEAT ***: the scale/box/KY rule is strongly verified
-(median 0px excess over 374 rooms). LARGE_CENTER rests on a single
-calibrated room (5); SMALL_CENTER rests on a single calibrated room
-(434) -- a second live landmark in a different small room, and one in a
-different large room, would be the next useful check. Room 423 remains
-an unexplained outlier from earlier investigation: several other 32x32
--tile rooms measure scale 4 (matching this model's prediction), but 423
-itself was observed drawn at only ~2x, and its ARM9 Table 3 byte offset
-+14 (0x88) is uniquely different from its same-size peers (all 0x00 or
-0x04) -- a plausible per-room override flag that was not conclusively
-decoded this session. This model does NOT special-case 423; treat its
-predicted entry as unverified.
+(median 0px excess over 374 rooms). LARGE_CENTER/SMALL_CENTER each rest
+on a single calibrated room (5 / 434). Room 423 remains an unexplained
+outlier (see prior session's marker_transform_report.md) -- not
+special-cased here.
 
 ===========================================================================
 DATA SOURCES (read directly from the ROM at generation time)
 ===========================================================================
 
   Table 1 -- per room, 8 bytes/entry, overlay 16 @ 0x0219efb4, N=0..668:
-      +2 (u16) minimap file ID ("%03d" in the filename)
+      +2 (u16) minimap file ID for single-floor rooms ("%03d" in the
+               filename). For multi-floor rooms this is a sentinel (0)
+               -- Table 2 carries the real per-floor file id instead.
       +4 (u8)  floor-variant start index into Table 2
       +5 (u8)  floor-variant count (0 = single floor, no _1/_2 suffix)
       +6 (u16) background-tile streaming budget (NOT a scale -- ruled
@@ -112,9 +125,19 @@ DATA SOURCES (read directly from the ROM at generation time)
   Table 2 -- per floor-variant, 12 bytes/entry, overlay 16 @ 0x0219e8c4,
              indexed by Table1.floorStartIndex + local floor index:
       +0..+3 (4xu8) tile rect, X0,Y0,X1,Y1 (by analogy with Table 3;
-               UNVERIFIED for this table specifically -- no calibrated
-               multi-floor room exists)
-      +6,+8 (2xu16) floor-suffix numbers for the filename (_1, _2, ...)
+               UNVERIFIED as a rect specifically for this table -- no
+               calibrated multi-floor room exists)
+      +6 (u16) minimap FILE id for this floor variant (confirmed against
+               real rendered PNGs this session -- e.g. room 47's four
+               floors read file id 47 with suffixes 1..4, matching
+               area_minimap_047_1.png..area_minimap_047_4.png on disk;
+               room 482-485 each cycle through TEN distinct file ids
+               370-375/442-445, confirming this field is a real
+               per-floor file id, not a constant)
+      +8 (u16) filename suffix ("_N"; 0 = no suffix in the filename --
+               confirmed against room 28, whose 4 floors all read
+               suffix 0 and which renders as a single unsuffixed
+               area_minimap_028.png)
 
   Table 3 -- per room, 20 bytes/entry, ARM9 main code @ 0x02059e04,
              looked up via a tiny helper (called from overlay 16) at
@@ -235,7 +258,7 @@ def rect_to_calib(x0, y0, x1, y1):
     return sx, sy, ox, oy
 
 
-def calib_dict(x0, y0, x1, y1, sx, sy, ox, oy):
+def transform_dict(x0, y0, x1, y1, sx, sy, ox, oy):
     return {
         "sx": round(sx, 4), "sy": round(sy, 4),
         "ox": round(ox, 4), "oy": round(oy, 4),
@@ -257,14 +280,13 @@ def main():
 
     result = {}
     multi_floor_rooms = []
-    conflicts = {}
 
     for room_id in range(T1_COUNT):
         a = T1_BASE + room_id * 8
         map_file_id = ov_rd16(a + 2)
         floor_off = ov_rd8(a + 4)
         floor_cnt = ov_rd8(a + 5)
-        key = f"{map_file_id:03d}"
+        key = str(room_id)
 
         if floor_cnt == 0:
             # Table 3: single-floor room, crop rect from ARM9 main code
@@ -275,27 +297,17 @@ def main():
             b2 = (f10 >> 16) & 0xFF
             b3 = (f10 >> 24) & 0xFF
             if b0 & 0x80:
-                # "no crop" flag -> full 32x24 tile canvas, native 8px/tile
+                # "no crop" flag -> full 32x24 tile canvas, native 8px/tile.
+                # Still emits a transform (not omitted) so the ~94 rooms on
+                # this path keep getting a marker, same as before.
                 x0, y0, x1, y1 = 0, 0, 31, 23
                 sx = sy = NATIVE_SCALE
                 ox = oy = 0.0
-                source = "table3_full_canvas"
             else:
                 x0, y0, x1, y1 = b0, b1, b2, b3
                 sx, sy, ox, oy = rect_to_calib(x0, y0, x1, y1)
-                source = "table3"
-            entry = calib_dict(x0, y0, x1, y1, sx, sy, ox, oy)
-            entry["source"] = source
-            entry["room_id"] = room_id
-            if key in result:
-                # Same minimap file ID reused by multiple distinct rooms
-                # with DIFFERENT crop rects -- see CONFLICTING_FILE_IDS
-                # in the printed summary. Deterministically keep the
-                # lowest room_id's transform; this is a real ambiguity in
-                # the ROM data, not a bug -- key by room_id instead of
-                # file id if you need per-room correctness.
-                conflicts.setdefault(key, [result[key]["room_id"]]).append(room_id)
-                continue
+            entry = {"file": map_file_id}
+            entry.update(transform_dict(x0, y0, x1, y1, sx, sy, ox, oy))
             result[key] = entry
         else:
             multi_floor_rooms.append((room_id, floor_off, floor_cnt))
@@ -304,22 +316,18 @@ def main():
                 t2 = T2_BASE + (floor_off + local) * 12
                 raw = ov_data[t2 - ov_base: t2 - ov_base + 12]
                 x0, y0, x1, y1 = raw[0], raw[1], raw[2], raw[3]
-                suffix = struct.unpack_from("<H", raw, 6)[0]
+                floor_file_id = struct.unpack_from("<H", raw, 6)[0]
+                suffix = struct.unpack_from("<H", raw, 8)[0]
                 sx, sy, ox, oy = rect_to_calib(x0, y0, x1, y1)
-                fentry = calib_dict(x0, y0, x1, y1, sx, sy, ox, oy)
-                fentry["suffix"] = suffix
-                fentry["floor_local_index"] = local
+                fentry = {"file": floor_file_id, "suffix": suffix}
+                fentry.update(transform_dict(x0, y0, x1, y1, sx, sy, ox, oy))
                 floors.append(fentry)
 
-            # Top-level entry = first floor variant's rect/transform, plus
-            # the full floors[] list so the app can pick by live position.
-            first = floors[0]
-            entry = calib_dict(
-                *first["rect_tiles"], first["sx"], first["sy"], first["ox"], first["oy"]
-            )
-            entry["source"] = "table2_unverified"
-            entry["room_id"] = room_id
-            entry["floors"] = floors
+            # Top-level "file" = the first floor's file id, so a caller
+            # that doesn't know the live position yet has a reasonable
+            # default (no top-level transform -- floors[] is the only
+            # source of truth for multi-floor rooms).
+            entry = {"file": floors[0]["file"], "floors": floors}
             result[key] = entry
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -327,15 +335,9 @@ def main():
         json.dump(result, f, indent=2, sort_keys=True)
 
     print(f"Wrote {len(result)} entries to {out_path}")
-    print(f"{len(multi_floor_rooms)} multi-floor rooms (Table 2 path, unverified rect/scale):")
+    print(f"{len(multi_floor_rooms)} multi-floor rooms (Table 2 path, unverified rect):")
     for room_id, floor_off, floor_cnt in multi_floor_rooms:
         print(f"  room {room_id}: {floor_cnt} floors starting at table2[{floor_off}]")
-    if conflicts:
-        print(f"\n{len(conflicts)} minimap file IDs are reused by multiple distinct rooms")
-        print("with DIFFERENT crop rects (kept the lowest room_id's transform; see")
-        print("comment in the code -- key by room_id for full correctness):")
-        for key, rooms in sorted(conflicts.items()):
-            print(f"  file {key}: rooms {rooms}")
 
 
 if __name__ == "__main__":

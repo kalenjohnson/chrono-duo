@@ -87,10 +87,20 @@ public final class ChronoAssets {
     // fallback.
     private static File filesDir;
 
-    /** DS-style per-map minimap PNGs (rendered on-device from a user-provided ROM, or dev-pushed via adb -- never shipped): {@code <filesDir or externalFilesDir>/ds_maps/area_minimap_%03d.png}, 256x192. */
+    /**
+     * DS-style per-map minimap PNGs (rendered on-device from a user-provided
+     * ROM, or dev-pushed via adb -- never shipped): {@code <filesDir or
+     * externalFilesDir>/ds_maps/area_minimap_%03d.png} (or, for a suffixed
+     * floor variant, {@code area_minimap_%03d_%d.png}), 256x192.
+     */
     private static final String AREA_MAP_SUBDIR = "ds_maps";
     private static final String AREA_MAP_FILENAME = "area_minimap_%03d.png";
+    private static final String AREA_MAP_FILENAME_SUFFIXED = "area_minimap_%03d_%d.png";
     private static final int AREA_MAP_CACHE_CAP = 12;
+    // Multiplier used to fold (fileId, suffix) into one cache key int --
+    // see getAreaMap(int, float, float). Suffixes seen in the ROM top out
+    // in the single digits; 1000 leaves plenty of headroom.
+    private static final int AREA_MAP_CACHE_KEY_SUFFIX_MULT = 1000;
 
     // Small LRU decode cache, plus a separate miss set so a map id with no
     // PNG on disk (the common case -- most maps aren't rendered yet) doesn't
@@ -203,33 +213,64 @@ public final class ChronoAssets {
 
     /**
      * Lazily decodes and caches the rendered DS-style area minimap for field
-     * map {@code id} (256x192 PNG at {@code area_minimap_%03d.png} under
+     * map (room id) {@code roomId}, resolving the actual minimap PNG file id
+     * via {@link AreaMapCalib#fileIdFor(int)} -- the DS maps room ids to
+     * minimap file ids through a ROM table that is not the identity (e.g.
+     * the Cathedral, room id 129, has no {@code area_minimap_129.png}).
+     * Equivalent to {@link #getAreaMap(int, float, float)} with NaN tile
+     * coordinates, so a multi-floor room resolves to its first floor's map.
+     */
+    public static Bitmap getAreaMap(int roomId) {
+        return getAreaMap(roomId, Float.NaN, Float.NaN);
+    }
+
+    /**
+     * Lazily decodes and caches the rendered DS-style area minimap for field
+     * map (room id) {@code roomId}, at the given live field-tile position
+     * ({@code tileX}, {@code tileY} -- see {@link PartySnapshot#fieldX}/
+     * {@code fieldY}). For a multi-floor room this picks the floor whose
+     * calibration rect contains the position (see {@link
+     * AreaMapCalib#fileIdFor(int, float, float)}); pass NaN for either
+     * coordinate (or use {@link #getAreaMap(int)}) when no position is
+     * known yet, which resolves to the first floor.
+     *
+     * <p>The PNG is looked up at {@code area_minimap_%03d.png} (or, for a
+     * suffixed floor variant, {@code area_minimap_%03d_%d.png}) under
      * either {@link #filesDir}/ds_maps -- the on-device DsMapImporter output
      * -- or, as a dev-push fallback, {@link #externalFilesDir}/ds_maps;
-     * whichever has the file wins, filesDir checked first). Returns null when
-     * neither dir is set yet, {@code id} is negative, or no PNG exists for
-     * this id in either location (a known-missing id is remembered so
-     * repeated calls -- e.g. once per frame from PartyPanelView -- don't
-     * re-hit the filesystem). Main thread only, like the rest of ChronoAssets.
+     * whichever has the file wins, filesDir checked first. Returns null when
+     * neither dir is set yet, {@code roomId} is negative, or no PNG exists
+     * for the resolved file in either location (a known-missing file is
+     * remembered so repeated calls -- e.g. once per frame from
+     * PartyPanelView -- don't re-hit the filesystem). Cache keys are by
+     * resolved file id (folding in the suffix, since two floors of the same
+     * room can resolve to different files), not by room id. Main thread
+     * only, like the rest of ChronoAssets.
      */
-    public static Bitmap getAreaMap(int id) {
-        if (id < 0) return null;
-        Bitmap cached = areaMapCache.get(id);
+    public static Bitmap getAreaMap(int roomId, float tileX, float tileY) {
+        if (roomId < 0) return null;
+        int fileId = AreaMapCalib.fileIdFor(roomId, tileX, tileY);
+        int suffix = AreaMapCalib.suffixFor(roomId, tileX, tileY);
+        int cacheKey = fileId * AREA_MAP_CACHE_KEY_SUFFIX_MULT + suffix;
+
+        Bitmap cached = areaMapCache.get(cacheKey);
         if (cached != null) return cached;
-        if (areaMapMisses.contains(id)) return null;
-        File f = resolveAreaMapFile(id);
+        if (areaMapMisses.contains(cacheKey)) return null;
+        File f = resolveAreaMapFile(fileId, suffix);
         Bitmap b = f != null ? BitmapFactory.decodeFile(f.getAbsolutePath()) : null;
         if (b == null) {
-            areaMapMisses.add(id);
+            areaMapMisses.add(cacheKey);
             return null;
         }
-        areaMapCache.put(id, b);
+        areaMapCache.put(cacheKey, b);
         return b;
     }
 
-    /** Resolves the on-disk file for area map {@code id}, filesDir first, externalFilesDir as fallback -- see {@link #getAreaMap(int)}. */
-    private static File resolveAreaMapFile(int id) {
-        String name = String.format(Locale.US, AREA_MAP_FILENAME, id);
+    /** Resolves the on-disk file for minimap file id {@code fileId} (with optional filename {@code suffix}, 0 = none), filesDir first, externalFilesDir as fallback -- see {@link #getAreaMap(int, float, float)}. */
+    private static File resolveAreaMapFile(int fileId, int suffix) {
+        String name = suffix != 0
+                ? String.format(Locale.US, AREA_MAP_FILENAME_SUFFIXED, fileId, suffix)
+                : String.format(Locale.US, AREA_MAP_FILENAME, fileId);
         if (filesDir != null) {
             File f = new File(new File(filesDir, AREA_MAP_SUBDIR), name);
             if (f.isFile()) return f;

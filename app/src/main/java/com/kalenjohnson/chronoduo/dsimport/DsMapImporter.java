@@ -135,7 +135,7 @@ public final class DsMapImporter {
         for (int i = 0; i < entries.size(); i++) {
             RoomTable.CalibEntry e = entries.get(i);
             sb.append("  ").append(jsonString(e.key)).append(": {\n");
-            appendEntryFields(sb, "    ", e.floors, e.ox, e.oy, e.x0, e.y0, e.x1, e.y1, e.roomId, e.source, e.sx, e.sy);
+            appendEntryFields(sb, "    ", e);
             sb.append("  }");
             if (i < entries.size() - 1) sb.append(",");
             sb.append("\n");
@@ -145,20 +145,19 @@ public final class DsMapImporter {
     }
 
     // Field order matches Python's json.dump(..., sort_keys=True): alphabetical.
-    private static void appendEntryFields(
-            StringBuilder sb, String indent, List<RoomTable.FloorEntry> floors,
-            double ox, double oy, int x0, int y0, int x1, int y1,
-            int roomId, String source, double sx, double sy) {
-
+    // "file" < "floors" < "ox" < "oy" < "rect_tiles" < "sx" < "sy".
+    private static void appendEntryFields(StringBuilder sb, String indent, RoomTable.CalibEntry e) {
         List<String> fields = new ArrayList<>();
-        if (floors != null) {
+        fields.add(indent + "\"file\": " + e.file);
+        if (e.floors != null) {
             StringBuilder fb = new StringBuilder();
             fb.append("\"floors\": [\n");
+            List<RoomTable.FloorEntry> floors = e.floors;
             for (int i = 0; i < floors.size(); i++) {
                 RoomTable.FloorEntry fe = floors.get(i);
                 fb.append(indent).append("  {\n");
                 List<String> ff = new ArrayList<>();
-                ff.add(indent + "    \"floor_local_index\": " + fe.floorLocalIndex);
+                ff.add(indent + "    \"file\": " + fe.file);
                 ff.add(indent + "    \"ox\": " + jsonNumber(fe.ox));
                 ff.add(indent + "    \"oy\": " + jsonNumber(fe.oy));
                 ff.add(indent + "    \"rect_tiles\": " + rectTilesJson(fe.x0, fe.y0, fe.x1, fe.y1));
@@ -176,14 +175,13 @@ public final class DsMapImporter {
             }
             fb.append(indent).append("]");
             fields.add(indent + fb);
+        } else {
+            fields.add(indent + "\"ox\": " + jsonNumber(e.ox));
+            fields.add(indent + "\"oy\": " + jsonNumber(e.oy));
+            fields.add(indent + "\"rect_tiles\": " + rectTilesJson(e.x0, e.y0, e.x1, e.y1));
+            fields.add(indent + "\"sx\": " + jsonNumber(e.sx));
+            fields.add(indent + "\"sy\": " + jsonNumber(e.sy));
         }
-        fields.add(indent + "\"ox\": " + jsonNumber(ox));
-        fields.add(indent + "\"oy\": " + jsonNumber(oy));
-        fields.add(indent + "\"rect_tiles\": " + rectTilesJson(x0, y0, x1, y1));
-        fields.add(indent + "\"room_id\": " + roomId);
-        fields.add(indent + "\"source\": " + jsonString(source));
-        fields.add(indent + "\"sx\": " + jsonNumber(sx));
-        fields.add(indent + "\"sy\": " + jsonNumber(sy));
 
         for (int j = 0; j < fields.size(); j++) {
             sb.append(fields.get(j));
