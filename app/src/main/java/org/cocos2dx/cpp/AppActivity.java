@@ -53,8 +53,21 @@ public class AppActivity extends Cocos2dxActivity {
         return super.getAssets();
     }
 
+    // Only one engine instance may exist: the Thor's secondary-display
+    // launcher can start a SECOND copy of this activity on the bottom screen
+    // (observed live: two games running, one invisible, audio bleeding).
+    private static AppActivity sLiveInstance;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        if (sLiveInstance != null && sLiveInstance != this && !sLiveInstance.isFinishing()) {
+            Log.w(TAG, "second instance launch blocked (existing instance alive)");
+            Cocos2dxActivity.sSkipEngineInit = true;
+            super.onCreate(savedInstanceState);
+            finish();
+            return;
+        }
+        sLiveInstance = this;
         try {
             runtime = ChronoRuntime.bootstrap(this);
         } catch (Exception e) {
@@ -182,6 +195,7 @@ public class AppActivity extends Cocos2dxActivity {
 
     @Override
     protected void onDestroy() {
+        if (sLiveInstance == this) sLiveInstance = null;
         if (secondScreen != null) secondScreen.onDestroy();
         super.onDestroy();
     }
