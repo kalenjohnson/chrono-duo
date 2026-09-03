@@ -198,11 +198,14 @@ public class AppActivity extends Cocos2dxActivity {
         final android.content.res.AssetManager gameAssets = runtime.getChronoAssets();
         new Thread(() -> {
             try {
+                // Locale hardcoded to "en"; other locales exist under
+                // Localize/<lang>/msg/monster.txt but aren't wired up.
                 String[] names = {
                         "Extension/face.png",
                         "Game/common/wb_mini.png",
                         "Game/common/minimap_mark.png",
                         "Extension/menu_win.png",
+                        "Localize/en/msg/monster.txt",
                 };
                 java.util.Map<String, File> files =
                         com.kalenjohnson.chronoduo.ChronoResources.extractAll(appCtx, gameAssets, names);
@@ -217,6 +220,7 @@ public class AppActivity extends Cocos2dxActivity {
                         hdMap != null ? null : cropWorldMap(files.get("Game/common/wb_mini.png"));
                 final android.graphics.Bitmap mark = cropMarkerTile(files.get("Game/common/minimap_mark.png"));
                 final android.graphics.Bitmap windowTex = cropWindowTexture(files.get("Extension/menu_win.png"));
+                final String[] monsterNames = readMonsterNames(files.get("Localize/en/msg/monster.txt"));
 
                 new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                     if (face != null) com.kalenjohnson.chronoduo.ChronoAssets.setFace(face);
@@ -227,6 +231,7 @@ public class AppActivity extends Cocos2dxActivity {
                     }
                     if (mark != null) com.kalenjohnson.chronoduo.ChronoAssets.setMinimapMark(mark);
                     if (windowTex != null) com.kalenjohnson.chronoduo.ChronoAssets.setWindowTex(windowTex);
+                    if (monsterNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setMonsterNames(monsterNames);
                 });
             } catch (Exception e) {
                 Log.w(TAG, "companion asset extraction failed", e);
@@ -324,6 +329,24 @@ public class AppActivity extends Cocos2dxActivity {
         android.graphics.Bitmap b = android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath());
         if (b == null) Log.w(TAG, "failed to decode bitmap: " + f);
         return b;
+    }
+
+    /**
+     * Reads Localize/en/msg/monster.txt as UTF-8, CRLF-delimited (a lone LF is
+     * tolerated too); line index (0-based) == monster id, e.g. line 146 =
+     * "Gato". Best-effort: any failure is logged and returns null, leaving
+     * PartyPanelView's "Enemy N" fallback in place.
+     */
+    private static String[] readMonsterNames(File f) {
+        if (f == null) return null;
+        try {
+            byte[] raw = java.nio.file.Files.readAllBytes(f.toPath());
+            String text = new String(raw, java.nio.charset.StandardCharsets.UTF_8);
+            return text.split("\r\n|\n");
+        } catch (Exception e) {
+            Log.w(TAG, "failed to read monster name table: " + f, e);
+            return null;
+        }
     }
 
     private void showBootstrapError(Exception e) {

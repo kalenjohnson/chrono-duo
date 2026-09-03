@@ -174,10 +174,28 @@ Verified live on device (values matched Crono/Marle/Lucca/… canonical stats):
   resume, gated by an ACTION_SCREEN_OFF receiver registered for the manager's
   lifetime (registering in onResume misses the broadcast — it fires pre-resume).
   Ungated recreates caused visible panel flashes on every ordinary resume.
-- **Still open:** player world coordinates (for a live map marker — diff dumps
-  standing at two known overworld spots), current map/area id, battle state
-  (SfcBattleWork; capture dumps during a Gato fight), battle layout for the
-  second screen.
+- **World position: SOLVED.** Overworld tile X/Y = u8 at Asm mem 0x2E102/0x2E103
+  (from WorldImpl::GetPartyCharPos disasm + calibration walk); world = 256×256
+  tiles, linear map onto the drawn map rect. Pixel-scale mirrors at ~0x2E00A.
+- **Battle: SOLVED (the five-fight saga).** CT battles are field-layer — no
+  battle Scene is pushed. The battle node's RTTI class is plain `Battle`
+  (mangled `6Battle`), a DIRECT child of the root cocos Scene; its +0x320 is
+  the `SceneBattle` engine object (update/isActive/setField all delegate).
+  SceneBattle+0x8 = the Asm memory base (getwork8/16 read it); **+0x68 = the
+  battle ACTOR ARRAY**: 0x80-byte actors, ≥10 slots; u8 +0x00 = monster/char
+  id, u16 +0x03 curHP, +0x05 maxHP; party slots 0-2, enemies 3+ (maxHP>0 =
+  present). Values live per-hit. Character records in cSfcWork FREEZE during
+  battle (sync at end). Dead heuristics for the record: scene-type detection,
+  cSfcWork+0x7651 byte (a first-fight coincidence), GetSendBtlDataa (a table).
+- **Enemy names**: `Localize/en/msg/monster.txt` in resources.bin — CRLF
+  lines, 0-based line index == monster id (146 = "Gato"). Loaded at runtime
+  via ChronoResources; other locales under Localize/<lang>/.
+- **Still open:** ATB gauge field (candidates +0x18/+0x2d u8, inconclusive —
+  needs fast-sampled single-battle capture), battle MP offsets, status-effect
+  flags, hiding the top-screen battle UI + touch-forwarded commands (the
+  Battle node's MenuItemToggles are located; the WorldMenu setVisible-not-
+  sticking mystery likely applies), enemy HP for the panel when the game
+  hides bars (we show them anyway — by design).
   For gold: diff before/after buying something. For play time: two dumps with
   everything else idle. Battle info: `SfcBattleWork` / `SceneBattle::getwork8`
   (reads a buffer pointer at SceneBattle+0x8) is the entry point.

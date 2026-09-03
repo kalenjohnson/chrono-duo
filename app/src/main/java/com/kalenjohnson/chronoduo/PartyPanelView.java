@@ -13,6 +13,9 @@ import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.view.View;
 
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
 import java.util.Random;
 
 /**
@@ -35,6 +38,30 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private static final int FACE_COLS = 4;
 
     private PartySnapshot snap = new PartySnapshot();
+
+    // --- lightweight animation state -------------------------------------
+    // No ValueAnimator: onDraw self-schedules via postInvalidateOnAnimation
+    // while (and only while) something below is still off-target, so the
+    // view is fully idle — no timers, no battery burn — once settled.
+    private boolean attached;
+
+    // Mode crossfade (map/field content <-> battle content), driven by
+    // wall-clock elapsed time. fadeSnap holds the snapshot that was current
+    // right before snap.inBattle flipped, so the fading-out side can keep
+    // drawing its own (slightly stale) content for MODE_FADE_NANOS.
+    private static final long MODE_FADE_NANOS = 250_000_000L;
+    private PartySnapshot fadeSnap;
+    private long modeFadeStart = -1L;
+
+    // Field-mode location title fade (map/battle titles don't use this).
+    private static final long TITLE_FADE_NANOS = 180_000_000L;
+    private String fadingOutTitle;
+    private long titleFadeStart = -1L;
+
+    // Per-slot eased HP-bar fractions (enemy battle bars). Keyed by enemy
+    // index -- there's no persistent enemy identity to key on, and slot
+    // order is stable within one fight, matching the "enemy slot" ask.
+    private final Map<Integer, Float> enemyBarFrac = new HashMap<>();
 
     // DS status box palette (navy window, light double border)
     private static final int BOX_BG = Color.rgb(32, 40, 96);
@@ -86,6 +113,22 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     }
 
     public void update(PartySnapshot s) {
+        boolean hadContent = !snap.members.isEmpty();
+        if (hadContent && s.inBattle != snap.inBattle) {
+            // parchment content mode is flipping (map/field <-> battle):
+            // keep the outgoing snapshot around so it can fade out with its
+            // own data while the incoming one fades in.
+            fadeSnap = snap;
+            modeFadeStart = System.nanoTime();
+        }
+        if (hadContent && !s.inBattle && !snap.inBattle) {
+            boolean overworldOld = snap.mapName == null || snap.mapName.isEmpty();
+            boolean overworldNew = s.mapName == null || s.mapName.isEmpty();
+            if (!overworldOld && !overworldNew && !snap.mapName.equals(s.mapName)) {
+                fadingOutTitle = snap.mapName;
+                titleFadeStart = System.nanoTime();
+            }
+        }
         snap = s;
         invalidate();
     }
@@ -93,11 +136,19 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
+        attached = true;
         ChronoAssets.addListener(this);
     }
 
     @Override
     protected void onDetachedFromWindow() {
+        attached = false;
+        // drop any in-flight animation state so a re-attach starts clean
+        // rather than resuming a stale fade with nonsense elapsed time.
+        fadeSnap = null;
+        modeFadeStart = -1L;
+        titleFadeStart = -1L;
+        fadingOutTitle = null;
         ChronoAssets.removeListener(this);
         super.onDetachedFromWindow();
     }
@@ -327,13 +378,21 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      * fraction). Drawn inside the same torn-parchment clip as the map, so it
      * inherits the aged-paper overlay drawn after this returns.
      */
-    private void drawBattleContent(Canvas c, RectF parchment) {
+    /**
+     * @param s    snapshot to draw enemies from (the live {@link #snap}, or a
+     *             stale {@link #fadeSnap} while fading out).
+     * @param live true when {@code s} is the live snapshot, in which case bar
+     *             fractions come from the eased {@link #enemyBarFrac} map;
+     *             false draws the raw (un-eased) fraction for the fading-out
+     *             side, which is about to disappear anyway.
+     */
+    private void drawBattleContent(Canvas c, RectF parchment, PartySnapshot s, boolean live) {
         int w = getWidth(), h = getHeight();
         setText(h * 0.045f, INK, true, Paint.Align.CENTER, false);
         text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         c.drawText("Battle", parchment.centerX(), parchment.top + h * 0.085f, text);
 
-        int n = snap.enemies.size();
+        int n = s.enemies.size();
         if (n == 0) return;
         float areaTop = parchment.top + h * 0.13f;
         float areaBottom = parchment.bottom - h * 0.09f;
@@ -342,15 +401,70 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         float barRight = parchment.right - w * 0.09f;
         for (int i = 0; i < n; i++) {
             float rowTop = areaTop + i * rowH;
-            drawEnemyBar(c, snap.enemies.get(i), i, barLeft, rowTop, barRight - barLeft, rowH * 0.62f);
+            PartySnapshot.Enemy e = s.enemies.get(i);
+            float rawFrac = e.maxHp > 0 ? clamp01(e.curHp / (float) e.maxHp) : 0f;
+            Float eased = live ? enemyBarFrac.get(i) : null;
+            drawEnemyBar(c, e, i, barLeft, rowTop, barRight - barLeft, rowH * 0.62f,
+                    eased != null ? eased : rawFrac);
         }
     }
 
-    /** One CT-style enemy HP bar: label above, colored fill bar with numeric readout. */
-    private void drawEnemyBar(Canvas c, PartySnapshot.Enemy e, int index, float l, float t, float w, float h) {
+    private static float clamp01(float v) {
+        return Math.max(0f, Math.min(1f, v));
+    }
+
+    /**
+     * Advances {@link #enemyBarFrac} one animation step toward the live
+     * snapshot's fractions. Called once per drawn frame (not per fade
+     * layer) so easing speed doesn't depend on whether a mode crossfade is
+     * also in progress. Returns true while any bar is still off-target, so
+     * the caller knows whether another frame is needed.
+     */
+    private boolean advanceEnemyBarFractions() {
+        boolean animating = false;
+        Iterator<Map.Entry<Integer, Float>> it = enemyBarFrac.entrySet().iterator();
+        while (it.hasNext()) {
+            if (it.next().getKey() >= snap.enemies.size()) it.remove();
+        }
+        for (int i = 0; i < snap.enemies.size(); i++) {
+            PartySnapshot.Enemy e = snap.enemies.get(i);
+            float target = e.maxHp > 0 ? clamp01(e.curHp / (float) e.maxHp) : 0f;
+            Float cur = enemyBarFrac.get(i);
+            if (cur == null) {
+                enemyBarFrac.put(i, target);
+                continue;
+            }
+            float delta = target - cur;
+            if (Math.abs(delta) < 0.005f) {
+                if (cur != target) enemyBarFrac.put(i, target);
+                continue;
+            }
+            enemyBarFrac.put(i, cur + delta * 0.25f);
+            animating = true;
+        }
+        return animating;
+    }
+
+    /**
+     * Resolves the display label for an enemy row: the real monster name from
+     * ChronoAssets' Localize/en/msg/monster.txt table (line index == monster
+     * id) when it's loaded and covers this id, else the "Enemy N" fallback
+     * used before extraction finishes or for an out-of-range/blank entry.
+     */
+    private static String enemyLabel(PartySnapshot.Enemy e, int index) {
+        String[] names = ChronoAssets.getMonsterNames();
+        if (names != null && e.id >= 0 && e.id < names.length) {
+            String name = names[e.id].trim();
+            if (!name.isEmpty()) return name;
+        }
+        return "Enemy " + (index + 1);
+    }
+
+    /** One CT-style enemy HP bar: label above, colored fill bar with numeric readout. Numbers are instant; only the fill bar (frac) eases. */
+    private void drawEnemyBar(Canvas c, PartySnapshot.Enemy e, int index, float l, float t, float w, float h, float frac) {
         setText(h * 0.62f, INK, true, Paint.Align.LEFT, false);
         text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
-        c.drawText("Enemy " + (index + 1), l, t, text);
+        c.drawText(enemyLabel(e, index), l, t, text);
         setText(h * 0.62f, INK, false, Paint.Align.RIGHT, false);
         text.setTypeface(Typeface.MONOSPACE);
         c.drawText(e.curHp + "/" + e.maxHp, l + w, t, text);
@@ -362,7 +476,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         fill.setColor(Color.argb(160, 40, 30, 15));
         c.drawRoundRect(track, barH * 0.4f, barH * 0.4f, fill);
 
-        float frac = e.maxHp > 0 ? Math.max(0f, Math.min(1f, e.curHp / (float) e.maxHp)) : 0f;
+        frac = clamp01(frac);
         if (frac > 0f) {
             RectF fillRect = new RectF(track);
             fillRect.right = track.left + track.width() * frac;
@@ -391,6 +505,110 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         c.drawText("CHRONO DUO", w / 2f, h / 2f + h * 0.03f, text);
     }
 
+    /** Dispatches to whichever parchment content (battle vs map vs field-title) {@code s} calls for. */
+    private void drawContent(Canvas c, PartySnapshot s, RectF parchment, boolean live) {
+        if (s.inBattle) {
+            drawBattleContent(c, parchment, s, live);
+            return;
+        }
+        boolean overworld = s.mapName == null || s.mapName.isEmpty();
+        String title = overworld ? "World Map" : s.mapName;
+        if (overworld) {
+            drawOverworldContent(c, parchment, s, title);
+        } else {
+            drawFieldContent(c, parchment, title, live);
+        }
+    }
+
+    /** Overworld: title, world map bitmap (or nothing, if not extracted yet), and the live position marker. */
+    private void drawOverworldContent(Canvas c, RectF parchment, PartySnapshot s, String title) {
+        int w = getWidth(), h = getHeight();
+        // small title above the map
+        setText(h * 0.045f, INK, true, Paint.Align.CENTER, false);
+        text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        c.drawText(title, parchment.centerX(), parchment.top + h * 0.085f, text);
+
+        float mx = parchment.centerX(), my = parchment.centerY() + h * 0.03f;
+        Bitmap map = ChronoAssets.getWorldMap();
+        if (map != null) {
+            // area between the title and the gold/time corner text
+            RectF area = new RectF(parchment.left + w * 0.06f, parchment.top + h * 0.13f,
+                    parchment.right - w * 0.06f, parchment.bottom - h * 0.09f);
+            // wb_mini.png's cropped map content is stored at half its
+            // displayed width (the game's own map view is landscape
+            // ~1.5:1, not the bitmap's raw 96:128 = 0.75:1), so the target
+            // aspect used for letterboxing is 1.5, not map.getWidth()/
+            // map.getHeight(). drawBitmap below maps the full (undoubled)
+            // source into a dst rect built from the doubled width, which
+            // is what stretches it 2x horizontally.
+            float effW = ChronoAssets.isWorldMapNaturalAspect()
+                    ? map.getWidth() : map.getWidth() * 2f;
+            float effH = map.getHeight();
+            float scale = Math.min(area.width() / effW, area.height() / effH);
+            float dw = effW * scale, dh = effH * scale;
+            RectF dst = new RectF(area.centerX() - dw / 2f, area.centerY() - dh / 2f,
+                    area.centerX() + dw / 2f, area.centerY() + dh / 2f);
+            c.drawBitmap(map, null, dst, mapPaint);
+            // live position: overworld tiles (0..255 each axis) map
+            // linearly onto the drawn map rect
+            if (s.worldX >= 0 && s.worldY >= 0) {
+                mx = dst.left + dst.width() * (s.worldX / 256f);
+                my = dst.top + dst.height() * (s.worldY / 256f);
+            } else {
+                mx = dst.centerX();
+                my = dst.centerY();
+            }
+        }
+
+        Bitmap mark = ChronoAssets.getMinimapMark();
+        if (mark != null) {
+            float ms = h * 0.03f;
+            RectF markDst = new RectF(mx - ms, my - ms * 1.4f, mx + ms, my + ms * 0.6f);
+            c.drawBitmap(mark, null, markDst, markerPaint);
+        } else {
+            // hand-drawn diamond marker (waiting for real coordinates either way)
+            fill.setColor(Color.rgb(210, 50, 70));
+            Path marker = new Path();
+            float ms = h * 0.016f;
+            marker.moveTo(mx, my - ms);
+            marker.lineTo(mx + ms, my);
+            marker.lineTo(mx, my + ms);
+            marker.lineTo(mx - ms, my);
+            marker.close();
+            c.drawPath(marker, fill);
+        }
+    }
+
+    /**
+     * Field location: no map, just the location name as the parchment's
+     * centerpiece. When {@code live} and a location-name change is fading
+     * (see {@link #titleFadeStart}), crossfades the old title out and the
+     * new one in over {@link #TITLE_FADE_NANOS}; otherwise just draws it.
+     */
+    private void drawFieldContent(Canvas c, RectF parchment, String title, boolean live) {
+        int h = getHeight();
+        setText(h * 0.075f, INK, true, Paint.Align.CENTER, false);
+        text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        float ty = parchment.centerY() + h * 0.025f;
+
+        if (live && titleFadeStart >= 0) {
+            long elapsed = System.nanoTime() - titleFadeStart;
+            float t = Math.min(1f, elapsed / (float) TITLE_FADE_NANOS);
+            if (t < 1f) {
+                text.setAlpha((int) (255 * (1f - t)));
+                c.drawText(fadingOutTitle, parchment.centerX(), ty, text);
+                text.setAlpha((int) (255 * t));
+                c.drawText(title, parchment.centerX(), ty, text);
+                text.setAlpha(255);
+                return;
+            }
+            // fade finished this frame -- settle and fall through to a plain draw
+            titleFadeStart = -1L;
+            fadingOutTitle = null;
+        }
+        c.drawText(title, parchment.centerX(), ty, text);
+    }
+
     @Override
     protected void onDraw(Canvas c) {
         if (snap.members.isEmpty()) {
@@ -405,82 +623,43 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         RectF parchment = new RectF(pad * 3, h * 0.2f, w - pad * 3, h - pad * 2.2f);
         drawParchmentBase(c, parchment);
 
-        // PartySnapshot.mapName is empty on the overworld (the world map is
-        // meaningful there) and non-empty inside a field location (house,
-        // Leene Square, etc. — the DS game doesn't show the world map
-        // there, and neither should this view).
-        boolean overworld = snap.mapName == null || snap.mapName.isEmpty();
-        String title = overworld ? "World Map" : snap.mapName;
+        boolean animating = advanceEnemyBarFractions();
 
         // clip the map/title content to the torn-paper path so nothing draws
         // past the ripped edge (drawParchmentBase() above already built it)
         c.save();
         c.clipPath(tornPaper);
-        if (snap.inBattle) {
-            drawBattleContent(c, parchment);
-        } else if (overworld) {
-            // small title above the map
-            setText(h * 0.045f, INK, true, Paint.Align.CENTER, false);
-            text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
-            c.drawText(title, parchment.centerX(), parchment.top + h * 0.085f, text);
 
-            float mx = parchment.centerX(), my = parchment.centerY() + h * 0.03f;
-            Bitmap map = ChronoAssets.getWorldMap();
-            if (map != null) {
-                // area between the title and the gold/time corner text
-                RectF area = new RectF(parchment.left + w * 0.06f, parchment.top + h * 0.13f,
-                        parchment.right - w * 0.06f, parchment.bottom - h * 0.09f);
-                // wb_mini.png's cropped map content is stored at half its
-                // displayed width (the game's own map view is landscape
-                // ~1.5:1, not the bitmap's raw 96:128 = 0.75:1), so the target
-                // aspect used for letterboxing is 1.5, not map.getWidth()/
-                // map.getHeight(). drawBitmap below maps the full (undoubled)
-                // source into a dst rect built from the doubled width, which
-                // is what stretches it 2x horizontally.
-                float effW = ChronoAssets.isWorldMapNaturalAspect()
-                        ? map.getWidth() : map.getWidth() * 2f;
-                float effH = map.getHeight();
-                float scale = Math.min(area.width() / effW, area.height() / effH);
-                float dw = effW * scale, dh = effH * scale;
-                RectF dst = new RectF(area.centerX() - dw / 2f, area.centerY() - dh / 2f,
-                        area.centerX() + dw / 2f, area.centerY() + dh / 2f);
-                c.drawBitmap(map, null, dst, mapPaint);
-                // live position: overworld tiles (0..255 each axis) map
-                // linearly onto the drawn map rect
-                if (snap.worldX >= 0 && snap.worldY >= 0) {
-                    mx = dst.left + dst.width() * (snap.worldX / 256f);
-                    my = dst.top + dst.height() * (snap.worldY / 256f);
-                } else {
-                    mx = dst.centerX();
-                    my = dst.centerY();
-                }
-            }
+        boolean modeFading = modeFadeStart >= 0 && fadeSnap != null;
+        float modeT = 1f;
+        if (modeFading) {
+            long elapsed = System.nanoTime() - modeFadeStart;
+            modeT = Math.min(1f, elapsed / (float) MODE_FADE_NANOS);
+        }
+        if (modeFading && modeT < 1f) {
+            // crossfade ONLY the parchment content (map/marker/title vs
+            // battle title/enemy bars) -- the parchment itself, status
+            // boxes, and gold/time are drawn once, outside this block, and
+            // never fade.
+            int layer = c.saveLayerAlpha(0, 0, w, h, (int) (255 * (1f - modeT)));
+            drawContent(c, fadeSnap, parchment, false);
+            c.restoreToCount(layer);
 
-            Bitmap mark = ChronoAssets.getMinimapMark();
-            if (mark != null) {
-                float ms = h * 0.03f;
-                RectF markDst = new RectF(mx - ms, my - ms * 1.4f, mx + ms, my + ms * 0.6f);
-                c.drawBitmap(mark, null, markDst, markerPaint);
-            } else {
-                // hand-drawn diamond marker (waiting for real coordinates either way)
-                fill.setColor(Color.rgb(210, 50, 70));
-                Path marker = new Path();
-                float ms = h * 0.016f;
-                marker.moveTo(mx, my - ms);
-                marker.lineTo(mx + ms, my);
-                marker.lineTo(mx, my + ms);
-                marker.lineTo(mx - ms, my);
-                marker.close();
-                c.drawPath(marker, fill);
-            }
+            layer = c.saveLayerAlpha(0, 0, w, h, (int) (255 * modeT));
+            drawContent(c, snap, parchment, true);
+            c.restoreToCount(layer);
+            animating = true;
         } else {
-            // field location: no map, just the location name as the
-            // parchment's centerpiece, large and vertically centered
-            setText(h * 0.075f, INK, true, Paint.Align.CENTER, false);
-            text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
-            c.drawText(title, parchment.centerX(), parchment.centerY() + h * 0.025f, text);
+            if (modeFading) {
+                // fade finished this frame -- settle
+                modeFadeStart = -1L;
+                fadeSnap = null;
+            }
+            drawContent(c, snap, parchment, true);
         }
         c.restore();
+
+        if (titleFadeStart >= 0) animating = true;
 
         // aged-paper vignette/speckles/frame ON TOP of the map so it reads
         // as ink on old parchment rather than a clean printed minimap
@@ -506,6 +685,13 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         String time = String.format("%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60);
         text.setTextAlign(Paint.Align.RIGHT);
         c.drawText(time, parchment.right - w * 0.035f, parchment.bottom - h * 0.035f, text);
+
+        // keep animating (mode crossfade, title fade, or bar easing) only
+        // while something is actually still off-target, and only while
+        // attached -- a detached view must never keep scheduling frames.
+        if (animating && attached) {
+            postInvalidateOnAnimation();
+        }
     }
 
     private static Rect faceTileRect(int charIdx) {

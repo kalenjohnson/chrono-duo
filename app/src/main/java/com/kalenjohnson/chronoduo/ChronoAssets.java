@@ -26,6 +26,9 @@ public final class ChronoAssets {
     private static Bitmap worldMap;
     private static Bitmap minimapMark;
     private static Bitmap windowTex;
+    // 0-based line index into Localize/en/msg/monster.txt == monster id
+    // (line 146 = "Gato", verified live). Null until extraction finishes.
+    private static String[] monsterNames;
     private static final List<Listener> listeners = new ArrayList<>();
 
     /**
@@ -43,6 +46,7 @@ public final class ChronoAssets {
     public static Bitmap getWorldMap() { return worldMap; }
     public static Bitmap getMinimapMark() { return minimapMark; }
     public static Bitmap getWindowTex() { return windowTex; }
+    public static String[] getMonsterNames() { return monsterNames; }
 
     // Public (not package-private): populated from AppActivity, which lives
     // in org.cocos2dx.cpp — a different package — because the game binary
@@ -66,10 +70,14 @@ public final class ChronoAssets {
     public static void setMinimapMark(Bitmap b) { minimapMark = b; notifyListeners(); }
     public static void setWindowTex(Bitmap b) { windowTex = b; notifyListeners(); }
 
+    /** Stores the monster name table (line index == monster id) and notifies listeners, so a battle panel already open when extraction finishes repaints with real names. */
+    public static void setMonsterNames(String[] names) { monsterNames = names; notifyListeners(); }
+
     /** Registers a listener; if any asset is already loaded, fires immediately so late attachers (e.g. a Presentation created after the background load finished) don't miss it. */
     public static void addListener(Listener l) {
         listeners.add(l);
-        if (facePng != null || worldMap != null || minimapMark != null || windowTex != null) {
+        if (facePng != null || worldMap != null || minimapMark != null || windowTex != null
+                || monsterNames != null) {
             l.onChronoAssetsChanged();
         }
     }

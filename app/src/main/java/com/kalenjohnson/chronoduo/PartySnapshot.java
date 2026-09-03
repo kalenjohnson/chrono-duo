@@ -52,6 +52,7 @@ public final class PartySnapshot {
 
     public static final class Enemy {
         public int curHp, maxHp;
+        public int id; // monster id, actor block +0x00 (u8); index into monster.txt name table
     }
 
     public final List<Member> members = new ArrayList<>();
@@ -73,6 +74,11 @@ public final class PartySnapshot {
     private static int u16(byte[] b, int off) {
         if (b == null || off + 2 > b.length) return 0;
         return (b[off] & 0xff) | (b[off + 1] & 0xff) << 8;
+    }
+
+    private static int u8(byte[] b, int off) {
+        if (b == null || off >= b.length) return 0;
+        return b[off] & 0xff;
     }
 
     public static PartySnapshot read() {
@@ -130,6 +136,7 @@ public final class PartySnapshot {
                 Enemy e = new Enemy();
                 e.curHp = curHp;
                 e.maxHp = maxHp;
+                e.id = u8(btl, base + 0x00);
                 snap.enemies.add(e);
             }
         }
@@ -162,7 +169,7 @@ public final class PartySnapshot {
         }
         for (int i = 0; i < enemies.size(); i++) {
             Enemy a = enemies.get(i), b = o.enemies.get(i);
-            if (a.curHp != b.curHp || a.maxHp != b.maxHp) return false;
+            if (a.curHp != b.curHp || a.maxHp != b.maxHp || a.id != b.id) return false;
         }
         return true;
     }
