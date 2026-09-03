@@ -43,6 +43,28 @@ public final class GameState {
     /** Scene-graph node type/name patterns hidden by the "clean UI" tick. */
     public static final String[] HIDDEN_UI_PATTERNS = {"FieldMenu", "WorldMenu"};
 
+    /**
+     * Hides every node matching HIDDEN_UI_PATTERNS. Must run on the GL thread
+     * (scene-graph access) -- shared by AppActivity's periodic "clean UI" tick
+     * and SecondScreenPresentation's scene-change fast path so both apply the
+     * exact same call.
+     */
+    public static void applyHiddenUiPatterns() {
+        for (String pat : HIDDEN_UI_PATTERNS) {
+            nativeSetVisibleByPattern(pat, false);
+        }
+    }
+
+    /**
+     * Queues one applyHiddenUiPatterns() run on the GL thread. Safe to call
+     * from any thread; no-op if the native hook isn't attached yet.
+     */
+    public static void queueHiddenUiPatterns() {
+        if (isAttached()) {
+            org.cocos2dx.lib.Cocos2dxHelper.runOnGLThread(GameState::applyHiddenUiPatterns);
+        }
+    }
+
     public static boolean attach() {
         if (!attached) {
             attached = nativeAttach();

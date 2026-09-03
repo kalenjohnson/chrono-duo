@@ -12,6 +12,10 @@ import android.view.WindowManager;
 /** Companion screen: live party status panel polled from game memory. */
 public final class SecondScreenPresentation extends Presentation {
     private static final long POLL_MS = 500;
+    // Battle needs snappier command-button/targeting tracking than the field/
+    // overworld case -- reschedule at this faster cadence whenever the last
+    // read snapshot was mid-battle, and fall back to POLL_MS otherwise.
+    private static final long POLL_MS_BATTLE = 150;
 
     private PartyPanelView panel;
     private PartySnapshot last;
@@ -25,11 +29,18 @@ public final class SecondScreenPresentation extends Presentation {
                 org.cocos2dx.lib.Cocos2dxHelper.runOnGLThread(GameState::nativeUpdateBattleFlag);
             }
             PartySnapshot snap = PartySnapshot.read();
+            // A mapName change means a scene switch just happened (field<->
+            // field, or field<->overworld) -- the game rebuilds its menu UI
+            // nodes on that transition, so re-hide them immediately instead
+            // of waiting for AppActivity's next 700ms tick.
+            if (last == null || !snap.mapName.equals(last.mapName)) {
+                GameState.queueHiddenUiPatterns();
+            }
             if (last == null || !snap.sameAs(last)) {
                 last = snap;
                 panel.update(snap);
             }
-            handler.postDelayed(this, POLL_MS);
+            handler.postDelayed(this, last != null && last.inBattle ? POLL_MS_BATTLE : POLL_MS);
         }
     };
 

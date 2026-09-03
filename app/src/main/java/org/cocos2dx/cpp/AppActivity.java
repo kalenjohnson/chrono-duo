@@ -129,19 +129,20 @@ public class AppActivity extends Cocos2dxActivity {
             h.postDelayed(dump, FIELD_INTERVAL_MS);
 
             // "clean UI": keep the game's on-screen touch buttons hidden — the
-            // controller covers them (Y = menu). Re-applied every 2s because
-            // scene transitions rebuild the UI nodes.
+            // controller covers them (Y = menu). Re-applied every 700ms because
+            // scene transitions rebuild the UI nodes (FieldMenu) and the
+            // overworld re-asserts its own button visibility every frame
+            // (WorldMenu) -- a shorter interval keeps the post-transition
+            // flash brief. SecondScreenPresentation's poll also fires this
+            // immediately on a detected scene change, so this tick is really
+            // just the steady-state backstop.
             Runnable cleanUi = new Runnable() {
                 @Override public void run() {
-                    Cocos2dxHelper.runOnGLThread(() -> {
-                        for (String pat : com.kalenjohnson.chronoduo.GameState.HIDDEN_UI_PATTERNS) {
-                            com.kalenjohnson.chronoduo.GameState.nativeSetVisibleByPattern(pat, false);
-                        }
-                    });
-                    h.postDelayed(this, 2000);
+                    com.kalenjohnson.chronoduo.GameState.queueHiddenUiPatterns();
+                    h.postDelayed(this, 700);
                 }
             };
-            h.postDelayed(cleanUi, 2000);
+            h.postDelayed(cleanUi, 700);
         }
 
         // dev trigger: adb shell am broadcast -a com.kalenjohnson.chronoduo.SCENE_DUMP

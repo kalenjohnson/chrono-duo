@@ -33,6 +33,7 @@ static void *(*p_node_getName)(void *);      // returns const std::string&
 static void *(*p_node_getChildren)(void *);  // returns cocos2d::Vector<Node*>&
 static int   (*p_node_isVisible)(void *);
 static void  (*p_node_setVisible)(void *, int);
+static void  (*p_node_setPosition)(void *, const void *); // (this, const Vec2*)
 
 // cocos2d::Size/Vec2 are HFAs (two floats) -- returned in s0/s1 per the arm64
 // AAPCS, so plain C struct-by-value declarations match the real ABI.
@@ -130,6 +131,8 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeAttach(JNIEnv *env, jclass cls) 
     p_node_getChildren = (void *(*)(void *)) dlsym(h, "_ZN7cocos2d4Node11getChildrenEv");
     p_node_isVisible = (int (*)(void *)) dlsym(h, "_ZNK7cocos2d4Node9isVisibleEv");
     p_node_setVisible = (void (*)(void *, int)) dlsym(h, "_ZN7cocos2d4Node10setVisibleEb");
+    p_node_setPosition = (void (*)(void *, const void *))
+        dlsym(h, "_ZN7cocos2d4Node11setPositionERKNS_4Vec2E");
     p_node_getContentSize = (const void *(*)(void *)) dlsym(h, "_ZNK7cocos2d4Node14getContentSizeEv");
     p_node_convertToWorldSpace = (CCVec2 (*)(void *, const CCVec2 *))
         dlsym(h, "_ZNK7cocos2d4Node19convertToWorldSpaceERKNS_4Vec2E");
@@ -541,6 +544,34 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSceneDump(JNIEnv *env, jclass cl
     LOGI("scene: dump done, %d nodes", g_walk_count);
 }
 
+// Small ring of recently-moved node addresses, so the off-screen-park log
+// line fires once per node rather than every tick (tick runs at 700ms and
+// these container nodes are long-lived, so this ring rarely wraps).
+#define MOVED_RING_CAP 16
+static void *g_moved_ring[MOVED_RING_CAP];
+static int g_moved_ring_pos;
+static int already_logged_move(void *node) {
+    for (int i = 0; i < MOVED_RING_CAP; i++) {
+        if (g_moved_ring[i] == node) return 1;
+    }
+    g_moved_ring[g_moved_ring_pos] = node;
+    g_moved_ring_pos = (g_moved_ring_pos + 1) % MOVED_RING_CAP;
+    return 0;
+}
+
+// WorldMenu (overworld Menu/Map buttons) re-asserts setVisible(true) every
+// frame from the scene's own update -- a setVisible(false) here loses that
+// per-frame war and the button never actually disappears. Parking the node's
+// *position* far off-screen wins instead: nothing re-asserts position, and
+// the node stays exactly as visible/invisible as the engine thinks (touch
+// dispatch, layout, etc. all keep working normally), it's simply nowhere
+// the camera or the touch hit-test can reach it. Only applied on the hide
+// path (visible=false); the show path (visible=true, currently unused by any
+// caller) intentionally leaves position alone since there is no
+// previously-saved position to restore to.
+#define OFFSCREEN_X -100000.0f
+#define OFFSCREEN_Y -100000.0f
+
 // Hide/show any node whose RTTI type name or node name contains `pat`.
 static int g_hide_hits;
 static void hide_walk(void *node, int depth, const char *pat, int visible) {
@@ -550,7 +581,22 @@ static void hide_walk(void *node, int depth, const char *pat, int visible) {
     if (!tn) return;
     const char *nm = p_node_getName ? sso_cstr(p_node_getName(node), nb, sizeof(nb)) : "";
     if (strstr(tn, pat) || (nm[0] && strstr(nm, pat))) {
-        if (p_node_setVisible) { p_node_setVisible(node, visible); g_hide_hits++; }
+        // Only call engine methods on nodes with coherent RTTI whose vtable
+        // still points into libchrono.so's own mapping (see
+        // vtable_in_libchrono comment above node_world_center) -- these
+        // Field/World menu containers are stable scene children (unlike the
+        // churning battle nodes that crashed on this check historically),
+        // but the guard costs nothing and keeps the invariant uniform.
+        if (vtable_in_libchrono(node)) {
+            if (p_node_setVisible) { p_node_setVisible(node, visible); g_hide_hits++; }
+            if (!visible && p_node_setPosition) {
+                CCVec2 off = { OFFSCREEN_X, OFFSCREEN_Y };
+                p_node_setPosition(node, &off);
+                if (!already_logged_move(node)) {
+                    LOGI("clean-ui: parked %s '%s' (%p) off-screen", tn, nm, node);
+                }
+            }
+        }
         return;
     }
     void *vecp = p_node_getChildren(node);
