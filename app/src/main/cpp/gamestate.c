@@ -21,6 +21,7 @@
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <time.h>
 #include <android/log.h>
 #include <zlib.h>
 
@@ -795,6 +796,82 @@ static void tex_fingerprint(const uint8_t *rgba, int w, int h,
     *out_red_fp = rh;
 }
 
+// Loads and inflates one ".rgbz" replacement file (see the mechanism 5
+// comment block above for the on-disk format) into `out` (must be exactly
+// `out_len` == width*height*4 bytes, i.e. the caller's pixel_decimate_scratch
+// buffer). Reads the whole compressed file into pixel_repl_read_scratch
+// first (its size isn't known up front), validates the 16-byte RGBZ header
+// against `expect_w`/`expect_h`/`out_len`, then inflates via zlib's
+// uncompress(). On any failure (open/stat/read/header/inflate) returns 0
+// and leaves a short reason in `err` (for the caller's one-shot mismatch
+// log); on success returns 1 and sets `*out_inflate_ms` to just the
+// uncompress() wall time. GL-thread-only, like every other mechanism-5
+// helper.
+static int pixel_repl_load_rgbz(const char *path, int expect_w, int expect_h,
+                                 uint8_t *out, size_t out_len,
+                                 double *out_inflate_ms, char *err, size_t err_len) {
+    FILE *rf = fopen(path, "rb");
+    if (!rf) {
+        snprintf(err, err_len, "open failed (errno=%d)", errno);
+        return 0;
+    }
+    if (fseek(rf, 0, SEEK_END) != 0) {
+        snprintf(err, err_len, "fseek(END) failed");
+        fclose(rf);
+        return 0;
+    }
+    long file_size = ftell(rf);
+    if (file_size < 16 || fseek(rf, 0, SEEK_SET) != 0) {
+        snprintf(err, err_len, "bad file size %ld", file_size);
+        fclose(rf);
+        return 0;
+    }
+
+    uint8_t *raw = pixel_repl_read_scratch((size_t) file_size);
+    if (!raw) {
+        snprintf(err, err_len, "OOM reading %ld bytes", file_size);
+        fclose(rf);
+        return 0;
+    }
+    size_t rd = fread(raw, 1, (size_t) file_size, rf);
+    fclose(rf);
+    if (rd != (size_t) file_size) {
+        snprintf(err, err_len, "short read %zu/%ld", rd, file_size);
+        return 0;
+    }
+
+    if (memcmp(raw, "RGBZ", 4) != 0) {
+        snprintf(err, err_len, "bad magic");
+        return 0;
+    }
+    uint32_t hdr_w = (uint32_t) raw[4] | ((uint32_t) raw[5] << 8) |
+                     ((uint32_t) raw[6] << 16) | ((uint32_t) raw[7] << 24);
+    uint32_t hdr_h = (uint32_t) raw[8] | ((uint32_t) raw[9] << 8) |
+                     ((uint32_t) raw[10] << 16) | ((uint32_t) raw[11] << 24);
+    uint32_t raw_len = (uint32_t) raw[12] | ((uint32_t) raw[13] << 8) |
+                        ((uint32_t) raw[14] << 16) | ((uint32_t) raw[15] << 24);
+    if (hdr_w != (uint32_t) expect_w || hdr_h != (uint32_t) expect_h ||
+        raw_len != (uint32_t) out_len) {
+        snprintf(err, err_len, "header %ux%u/%u mismatches expected %dx%d/%zu",
+                 hdr_w, hdr_h, raw_len, expect_w, expect_h, out_len);
+        return 0;
+    }
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uLongf dest_len = (uLongf) out_len;
+    int zret = uncompress(out, &dest_len, raw + 16, (uLong) file_size - 16);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    *out_inflate_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    if (zret != Z_OK || dest_len != (uLongf) out_len) {
+        snprintf(err, err_len, "uncompress failed (zret=%d, got=%lu/%zu)",
+                 zret, (unsigned long) dest_len, out_len);
+        return 0;
+    }
+    return 1;
+}
+
 static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat,
                                  GLsizei width, GLsizei height, GLint border,
                                  GLenum format, GLenum type, const void *pixels) {
@@ -898,29 +975,32 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
             if (r->w == width && r->h == height) {
                 size_t needed = (size_t) width * (size_t) height * 4;
                 // Reuses g_pixel_decimate_buf (via pixel_decimate_scratch) as
-                // a generic grow-only I/O buffer. Safe: this path always
+                // the decoded-output buffer, and g_pixel_repl_read_buf (via
+                // pixel_repl_read_scratch, inside pixel_repl_load_rgbz) as
+                // the compressed-file-read buffer. Safe: this path always
                 // either uploads-and-returns or falls through to the normal
                 // (non-decimated-replacement) path below without touching
-                // the buffer again, so the fread here and
+                // the decoded buffer again, so the inflate here and
                 // pixel_decimate_rgba's writes below never run on the same
                 // buffer contents; both are GL-thread-only besides.
                 uint8_t *scratch = pixel_decimate_scratch(needed);
-                FILE *rf = scratch ? fopen(r->rgba_path, "rb") : NULL;
-                size_t rd = 0;
-                if (rf) {
-                    rd = fread(scratch, 1, needed, rf);
-                    fclose(rf);
-                }
-                if (scratch && rf && rd == needed) {
+                double inflate_ms = 0.0;
+                char err[128] = "";
+                int ok = scratch && pixel_repl_load_rgbz(r->rgba_path, width, height,
+                                                          scratch, needed, &inflate_ms,
+                                                          err, sizeof(err));
+                if (ok) {
                     if (p_real_glTexImage2D) {
                         p_real_glTexImage2D(target, level, internalformat, width, height, border,
                                              format, type, scratch);
                     }
                     if (!r->replaced_logged) {
                         if (via_fingerprint) {
-                            LOGI("pixel-gfx: replaced %s by fingerprint", r->name);
+                            LOGI("pixel-gfx: replaced %s by fingerprint (inflate %.2f ms)",
+                                 r->name, inflate_ms);
                         } else {
-                            LOGI("pixel-gfx: replaced %s %dx%d", r->name, width, height);
+                            LOGI("pixel-gfx: replaced %s %dx%d (inflate %.2f ms)",
+                                 r->name, width, height, inflate_ms);
                         }
                         r->replaced_logged = 1;
                     }
@@ -928,13 +1008,13 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
                     return;
                 }
                 if (!r->mismatch_logged) {
-                    LOGE("pixel-gfx: replacement %s: failed to load %s (scratch=%d open=%d "
-                         "read=%zu/%zu) -- using original",
-                         r->name, r->rgba_path, scratch != NULL, rf != NULL, rd, needed);
+                    LOGE("pixel-gfx: replacement %s: failed to load %s (scratch=%d: %s) "
+                         "-- using original",
+                         r->name, r->rgba_path, scratch != NULL, scratch ? err : "no scratch buffer");
                     r->mismatch_logged = 1;
                 }
                 // Falls through to the normal upload path below, using the
-                // live `pixels` (not the half-read scratch buffer).
+                // live `pixels` (not the possibly-partial scratch buffer).
             } else if (!r->mismatch_logged) {
                 LOGE("pixel-gfx: replacement %s is %dx%d, upload is %dx%d -- size mismatch, "
                      "using original", r->name, r->w, r->h, width, height);
