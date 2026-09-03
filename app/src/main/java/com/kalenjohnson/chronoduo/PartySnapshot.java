@@ -39,10 +39,11 @@ public final class PartySnapshot {
     private static final int BTL_PARTY_SLOTS = 3;
     private static final int BTL_HP_OFF = 0x03;
     private static final int BTL_MAXHP_OFF = 0x05;
-    // Battle MP: u8 pair right after the HP fields — calibrated live with
-    // Crono 0/14 and Marle 8/18 showing on the game's own battle HUD.
+    // Battle MP: u8 curMP at +0x07, u8 maxMP at +0x09 (+0x08 is always 0 --
+    // reading it as maxMP showed "x/0" in battle). Verified against 8
+    // in-fight snapshots: Crono 0x00/0x0e = 0/14, Marle 0x07/0x12 = 7/18.
     private static final int BTL_MP_OFF = 0x07;
-    private static final int BTL_MAXMP_OFF = 0x08;
+    private static final int BTL_MAXMP_OFF = 0x09;
     private static final int BTL_MAX_PLAUSIBLE_HP = 9999;
 
     public static final class Member {
