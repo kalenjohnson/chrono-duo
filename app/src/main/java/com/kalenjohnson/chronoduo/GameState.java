@@ -56,6 +56,11 @@ public final class GameState {
     // Default true; expose an off switch in case it ever misbehaves. Any
     // thread (plain flag write).
     public static native void nativeSetHideBattleUi(boolean hide);
+    // Dev experiment hook: bit i blanks direct child index i of the battle
+    // node's children (any type), so which child draws what can be seen
+    // live. One-way -- clearing a bit does not restore opacity. Any thread
+    // (plain flag write).
+    public static native void nativeSetBattleHideMask(int mask);
 
     private static boolean frameEnforcerStarted;
     private static final android.os.Handler sEnforcerHandler =

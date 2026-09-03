@@ -154,10 +154,21 @@ public class AppActivity extends Cocos2dxActivity {
         }
 
         // dev trigger: adb shell am broadcast -a com.kalenjohnson.chronoduo.SCENE_DUMP
+        // dev trigger: adb shell am broadcast -a com.kalenjohnson.chronoduo.BATTLE_HIDE_MASK
+        // --ei mask N -- blanks direct children of the battle node by index
+        // bitmask, for seeing live which child draws what.
         android.content.IntentFilter filter =
                 new android.content.IntentFilter("com.kalenjohnson.chronoduo.SCENE_DUMP");
+        filter.addAction("com.kalenjohnson.chronoduo.BATTLE_HIDE_MASK");
         android.content.BroadcastReceiver devReceiver = new android.content.BroadcastReceiver() {
             @Override public void onReceive(Context c, android.content.Intent i) {
+                String action = i.getAction();
+                if ("com.kalenjohnson.chronoduo.BATTLE_HIDE_MASK".equals(action)) {
+                    int mask = i.getIntExtra("mask", 0);
+                    Cocos2dxHelper.runOnGLThread(
+                            () -> com.kalenjohnson.chronoduo.GameState.nativeSetBattleHideMask(mask));
+                    return;
+                }
                 int depth = i.getIntExtra("depth", 4);
                 Cocos2dxHelper.runOnGLThread(
                         () -> com.kalenjohnson.chronoduo.GameState.nativeSceneDump(depth));

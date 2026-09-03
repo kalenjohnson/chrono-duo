@@ -55,6 +55,30 @@ static int safe_read(const void *addr, void *out, size_t len);
 #define NODE_CONTENT  0x80
 #define NODE_PARENT   0x190
 #define NODE_VISIBLE  0x1f9
+// _tag (int) derived, not disassembled: walking cocos2d/2d/CCNode.h's
+// protected member list in declaration order from _parent (trusted +0x190)
+// -- Node* _parent(8) @0x190, Director* _director(8) @0x198, int _tag(4)
+// @0x1a0 -- and continuing the same walk through _name/_hashOfName/
+// _userData/_userObject/_glProgramState/_scheduler/_actionManager/
+// _eventDispatcher/_running lands bool _visible at exactly 0x1f9, matching
+// the independently-trusted NODE_VISIBLE constant with zero slack. That
+// exact match validates the counting (including the earlier Mat4-sized
+// _modelViewTransform/_transform/_inverse block between _contentSize and
+// _parent, since NODE_PARENT=0x190 was hit exactly too), so 0x1a0 is used
+// with confidence.
+#define NODE_TAG 0x1a0
+// Opacity (_displayedOpacity/_realOpacity, GLubyte) is intentionally NOT
+// offset here: the fields after _visible depend on whether
+// CC_ENABLE_SCRIPT_BINDING was compiled in (it inserts two ints + an enum
+// before _componentContainer), which cannot be determined from the header
+// alone and isn't covered by any trusted accessor offset in this file, so
+// getting it wrong would silently print garbage. Skipped.
+// cocos2d::Label's _utf8Text (CCLabel.h L691) is also skipped: Label uses
+// multiple inheritance (Node, LabelProtocol, BlendProtocol) and _utf8Text
+// sits after ~70 lines of intervening protected members (CCLabel.h
+// L623-691) with no trusted accessor offset to anchor a derivation the way
+// NODE_PARENT/NODE_VISIBLE anchor the Node fields above -- not confidently
+// derivable from the header alone.
 
 // World-space center of a node via pure safe_read parent-chain walk (ignores
 // scale/rotation — fine for the unscaled battle menu). Engine transform calls
@@ -551,23 +575,65 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleToggles(JNIEnv *env, jc
 }
 
 static int g_walk_count;
+static int g_walk_cap_hit;
 static void walk_node(void *node, int depth, int max_depth) {
     char tb[96], nb[64];
-    if (g_walk_count > 300) return;
+    if (g_walk_count > 2000) { g_walk_cap_hit = 1; return; }
     const char *tn = type_name(node, tb, sizeof(tb));
     if (!tn) return; // no coherent RTTI -> not a live object, don't call methods
     g_walk_count++;
     const char *nm = p_node_getName ? sso_cstr(p_node_getName(node), nb, sizeof(nb)) : "";
     int vis = p_node_isVisible ? p_node_isVisible(node) : -1;
-    LOGI("scene:%*s%p %s '%s' vis=%d", depth * 2, "", node, tn, nm, vis);
-    if (depth >= max_depth || !p_node_getChildren) return;
+
+    // Geometry via safe_read only -- see node_world_center comment above for
+    // why we avoid calling engine methods (other than the getName/isVisible/
+    // getChildren already used elsewhere) on nodes that may be mid-destruction.
+    float pos[2] = {0, 0}, anc[2] = {0, 0}, csz[2] = {0, 0};
+    int32_t tag = 0;
+    int got_pos = safe_read((uint8_t *)node + NODE_POSITION, pos, 8);
+    int got_anc = safe_read((uint8_t *)node + NODE_ANCHOR, anc, 8);
+    int got_csz = safe_read((uint8_t *)node + NODE_CONTENT, csz, 8);
+    int got_tag = safe_read((uint8_t *)node + NODE_TAG, &tag, 4);
+    float wx = 0, wy = 0;
+    int got_world = node_world_center(node, &wx, &wy);
+    // opacity is intentionally not read here -- see NODE_TAG comment block
+    // above for why the offset isn't confidently derivable.
+
     // cocos2d::Vector<Node*> wraps std::vector: {begin, end, cap}
-    void *vecp = p_node_getChildren(node);
-    void *ptrs[2];
-    if (!safe_read(vecp, ptrs, 16)) return;
+    void *vecp = p_node_getChildren ? p_node_getChildren(node) : NULL;
+    void *ptrs[2] = {0, 0};
+    int child_ok = vecp && safe_read(vecp, ptrs, 16);
     void **begin = (void **)ptrs[0], **end = (void **)ptrs[1];
-    if (!plausible_any(begin) || !plausible_any(end) || end < begin
-            || (end - begin) > 512) return;
+    if (child_ok && (!plausible_any(begin) || !plausible_any(end) || end < begin
+            || (end - begin) > 512)) {
+        child_ok = 0;
+    }
+    int child_count = child_ok ? (int)(end - begin) : -1;
+
+    // cocos2d::Label string is intentionally not read here -- see the
+    // comment above NODE_TAG for why _utf8Text's offset isn't confidently
+    // derivable from CCLabel.h alone (multiple inheritance, no trusted
+    // anchor to walk from).
+
+    if (got_world) {
+        LOGI("scene:%*s%p %s '%s' vis=%d pos=(%.1f,%.1f) size=(%.1f,%.1f) "
+             "anchor=(%.2f,%.2f) tag=%d children=%d world=(%.1f,%.1f)",
+             depth * 2, "", node, tn, nm, vis,
+             got_pos ? pos[0] : 0.0f, got_pos ? pos[1] : 0.0f,
+             got_csz ? csz[0] : 0.0f, got_csz ? csz[1] : 0.0f,
+             got_anc ? anc[0] : 0.0f, got_anc ? anc[1] : 0.0f,
+             got_tag ? tag : 0, child_count, wx, wy);
+    } else {
+        LOGI("scene:%*s%p %s '%s' vis=%d pos=(%.1f,%.1f) size=(%.1f,%.1f) "
+             "anchor=(%.2f,%.2f) tag=%d children=%d world=?",
+             depth * 2, "", node, tn, nm, vis,
+             got_pos ? pos[0] : 0.0f, got_pos ? pos[1] : 0.0f,
+             got_csz ? csz[0] : 0.0f, got_csz ? csz[1] : 0.0f,
+             got_anc ? anc[0] : 0.0f, got_anc ? anc[1] : 0.0f,
+             got_tag ? tag : 0, child_count);
+    }
+
+    if (depth >= max_depth || !child_ok) return;
     for (void **c = begin; c < end; c++) {
         void *child;
         if (safe_read(c, &child, 8)) walk_node(child, depth + 1, max_depth);
@@ -579,8 +645,10 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSceneDump(JNIEnv *env, jclass cl
     void *scene = find_running_scene();
     if (!scene) { LOGI("scene: not found"); return; }
     g_walk_count = 0;
+    g_walk_cap_hit = 0;
     walk_node(scene, 0, maxDepth);
-    LOGI("scene: dump done, %d nodes", g_walk_count);
+    LOGI("scene: dump done, %d nodes%s", g_walk_count,
+         g_walk_cap_hit ? " (cap hit)" : "");
 }
 
 // Small ring of recently-moved node addresses, so the off-screen-park log
@@ -749,18 +817,56 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetHideBattleUi(JNIEnv *env, jcl
     g_hide_battle_ui = hide ? 1 : 0;
 }
 
+// Dev experiment hook: bit i (0-based) blanks direct child index i of
+// g_battle_node's children vector, counted over every entry (including ones
+// whose type_name lookup fails), regardless of type -- lets the user hide
+// children one at a time to see what each one draws. We never restore
+// opacity when a bit is cleared (this is a one-way dev hook, not a real
+// toggle); reopening the affected menu or restarting battle is the reset.
+static uint32_t g_battle_hide_mask = 0;
+
+JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeSetBattleHideMask(JNIEnv *env, jclass cls,
+                                                                   jint mask) {
+    uint32_t m = (uint32_t)mask;
+    if (m != g_battle_hide_mask) {
+        LOGI("battle-ui: hide mask changed 0x%08x -> 0x%08x", g_battle_hide_mask, m);
+        g_battle_hide_mask = m;
+    }
+}
+
 // Opacity (not visibility/position) hiding of the battle command menus:
 // touch hit-testing and the controller cursor both need the real node graph
 // untouched (visible, at its real position) for the game's own input/tap-
 // injection targeting to keep working -- only the pixels are hidden. Direct
-// children of g_battle_node only (no recursion): the cocos2d::Menu of
-// command toggles and the Tech/Item/List submenus all sit there. Every
-// matching node whose type name contains "Menu" (covers cocos2d::Menu,
-// BattleTechMenu, BattleItemMenu, BattleListMenu -- all contain that
-// substring) gets cascade-opacity enabled once (so setOpacity below actually
-// propagates to children instead of only dimming the container), then
-// setOpacity(0) applied EVERY tick, since the game may reassert its own
+// children of g_battle_node only (no recursion). The top screen mirror
+// composites its own HUD, so every plain-engine chrome node here is
+// redundant and gets blanked:
+//   - cocos2d::Menu (plain, non-Battle*)  -- Attack/Combo/Item command toggles
+//   - cocos2d::RenderTexture              -- the baked SNES-style HUD sprite
+//                                             (party HP/MP frame, portraits,
+//                                             ATB bars)
+//   - cocos2d::Node (exact, plain engine) -- the HP/MP number label group
+//   - cocos2d::Label (exact)              -- the "Attack"/"Tech"/"Item" text
+// The nsBattleListMenu::BattleTechMenu / BattleItemMenu submenus (and
+// anything else with "Battle" in its RTTI name) are deliberately excluded:
+// we don't mirror their list contents on the bottom screen yet, so hiding
+// them would leave tech/item selection invisible everywhere. Damage numbers
+// and the target cursor live outside this set and are unaffected.
+// The matching node gets cascade-opacity enabled (so setOpacity below
+// actually propagates to children instead of only dimming the container),
+// then setOpacity(0) applied EVERY tick, since the game may reassert its own
 // opacity whenever the menu (re)opens.
+static int should_hide_battle_child(const char *tn) {
+    if (!tn) return 0;
+    if (strstr(tn, "Battle")) return 0;
+    if (strstr(tn, "cocos2d") && strstr(tn, "4MenuE")) return 1;
+    if (strcmp(tn, "N7cocos2d13RenderTextureE") == 0) return 1;
+    if (strcmp(tn, "N7cocos2d4NodeE") == 0) return 1;
+    if (strcmp(tn, "N7cocos2d5LabelE") == 0) return 1;
+    return 0;
+}
+
 static void enforce_battle_ui_hide(void) {
     if (!g_hide_battle_ui || !g_battle_node || !vtable_in_libchrono(g_battle_node)
             || !p_node_getChildren) {
@@ -772,12 +878,19 @@ static void enforce_battle_ui_hide(void) {
     void **begin = (void **)ptrs[0], **end = (void **)ptrs[1];
     if (!plausible_any(begin) || !plausible_any(end) || end < begin
             || (end - begin) > 512) return;
+    int idx = -1;
     for (void **c = begin; c < end; c++) {
+        idx++;
         void *child;
         if (!safe_read(c, &child, 8)) continue;
         char tb[96];
         const char *tn = type_name(child, tb, sizeof(tb));
-        if (!tn || !strstr(tn, "Menu")) continue;
+        int hide_type = should_hide_battle_child(tn);
+        // Dev hook: also hide direct child index `idx` when its bit is set
+        // in g_battle_hide_mask, regardless of type -- see
+        // nativeSetBattleHideMask above.
+        int mask_hit = idx >= 0 && idx < 32 && (g_battle_hide_mask & (1u << idx));
+        if (!hide_type && !mask_hit) continue;
         if (!vtable_in_libchrono(child)) continue;
         // Cascade must be (re)enabled EVERY tick, not once per node: the
         // toggles swap in freshly created child sprites each time the menu
@@ -788,7 +901,7 @@ static void enforce_battle_ui_hide(void) {
         if (p_setCascadeOpacityEnabledRecursive) {
             p_setCascadeOpacityEnabledRecursive(child, 1);
             if (!already_cascade_set(child)) {
-                LOGI("battle-ui: cascade-opacity enabled on %s (%p)", tn, child);
+                LOGI("battle-ui: cascade-opacity enabled on %s (%p)", tn ? tn : "?", child);
             }
         }
         if (p_node_setOpacity) p_node_setOpacity(child, 0);
