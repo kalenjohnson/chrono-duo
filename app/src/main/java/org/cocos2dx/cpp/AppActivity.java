@@ -77,6 +77,7 @@ public class AppActivity extends Cocos2dxActivity {
 
         secondScreen = new SecondScreenManager(this);
         controllerInput.ensureConnected();
+        extractCompanionAssets();
 
         com.kalenjohnson.chronoduo.GameState.attach();
         // periodic full-memory dumps for offline layout analysis (dev only)
@@ -155,6 +156,107 @@ public class AppActivity extends Cocos2dxActivity {
     protected void onPause() {
         if (secondScreen != null) secondScreen.onPause();
         super.onPause();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (secondScreen != null) secondScreen.onDestroy();
+        super.onDestroy();
+    }
+
+    /**
+     * Extracts the companion-UI art (portraits, world map sheet) from the
+     * game's resources.bin off the main thread, then decodes and hands the
+     * bitmaps to ChronoAssets on the main thread. Best-effort: any failure
+     * (game assets missing, archive format surprise, OOM on a 420MB stream)
+     * is logged and simply leaves PartyPanelView's placeholders in place.
+     */
+    private void extractCompanionAssets() {
+        final Context appCtx = getApplicationContext();
+        final android.content.res.AssetManager gameAssets = runtime.getChronoAssets();
+        new Thread(() -> {
+            try {
+                String[] names = {
+                        "Extension/face.png",
+                        "Game/common/wb_mini.png",
+                        "Game/common/minimap_mark.png",
+                        "Extension/menu_win.png",
+                };
+                java.util.Map<String, File> files =
+                        com.kalenjohnson.chronoduo.ChronoResources.extractAll(appCtx, gameAssets, names);
+
+                final android.graphics.Bitmap face = decodeBitmap(files.get("Extension/face.png"));
+                final android.graphics.Bitmap mapRaw = decodeBitmap(files.get("Game/common/wb_mini.png"));
+                final android.graphics.Bitmap map = mapRaw != null
+                        ? com.kalenjohnson.chronoduo.ChronoAssets.autoCropContent(mapRaw) : null;
+                final android.graphics.Bitmap mark = cropMarkerTile(files.get("Game/common/minimap_mark.png"));
+                final android.graphics.Bitmap windowTex = cropWindowTexture(files.get("Extension/menu_win.png"));
+
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                    if (face != null) com.kalenjohnson.chronoduo.ChronoAssets.setFace(face);
+                    if (map != null) com.kalenjohnson.chronoduo.ChronoAssets.setWorldMap(map);
+                    if (mark != null) com.kalenjohnson.chronoduo.ChronoAssets.setMinimapMark(mark);
+                    if (windowTex != null) com.kalenjohnson.chronoduo.ChronoAssets.setWindowTex(windowTex);
+                });
+            } catch (Exception e) {
+                Log.w(TAG, "companion asset extraction failed", e);
+            }
+        }, "ChronoResExtract").start();
+    }
+
+    // Extension/menu_win.png is a 512x512 sheet of pre-baked DS-style window
+    // panels at various fixed sizes (packed, not tiled). The largest one —
+    // a beveled steel/navy panel with a black outline and a light bevel
+    // highlight line that resolves into flat noise fill by ~16px in from
+    // each edge — sits at (198,134)-(500,304) in sheet pixels; that region
+    // is cropped out here so ChronoAssets/PartyPanelView can 9-slice it
+    // directly (bitmap origin becomes the panel's own top-left).
+    private static final int WIN_TEX_L = 198, WIN_TEX_T = 134, WIN_TEX_R = 500, WIN_TEX_B = 304;
+
+    private static android.graphics.Bitmap cropWindowTexture(File f) {
+        android.graphics.Bitmap sheet = decodeBitmap(f);
+        if (sheet == null) return null;
+        if (sheet.getWidth() < WIN_TEX_R || sheet.getHeight() < WIN_TEX_B) {
+            Log.w(TAG, "menu_win.png smaller than expected, skipping window texture crop");
+            return null;
+        }
+        try {
+            return android.graphics.Bitmap.createBitmap(sheet, WIN_TEX_L, WIN_TEX_T,
+                    WIN_TEX_R - WIN_TEX_L, WIN_TEX_B - WIN_TEX_T);
+        } catch (Exception e) {
+            Log.w(TAG, "window texture crop failed", e);
+            return null;
+        }
+    }
+
+    // Game/common/minimap_mark.png is a 48x16 strip of three 16x16 tiles:
+    // tile 0 is fully transparent (unused spacer), tile 1 is a green ring
+    // with a pale-blue fill, tile 2 is a yellow ring with a pale-yellow
+    // fill. Read as a two-color map-pin legend (e.g. visited/current vs.
+    // other point of interest), tile 1's cooler blue center reads as the
+    // "you are here" marker, so that's the one tile we draw — the old code
+    // drew the whole 48x16 sheet in one rect, which showed up on-screen as
+    // three stray circles side by side.
+    private static android.graphics.Bitmap cropMarkerTile(File f) {
+        android.graphics.Bitmap sheet = decodeBitmap(f);
+        if (sheet == null) return null;
+        if (sheet.getWidth() < 32 || sheet.getHeight() < 16) {
+            Log.w(TAG, "minimap_mark.png smaller than expected, skipping marker tile crop");
+            return null;
+        }
+        try {
+            return android.graphics.Bitmap.createBitmap(sheet, 16, 0, 16, 16);
+        } catch (Exception e) {
+            Log.w(TAG, "marker tile crop failed", e);
+            return null;
+        }
+    }
+
+    private static android.graphics.Bitmap decodeBitmap(File f) {
+        if (f == null) return null;
+        android.graphics.Bitmap b = android.graphics.BitmapFactory.decodeFile(f.getAbsolutePath());
+        if (b == null) Log.w(TAG, "failed to decode bitmap: " + f);
+        return b;
     }
 
     private void showBootstrapError(Exception e) {

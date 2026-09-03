@@ -19,6 +19,23 @@ import android.view.WindowManager;
  *    going to the game on the default display
  *  - the system can dismiss a Presentation behind our back (rotation, display
  *    config churn); recover in onDismiss and on display events
+ *
+ * Sleep/wake note: onResume() fires reliably after every device wake (verified
+ * via adb: Cocos2dxActivity logs onPause/onResume around KEYCODE_SLEEP/WAKEUP),
+ * so a screen-on BroadcastReceiver is unnecessary for that path -- and was
+ * actually harmful here: it was registered in onResume/unregistered in onPause,
+ * which guarantees it misses ACTION_SCREEN_ON (that broadcast fires the instant
+ * the display powers on, before onResume has run and re-registered it).
+ * The real failure mode is different and more subtle: a Presentation created
+ * immediately (synchronously) on the first onResume() after wake can end up
+ * with isShowing()==true but a permanently black surface -- the display
+ * reports ready (DisplayPowerController "Unblocked screen on") before its
+ * compositor layer is actually live again. A View.invalidate() cannot recover
+ * a dead surface (verified: the panel keeps calling update()/invalidate()
+ * every 500ms via its poll loop, yet the screen stays black), only tearing
+ * down and recreating the Presentation (a fresh Surface) does. So update()'s
+ * post-resume retries must force a real recreate, not just skip out because
+ * isShowing() already (falsely) reports true.
  */
 public final class SecondScreenManager {
     private static final String TAG = "ChronoDuoSS";
@@ -35,40 +52,48 @@ public final class SecondScreenManager {
         @Override public void onDisplayChanged(int displayId) { update(); }
     };
 
+    // Set when the screen actually turned off since our last resume; gates the
+    // forced recreate so healthy resumes (app switches, overlays) don't flash.
+    private boolean screenWasOff;
+    private final android.content.BroadcastReceiver screenOffReceiver =
+            new android.content.BroadcastReceiver() {
+                @Override public void onReceive(android.content.Context c, android.content.Intent i) {
+                    screenWasOff = true;
+                }
+            };
+
     public SecondScreenManager(Activity activity) {
         this.activity = activity;
         this.displayManager = (DisplayManager) activity.getSystemService(Activity.DISPLAY_SERVICE);
+        // Registered for the manager's whole life (not resume/pause) so it
+        // can't miss the broadcast — SCREEN_ON/OFF fire before onResume runs.
+        activity.registerReceiver(screenOffReceiver,
+                new android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_OFF));
     }
 
-    private final android.content.BroadcastReceiver screenOnReceiver =
-            new android.content.BroadcastReceiver() {
-                @Override public void onReceive(android.content.Context ctx, android.content.Intent i) {
-                    // After device sleep the panel powers back on without any
-                    // display event; the old Presentation surface stays black.
-                    // Recreate it from scratch.
-                    dismiss();
-                    handler.postDelayed(SecondScreenManager.this::update, 400);
-                }
-            };
+    public void onDestroy() {
+        try {
+            activity.unregisterReceiver(screenOffReceiver);
+        } catch (IllegalArgumentException ignored) {
+        }
+    }
 
     public void onResume() {
         resumed = true;
         displayManager.registerDisplayListener(listener, handler);
-        activity.registerReceiver(screenOnReceiver,
-                new android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_ON));
         update();
-        // displays are sometimes not ready the instant we resume — retry briefly
-        handler.postDelayed(this::update, 600);
-        handler.postDelayed(this::update, 2500);
+        if (screenWasOff) {
+            screenWasOff = false;
+            // After a genuine wake, the presentation created just above can sit
+            // on a dead compositor surface while claiming isShowing() (see
+            // class doc); one forced recreate shortly after revives it.
+            handler.postDelayed(this::forceUpdate, 700);
+        }
     }
 
     public void onPause() {
         resumed = false;
         displayManager.unregisterDisplayListener(listener);
-        try {
-            activity.unregisterReceiver(screenOnReceiver);
-        } catch (IllegalArgumentException ignored) {
-        }
         dismiss();
     }
 
@@ -87,6 +112,16 @@ public final class SecondScreenManager {
             dismiss();
         }
         show(target);
+    }
+
+    /** Unconditionally tears down and recreates the presentation, if a target
+     *  display is available. Unlike update(), this ignores isShowing() -- see
+     *  class doc for why that check alone can't detect a dead-but-"showing"
+     *  surface after a sleep/wake cycle. */
+    private void forceUpdate() {
+        if (!resumed) return;
+        dismiss();
+        update();
     }
 
     private Display findSecondaryDisplay() {
