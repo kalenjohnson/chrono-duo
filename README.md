@@ -13,15 +13,22 @@ ChronoDuo's private storage, points the engine's asset loading at the game's own
 APK, and boots the engine inside ChronoDuo's process — where we control the second
 screen via Android's standard `Presentation` API.
 
-## Status
+## Status (2026-09-03 — one very long day)
 
-- [x] Phase 1: the game boots and renders full-widescreen inside ChronoDuo
-      (verified on Ayn Thor Lite, 2026-09-03: intro scene, music, 1920×1080)
-- [x] Second screen Presentation confirmed on the Thor's bottom panel
-      (display id 4, 1240×1080) — placeholder UI for now
-- [ ] Phase 2: real companion UI on the bottom screen
-- [ ] Phase 3: live game state (map, party, inventory) feeding the second screen
-- [ ] Input: verify touch/controller in-game; route physical controls if needed
+- [x] Game boots and plays full-widescreen inside ChronoDuo (Ayn Thor Lite)
+- [x] DS-style second screen: real portraits in the game's own window chrome,
+      HD sepia world map (torn-paper parchment) with a live position marker,
+      live location name, gold and play time
+- [x] Live battle mode: real-time party HP, named enemy bars (honoring the
+      game's hidden-info flags by default, eye-toggle to reveal), fades
+- [x] Bottom-screen battle CONTROLS: Attack/Tech/Item buttons synced to the
+      real command menu, tap-injected into the game; targeting and submenu
+      navigation rows; selection highlight mirrors the game's cursor, so
+      controller and touch drive one shared menu
+- [x] Top-screen cleanup: field/world menu buttons parked off-screen every
+      frame; battle command UI faded to zero opacity (inputs unaffected)
+- [ ] Someday: tech names on the list buttons, ATB gauges, battle MP,
+      per-era DS maps, optional cheats via the game's own ExperiencePlus
 
 ## Build
 
