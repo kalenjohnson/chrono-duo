@@ -56,40 +56,43 @@ public final class GameState {
     public static native void nativeLogPixelStats();
 
     /**
-     * Registers (or replaces) a user-local texture substitution keyed by
-     * asset basename (e.g. "c000_0.png" -- no directory component). {@code w}
-     * and {@code h} must match the size the game actually uploads for that
-     * asset exactly, or the native side logs a mismatch and leaves the
-     * original texture in place; {@code rgba} must be {@code w*h*4}
-     * PREMULTIPLIED RGBA8888 bytes, tightly packed (R,G,B,A per texel, the
-     * game's own upload order), matching how the game premultiplies its own
-     * PNGs before upload.
+     * Loads the whole disk-backed texture-replacement registry from a text
+     * index (see {@link com.kalenjohnson.chronoduo.OrigArtCache#refresh}):
+     * {@code indexPath} is "&lt;filesDir&gt;/orig_art_cache/index.txt", one
+     * line per sheet, "&lt;name&gt; &lt;w&gt; &lt;h&gt; &lt;alphaFp hex16&gt;
+     * &lt;redFp hex16&gt;" (name is the asset basename, e.g. "c000_0.png" --
+     * no directory component -- matched against the asset path the game
+     * loads it with, or by content fingerprint when that bypasses the
+     * path-based hooks; fps are lowercase 16-hex-digit, e.g. via Java's
+     * {@code String.format("%016x", fp)}). {@code rgbaDir} is the directory
+     * holding "&lt;name&gt;.rgba" -- tightly packed PREMULTIPLIED RGBA8888
+     * bytes, {@code w*h*4} each, matching how the game premultiplies its own
+     * PNGs before upload -- which the native side reads lazily (fread) on a
+     * match inside hooked_glTexImage2D; nothing is held decoded in native RAM
+     * between matches.
      *
-     * {@code alphaFp}/{@code redFp} are content fingerprints of the game's
-     * ORIGINAL (unmodified) texture at this name -- a 64-bit FNV-1a hash over
-     * a 64x64 grid of alpha-channel samples (w/h mixed into the hash first),
-     * and a second FNV-1a hash over the same grid's red-channel samples as a
-     * tiebreaker. See AppActivity#fingerprint and gamestate.c's
-     * tex_fingerprint for the identical sampling formula both sides must
-     * agree on: for i,j in 0..63, x = (i*w)/64, y = (j*h)/64 (integer
-     * division), sampling pixel (x,y). These let hooked_glTexImage2D
-     * (gamestate.c) match uploads that bypass the path-based hooks entirely
-     * (e.g. character sheets loaded via a code path that never calls
-     * TextureCache::addImage or ResourceManager::createTexture) by comparing
-     * fingerprints of the live upload's pixels against this registered
-     * fingerprint of the original asset, instead of by asset path.
+     * The alpha/red fingerprints are a 64-bit FNV-1a hash over a 64x64 grid
+     * of alpha-channel samples (w/h mixed into the hash first) and a second
+     * FNV-1a hash over the same grid's red-channel samples as a tiebreaker --
+     * see OrigArtCache#fingerprint and gamestate.c's tex_fingerprint for the
+     * identical sampling formula both sides must agree on: for i,j in 0..63,
+     * x = (i*w)/64, y = (j*h)/64 (integer division), sampling pixel (x,y).
+     * These let hooked_glTexImage2D (gamestate.c) match uploads that bypass
+     * the path-based hooks entirely (e.g. character sheets loaded via a code
+     * path that never calls TextureCache::addImage or
+     * ResourceManager::createTexture) by comparing fingerprints of the live
+     * upload's pixels against a registered fingerprint of the original
+     * asset, instead of by asset path.
      *
-     * Installed via GOT-patched TextureCache::addImage /
-     * ResourceManager::createTexture hooks plus a content-fingerprint match
-     * inside the glTexImage2D hook (gamestate.c) that are always live once
-     * nativeSetPixelGraphics has run once, independent of the pixel-graphics
-     * on/off pref. Returns false on a bad size, an rgba array whose length
-     * doesn't match w*h*4, or an OOM/full-table failure.
+     * Replaces the registry wholesale, so this is idempotent and safe to
+     * call again (e.g. from the settings toggle). Called from a background
+     * thread at boot and from the pixel-graphics settings toggle; consulted
+     * from the GL thread inside hooked_glTexImage2D. Returns the number of
+     * entries loaded.
      */
-    public static native boolean nativeRegisterTextureReplacement(
-            String name, int w, int h, long alphaFp, long redFp, byte[] rgba);
+    public static native int nativeLoadTextureReplacementIndex(String indexPath, String rgbaDir);
 
-    /** Frees and clears every registered texture replacement. See gamestate.c. */
+    /** Clears the registered texture-replacement registry. See gamestate.c. */
     public static native void nativeClearTextureReplacements();
 
     /** Reads the persisted pixel-graphics preference. Default true (crisp/GL_NEAREST). */

@@ -263,6 +263,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         void requestRomImport();
         /** Pixel-graphics toggle changed: (un)register the original-sprite replacements. */
         void onPixelGraphicsChanged(boolean enabled);
+        /** "Build original sprites" tapped: kick off the background OrigArtRebuilder pass. */
+        void requestOrigArtBuild();
     }
     private SettingsHost settingsHost;
 
@@ -318,6 +320,35 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         this.importTotal = total;
         this.importStage = stage != null ? stage : "";
         this.importError = error;
+        invalidate();
+    }
+
+    // Original-sprites row, pushed from AppActivity via setOrigArtStatus as
+    // the background OrigArtRebuilder pass (see SettingsHost#requestOrigArtBuild)
+    // advances -- same idle/building/error shape as the DS-import row above,
+    // just without a "stage" string (rebuildAll's progress callback only ever
+    // reports a done/total sheet count). origArtError is non-null only after
+    // a failed build; cleared by the next attempt.
+    private boolean origArtBuilding;
+    private int origArtDone, origArtTotal;
+    private String origArtError;
+    // Hit box for the "Build original sprites" button -- left empty while
+    // building, same double-fire guard as importButtonHitBox.
+    private final RectF origArtButtonHitBox = new RectF();
+
+    /**
+     * Pushes live original-sprite-rebuild progress/result to the settings
+     * screen (see {@link #drawSettingsScreen}); called from AppActivity on
+     * the main thread as the background {@code OrigArtRebuilder.rebuildAll}
+     * pass advances. Mirrors {@link #setImportStatus}'s building/error/idle
+     * shape -- idle falls back to counting {@code *.png} files under
+     * {@code <filesDir>/orig_art}, see {@link #countOrigArtSheets}.
+     */
+    public void setOrigArtStatus(boolean building, int done, int total, String error) {
+        this.origArtBuilding = building;
+        this.origArtDone = done;
+        this.origArtTotal = total;
+        this.origArtError = error;
         invalidate();
     }
 
@@ -410,6 +441,11 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 GameState.setPixelGraphicsPref(getContext(), pixelGraphicsOn);
                 if (settingsHost != null) settingsHost.onPixelGraphicsChanged(pixelGraphicsOn);
                 invalidate();
+                return true;
+            }
+            if (!origArtBuilding && !origArtButtonHitBox.isEmpty()
+                    && origArtButtonHitBox.contains(event.getX(), event.getY())) {
+                if (settingsHost != null) settingsHost.requestOrigArtBuild();
                 return true;
             }
             if (!settingsBackHitBox.isEmpty()
@@ -1873,13 +1909,31 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         return n > 0 ? (n + " maps") : "not imported";
     }
 
+    /** Counts {@code *.png} files directly under {@code <filesDir>/orig_art} for the settings screen's "Original sprites" status row -- see {@link #drawSettingsScreen}. Mirrors {@link #countDsMaps}; this is the same directory {@link org.cocos2dx.cpp.AppActivity}'s OrigArtRebuilder writes into and scanOrigArtReplacements() scans. */
+    private int countOrigArtSheets() {
+        File dir = new File(getContext().getFilesDir(), "orig_art");
+        File[] files = dir.listFiles((d, name) -> name.endsWith(".png"));
+        return files != null ? files.length : 0;
+    }
+
+    /** Builds the "Original sprites: ..." status line's value half -- mirrors {@link #importStatusText}'s building/error/idle shape (see {@link #setOrigArtStatus}). */
+    private String origArtStatusText() {
+        if (origArtBuilding) {
+            return "building... " + origArtDone + "/" + origArtTotal;
+        }
+        if (origArtError != null) return "error: " + origArtError;
+        int n = countOrigArtSheets();
+        return n > 0 ? (n + " sheets") : "not built";
+    }
+
     /**
      * The settings screen: same parchment chrome as the normal panel (title,
-     * "DS maps: <status>" row, a short explanatory line, an "Import DS
-     * ROM..." button that's disabled -- no hit box -- while {@link
-     * #importing}, and a "Back" button that returns to the normal panel).
-     * Drawn instead of {@link #drawContent}/the status boxes/gold-time
-     * corners whenever {@link #settingsMode} is true -- see {@link #onDraw}.
+     * "DS maps: <status>" row + import button, "Pixel graphics: On/Off"
+     * button, "Original sprites: <status>" row + "Build original sprites"
+     * button -- disabled, no hit box, while {@link #origArtBuilding} -- and a
+     * "Back" button that returns to the normal panel). Drawn instead of
+     * {@link #drawContent}/the status boxes/gold-time corners whenever
+     * {@link #settingsMode} is true -- see {@link #onDraw}.
      */
     private void drawSettingsScreen(Canvas c) {
         int w = getWidth(), h = getHeight();
@@ -1890,21 +1944,33 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         c.save();
         c.clipPath(tornPaper);
 
-        setText(h * 0.06f, INK, true, Paint.Align.CENTER, false);
+        setText(h * 0.055f, INK, true, Paint.Align.CENTER, false);
         text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
-        c.drawText("Settings", parchment.centerX(), parchment.top + h * 0.11f, text);
+        c.drawText("Settings", parchment.centerX(), parchment.top + h * 0.09f, text);
 
-        setText(h * 0.04f, INK, false, Paint.Align.LEFT, false);
+        setText(h * 0.032f, INK, false, Paint.Align.LEFT, false);
         text.setTypeface(Typeface.MONOSPACE);
         c.drawText("DS maps: " + importStatusText(), parchment.left + w * 0.06f,
-                parchment.top + h * 0.2f, text);
+                parchment.top + h * 0.155f, text);
 
-        setText(h * 0.026f, Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK)),
+        setText(h * 0.022f, Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK)),
                 false, Paint.Align.LEFT, false);
         c.drawText("Room maps are available if you can provide the",
-                parchment.left + w * 0.06f, parchment.top + h * 0.275f, text);
+                parchment.left + w * 0.06f, parchment.top + h * 0.185f, text);
         c.drawText("Chrono Trigger DS ROM (.nds or .zip).",
-                parchment.left + w * 0.06f, parchment.top + h * 0.31f, text);
+                parchment.left + w * 0.06f, parchment.top + h * 0.212f, text);
+
+        setText(h * 0.032f, INK, false, Paint.Align.LEFT, false);
+        text.setTypeface(Typeface.MONOSPACE);
+        c.drawText("Original sprites: " + origArtStatusText(), parchment.left + w * 0.06f,
+                parchment.top + h * 0.462f, text);
+
+        setText(h * 0.022f, Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK)),
+                false, Paint.Align.LEFT, false);
+        c.drawText("Rebuilds the character sprites from the game's own",
+                parchment.left + w * 0.06f, parchment.top + h * 0.488f, text);
+        c.drawText("original pixel art. Only applies when Pixel graphics is On.",
+                parchment.left + w * 0.06f, parchment.top + h * 0.514f, text);
 
         c.restore();
         drawParchmentOverlay(c, parchment);
@@ -1912,9 +1978,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         Bitmap winTex = ChronoAssets.getWindowTex();
 
         float btnW = parchment.width() * 0.6f;
-        float btnH = h * 0.09f;
-        RectF importBtn = new RectF(parchment.centerX() - btnW / 2f, parchment.top + h * 0.4f,
-                parchment.centerX() + btnW / 2f, parchment.top + h * 0.4f + btnH);
+        float btnH = h * 0.075f;
+        RectF importBtn = new RectF(parchment.centerX() - btnW / 2f, parchment.top + h * 0.245f,
+                parchment.centerX() + btnW / 2f, parchment.top + h * 0.245f + btnH);
         drawCommandButton(c, importBtn, "Import DS ROM...", winTex, false);
         if (importing) {
             fill.setShader(null);
@@ -1926,21 +1992,35 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         }
 
         float pixelBtnW = parchment.width() * 0.6f;
-        float pixelBtnH = h * 0.08f;
-        RectF pixelBtn = new RectF(parchment.centerX() - pixelBtnW / 2f, parchment.top + h * 0.54f,
-                parchment.centerX() + pixelBtnW / 2f, parchment.top + h * 0.54f + pixelBtnH);
+        float pixelBtnH = h * 0.065f;
+        RectF pixelBtn = new RectF(parchment.centerX() - pixelBtnW / 2f, parchment.top + h * 0.35f,
+                parchment.centerX() + pixelBtnW / 2f, parchment.top + h * 0.35f + pixelBtnH);
         drawCommandButton(c, pixelBtn, "Pixel graphics: " + (pixelGraphicsOn ? "On" : "Off"), winTex, false);
         pixelGraphicsHitBox.set(pixelBtn);
 
-        setText(h * 0.022f, Color.argb(190, Color.red(INK), Color.green(INK), Color.blue(INK)),
+        setText(h * 0.018f, Color.argb(190, Color.red(INK), Color.green(INK), Color.blue(INK)),
                 false, Paint.Align.CENTER, false);
         c.drawText("Takes full effect after restarting the game",
-                parchment.centerX(), pixelBtn.bottom + h * 0.032f, text);
+                parchment.centerX(), pixelBtn.bottom + h * 0.024f, text);
+
+        float origArtBtnW = parchment.width() * 0.6f;
+        float origArtBtnH = h * 0.065f;
+        RectF origArtBtn = new RectF(parchment.centerX() - origArtBtnW / 2f, parchment.top + h * 0.545f,
+                parchment.centerX() + origArtBtnW / 2f, parchment.top + h * 0.545f + origArtBtnH);
+        drawCommandButton(c, origArtBtn, "Build original sprites", winTex, false);
+        if (origArtBuilding) {
+            fill.setShader(null);
+            fill.setColor(Color.argb(150, 0, 0, 0));
+            c.drawRect(origArtBtn, fill);
+            origArtButtonHitBox.setEmpty();
+        } else {
+            origArtButtonHitBox.set(origArtBtn);
+        }
 
         float backW = parchment.width() * 0.4f;
-        float backH = h * 0.08f;
-        RectF backBtn = new RectF(parchment.centerX() - backW / 2f, parchment.bottom - h * 0.1f,
-                parchment.centerX() + backW / 2f, parchment.bottom - h * 0.1f + backH);
+        float backH = h * 0.065f;
+        RectF backBtn = new RectF(parchment.centerX() - backW / 2f, parchment.bottom - h * 0.09f,
+                parchment.centerX() + backW / 2f, parchment.bottom - h * 0.09f + backH);
         drawCommandButton(c, backBtn, "Back", winTex, false);
         settingsBackHitBox.set(backBtn);
     }
