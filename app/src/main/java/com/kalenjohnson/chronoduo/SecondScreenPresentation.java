@@ -18,6 +18,9 @@ public final class SecondScreenPresentation extends Presentation {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable poll = new Runnable() {
         @Override public void run() {
+            if (GameState.isAttached()) {
+                org.cocos2dx.lib.Cocos2dxHelper.runOnGLThread(GameState::nativeUpdateMapName);
+            }
             PartySnapshot snap = PartySnapshot.read();
             if (last == null || !snap.sameAs(last)) {
                 last = snap;

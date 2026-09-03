@@ -25,6 +25,9 @@ public final class GameState {
     public static native void nativeSceneDump(int maxDepth);      // GL thread only
     public static native int nativeSetVisibleByPattern(String pattern, boolean visible); // GL thread only
 
+    public static native void nativeUpdateMapName();              // GL thread only
+    public static native String nativeGetMapName();
+
     /** Scene-graph node type/name patterns hidden by the "clean UI" tick. */
     public static final String[] HIDDEN_UI_PATTERNS = {"FieldMenu", "WorldMenu"};
 

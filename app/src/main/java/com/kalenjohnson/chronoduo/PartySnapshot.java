@@ -27,6 +27,7 @@ public final class PartySnapshot {
     public final List<Member> members = new ArrayList<>();
     public int gold;        // cSfcWork+0x1a04 (u32), found by differential dump
     public int playSeconds; // cSfcWork+0x1a10 (u32), monotonically rising
+    public String mapName = ""; // cached from ChronoCanvas::getFieldMapName()
 
     private static int u32(byte[] b, int off) {
         if (b == null || off + 4 > b.length) return 0;
@@ -40,6 +41,8 @@ public final class PartySnapshot {
         byte[] misc = GameState.nativeReadSfc(0x1a00, 0x20);
         snap.gold = u32(misc, 0x04);
         snap.playSeconds = u32(misc, 0x10);
+        String mn = GameState.nativeGetMapName();
+        snap.mapName = mn != null ? mn : "";
         for (int i = 0; i < 7; i++) {
             byte[] b = GameState.nativeReadSfc(CHARA_BASE + i * CHARA_STRIDE, 0x120);
             if (b == null) break;
@@ -75,7 +78,8 @@ public final class PartySnapshot {
 
     public boolean sameAs(PartySnapshot o) {
         if (o == null || o.members.size() != members.size()) return false;
-        if (gold != o.gold || playSeconds != o.playSeconds) return false;
+        if (gold != o.gold || playSeconds != o.playSeconds
+                || !mapName.equals(o.mapName)) return false;
         for (int i = 0; i < members.size(); i++) {
             Member a = members.get(i), b = o.members.get(i);
             if (!a.name.equals(b.name) || a.level != b.level

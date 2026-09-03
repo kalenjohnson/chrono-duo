@@ -32,6 +32,11 @@ static void *(*p_node_getChildren)(void *);  // returns cocos2d::Vector<Node*>&
 static int   (*p_node_isVisible)(void *);
 static void  (*p_node_setVisible)(void *, int);
 
+// std::string returned by value (sret) from ChronoCanvas::getFieldMapName()
+typedef struct { uint8_t raw[24]; } CppStr;
+static CppStr (*p_getFieldMapName)(void *);
+static char g_map_name[64];
+
 // Asm::GetAddrY8 reads the memory base from an unnamed static at 0xbeeba8
 // (bank $7E maps to +0x20000, bank $7F to +0x10000 within it).
 #define ASM_MEM_GLOBAL 0xbeeba8
@@ -60,6 +65,7 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeAttach(JNIEnv *env, jclass cls) 
             g_asm_mem_slot = (uint8_t **)((uint8_t *)info.dli_fbase + ASM_MEM_GLOBAL);
         }
     }
+    p_getFieldMapName = (CppStr (*)(void *)) dlsym(h, "_ZNK12ChronoCanvas15getFieldMapNameEv");
     p_dir_getInstance = (void *(*)(void)) dlsym(h, "_ZN7cocos2d8Director11getInstanceEv");
     p_node_getName = (void *(*)(void *)) dlsym(h, "_ZNK7cocos2d4Node7getNameEv");
     p_node_getChildren = (void *(*)(void *)) dlsym(h, "_ZN7cocos2d4Node11getChildrenEv");
@@ -166,6 +172,40 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeScan(JNIEnv *env, jclass cls) {
     if (g_asm_mem_slot && plausible_ptr(*g_asm_mem_slot)) {
         scan_region("asmMem", *g_asm_mem_slot, 0x30000);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Location name: ChronoCanvas::getFieldMapName() returns std::string by value
+// (sret). Must run on the GL thread; result cached for the UI poller.
+// ---------------------------------------------------------------------------
+
+JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeUpdateMapName(JNIEnv *env, jclass cls) {
+    if (!p_getFieldMapName || !p_getInstance) return;
+    void *canvas = p_getInstance();
+    if (!canvas) return;
+    CppStr s = p_getFieldMapName(canvas);
+    uint8_t *b = s.raw;
+    if ((b[0] & 1) == 0) {
+        int len = b[0] >> 1;
+        if (len > 22) len = 22;
+        memcpy(g_map_name, b + 1, len);
+        g_map_name[len] = 0;
+    } else {
+        uint64_t len; char *data;
+        memcpy(&len, b + 8, 8);
+        memcpy(&data, b + 16, 8);
+        if (len < sizeof(g_map_name) && data) {
+            memcpy(g_map_name, data, len);
+            g_map_name[len] = 0;
+        }
+        // long-mode heap buffer intentionally not freed (never hit for CT names)
+    }
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetMapName(JNIEnv *env, jclass cls) {
+    return (*env)->NewStringUTF(env, g_map_name);
 }
 
 // ---------------------------------------------------------------------------
