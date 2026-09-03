@@ -191,14 +191,13 @@ Verified live on device (values matched Crono/Marle/Lucca/… canonical stats):
   lines, 0-based line index == monster id (146 = "Gato"). Loaded at runtime
   via ChronoResources; other locales under Localize/<lang>/.
 - **Still open:** ATB gauge field (candidates +0x18/+0x2d u8, inconclusive —
-  needs fast-sampled single-battle capture), battle MP offsets, status-effect
-  flags, hiding the top-screen battle UI + touch-forwarded commands (the
-  Battle node's MenuItemToggles are located; the WorldMenu setVisible-not-
-  sticking mystery likely applies), enemy HP for the panel when the game
-  hides bars (we show them anyway — by design).
+  needs fast-sampled single-battle capture), status-effect flags, enemy HP
+  for the panel when the game hides bars (we show them anyway — by design).
   For gold: diff before/after buying something. For play time: two dumps with
   everything else idle. Battle info: `SfcBattleWork` / `SceneBattle::getwork8`
   (reads a buffer pointer at SceneBattle+0x8) is the entry point.
+  **SOLVED:** hiding the top-screen battle UI + panel-owned touch-forwarded
+  commands — see "Battle UI hiding, battle MP, list submenus — RE record (2026-09-04)".
 
 ## Phase 3 leads (game state → second screen)
 
@@ -217,3 +216,50 @@ Verified live on device (values matched Crono/Marle/Lucca/… canonical stats):
 
 - `ct_nx` — Switch port of this exact binary; loader blueprint + JNI catalogue
 - `cocos2d-x` — engine source at the game's exact version (sparse checkout)
+
+## Battle UI hiding, battle MP, list submenus — RE record (2026-09-04)
+
+**Battle node direct children (8 total).** Scene dump (tag at Node+0x1a0):
+- Index 0: `N7cocos2d4MenuE` (Menu, 30 children) — command buttons (Attack/Tech/Item toggles).
+- Index 1: `N7cocos2d13RenderTextureE` (1 child) — status window cell layer (frame, portraits, HP/MP bars, ATB).
+- Index 2: `nsBattleListMenu14BattleTechMenuE` (1 child) — tech submenu, not hidden.
+- Index 3: `nsBattleListMenu14BattleItemMenuE` (1 child) — item submenu, not hidden.
+- Index 4: `N7cocos2d4NodeE` (7 children) — labels (HP/MP values, Attack/Tech/Item text).
+- Indices 5–7: additional nodes (draw node, render textures).
+**Hide set:** indices 0, 1, 4–7; indices 2, 3 stay visible (lists not yet mirrored to panel).
+**Verified:** damage numbers and target cursor render on top screen; panel shows clean battle state.
+
+**Status window architecture.** `BattleMenu` (the 2D UI host node) has no separate RTTI class — status info draws via internal methods `drawStatusWindow`, `chrTab`, `drawActiveBar` into the RenderTexture cell layer (index 1). Offsets into `SceneBattle::update` reveal it's a single composite render step, not a scene node, so reading/hiding requires hitting the RenderTexture child, not a separate node class.
+
+**Battle actor MP offsets.** SceneBattle+0x68 = actor array (0x80-byte stride). Field order (all u8 unless noted):
+- +0x07: **curMP** (live per tech cast; Crono=0, Marle=7 in Gato fight, frozen across snapshots).
+- +0x09: **maxMP** (Crono=14, Marle=18; Gato fight confirmed via 8 sequential snapshots; byte +0x08 always 0x00, not shifted field).
+**Confidence: high** — exact dual-actor match, all 8 seqs; corroborated by frozen sfcwork.bin ground truth.
+
+**BattleListMenuBase member offsets** (`BattleTechMenu`/`BattleItemMenu` subclasses). Derived from disasm + live calls:
+
+| Offset | Size | Field | Role |
+|---|---|---|---|
+| 0x320 | 8 | `_rootNode` | cocos2d::Node* (scene graph anchor). |
+| 0x330 | 8 | `_scrollView` | cocos2d::ui::ScrollView* (holds row buttons). |
+| 0x340 | 8 | `_inputManager` | nsMenu::nsInput::Manager* (state & current index). |
+| 0x370 | 8 | `_eventCallback` | `std::function<void(int,EventType)>` (selection callback). |
+| 0x380 | 1 | `_isOpen` | bool (set in `open()`, cleared in `close()`). |
+| 0x388–0x390 | 8 ea | data vector | begin/end pointers; 12-byte row elements. |
+| 0x398 | 8 | data capacity | vector cap. |
+| 0x3a0–0x3ec | 80 | cursor cache | int32[20], per-category cursor, init'd -1 in `listupTechs`. |
+| 0x3c8 | 4 | category idx | actor/category arg from `open(actor, category)`. |
+
+Row element struct (12 bytes, **layout differs per subclass**):
+- **TechRow:** id (4B) + param (4B) + usable (1B u8) + pad (3B).
+- **ItemRow:** id (4B) + usable (1B u8) + pad (3B) + count (4B).
+Usable byte read by `canSelect(i)` matches storage offset exactly.
+**Confirmation:** `listupTechs`/`listupItems` store writes + `canSelect` reads, high confidence.
+
+Entry point: `onButtonPressed(int rowIdx)` (BattleTechMenu 0x6e44b4, 520B). Reads current index from input manager, validates against 20-entry cursor cache, calls `vtable[0x658](newIndex)` to commit, fires callback if set.
+
+**Dev hooks.** Broadcast intents:
+- `SCENE_DUMP`: prints node geometry (pos, size, anchor, tag, child count, world-center per Node+0x1a0 tag offset). Node cap raised to 2000.
+- `BATTLE_HIDE_MASK --ei mask N`: blanks Battle's direct children by bitmask (bit i hides child i). Live what-draws-what debug.
+
+**Command selection model (shipped).** Panel owns d-pad left/right + A while command menu is open (`_isOpen` byte check at this+0x380). Left/right update panel index (no game cursor sync); A injects touch on highlighted command + swallows key-up so game sees no keypress. Outside menu, all controller input passes through. On-panel direct tap updates index and fires selection callback.
