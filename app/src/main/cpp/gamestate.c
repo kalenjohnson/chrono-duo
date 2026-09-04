@@ -633,7 +633,10 @@ static void pixel_decimate_log_once(GLsizei width, GLsizei height) {
 //
 // GOT-patches cocos2d::TextureCache::addImage(const std::string&) and
 // ctr::ResourceManager::createTexture(const std::string&) -- both take just
-// an asset path (self, const std::string*) and both have R_AARCH64_JUMP_SLOT
+// an asset path (but with DIFFERENT signatures: addImage is a member, taking
+// (this, const std::string*), while createTexture is static, taking
+// (const std::string*) alone -- see the note on p_real_createTexture below)
+// and both have R_AARCH64_JUMP_SLOT
 // relocations in libchrono.so (verified with `readelf -r -W`; addImage's
 // other overload and createTexture's Image*-taking overload also have slots
 // but don't carry a filename by themselves, so they're not hooked). Texture
@@ -676,7 +679,16 @@ static uintptr_t  g_pixel_createtex_orig;
 static int        g_pixel_createtex_orig_saved;
 
 static void *(*p_real_addImage)(void *self, const void *stdstring);
-static void *(*p_real_createTexture)(void *self, const void *stdstring);
+// NOTE the asymmetry, verified in the disassembly and NOT cosmetic:
+// TextureCache::addImage @ 0x93e518 is an ordinary member (x0 = this,
+// x1 = the std::string), but ctr::ResourceManager::createTexture @ 0x5be3bc
+// is STATIC -- x0 IS the std::string (0x5be3d4 `mov x19, x0`, then 0x5be3ec
+// `mov x0, x19` straight into the two-arg overload). Declaring it with a
+// leading `self` and reading the string from x1 read whatever junk happened
+// to be in x1: g_pending_tex_path then stayed EMPTY for every createTexture
+// load, which is exactly why the field chip sheets' path-keyed replacement
+// never fired and why the "no asset path in flight" alarm did.
+static void *(*p_real_createTexture)(const void *stdstring);
 
 // Basename (e.g. "c000_0.png") and full path of the asset currently being
 // loaded, valid only for the duration of the addImage/createTexture call
@@ -708,12 +720,174 @@ static void *hooked_addImage(void *self, const void *stdstring) {
     return ret;
 }
 
-static void *hooked_createTexture(void *self, const void *stdstring) {
+static void *hooked_createTexture(const void *stdstring) {
     char buf[256];
     pixel_set_pending_tex_path(sso_cstr((void *) stdstring, buf, sizeof(buf)));
-    void *ret = p_real_createTexture ? p_real_createTexture(self, stdstring) : NULL;
+    void *ret = p_real_createTexture ? p_real_createTexture(stdstring) : NULL;
     pixel_clear_pending_tex_path();
     return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Pixel graphics, mechanism 7: FILE-LEVEL asset substitution at the game's own
+// archive reader -- the mechanism the field chip sheets actually need.
+//
+// Mechanism 5 substitutes pixels at glTexImage2D, keyed on the asset path
+// parked by the addImage/createTexture hooks. For the field `mapchip` sheets
+// that never fired -- no `replaced mapchip_` line ever appeared on device,
+// while the one-shot "512x512 upload with no asset path in flight" alarm did.
+// The cause turned out to be OUR bug, not the game's: createTexture is a
+// STATIC member, so the path was being read from the wrong register and
+// g_pending_tex_path stayed empty (see the note on p_real_createTexture
+// above). That is fixed, and the GL swap would very likely work now --
+// MapTable::drawFrontChip @ 0x56bdac samples the uploaded Texture2D directly.
+//
+// The chip sheets are still moved one layer lower, before the PNG is ever
+// decoded, because that layer is strictly more general and has far fewer ways
+// to be silently inert: no fingerprint, no .rgbz, no agreement with the upload
+// on size or pixel format, every consumer of the decoded image covered, and
+// the same hook available for .dat/.bin assets later:
+//
+//   ctr::ResourceManager::getData(const std::string& path, int* outLen)
+//       body 0x5be02c   PLT stub 0xb42b80   GOT slot base+0xbcd038
+//
+// is the single choke point every asset read in this game passes through:
+//
+//   * it is a *static* member -- x0 is the std::string*, x1 the out-length --
+//     and returns the decompressed bytes in x0;
+//   * it first tries DetchmanResource::LoadFileEntry (the ARC1 archive in
+//     resources.bin: XOR-descramble with the LCG seed
+//     `(base + fileOffset) * 0x41c64e6d + 0x3039`, 4-byte big-endian raw size,
+//     then ZipUtils::inflateMemory), and falls back to
+//     getMainBundlePath() + path -> ResourceManager::readFile ->
+//     FileUtils::getDataFromFile. Hooking getData covers BOTH; hooking
+//     LoadFileEntry would miss the filesystem fallback;
+//   * ResourceData::ResourceData(const std::string&) @ 0x5bdfc4 (149 call
+//     sites -- every .dat/.bin read in the game) is a thin wrapper over it,
+//     and ctr::ResourceManager::createTexture(path) @ 0x5be3bc reaches it via
+//     createTexture(path, Image*) @ 0x5be450, which does
+//     `getData -> Image::initWithImageData(bytes, len) -> free(bytes)`;
+//   * `grep -cE "bl[[:space:]]+0x5be02c\b"` over the full disassembly is 0 --
+//     there is no direct-BL bypass, every call goes through the one PLT stub,
+//     so pixel_find_jump_slot's GOT patch sees all of them;
+//   * OWNERSHIP: the returned buffer is malloc'd (ZipUtils::inflateMemory uses
+//     malloc/realloc) and freed by the caller with plain free() --
+//     ResourceData::~ResourceData @ 0x5be118 is `ldr x0,[x0]; b free@plt`, and
+//     createTexture does `bl initWithImageData; mov x0,x20; bl free@plt` at
+//     0x5be494. A substitute buffer must therefore come from malloc(), never
+//     new[] and never a shared scratch buffer.
+//
+// The registry is a flat list of (basename -> absolute replacement path)
+// registered from Java by nativeRegisterFileSubstitutions (the ~504 rebuilt
+// `<filesDir>/orig_art/mapchip_<a>_<b>_<page>.png` pages). On a basename hit
+// the hook reads that file whole into a fresh malloc() and returns it in place
+// of the archive entry, so the game decodes OUR PNG -- which fixes every
+// consumer at once (GL upload, sprite draw, CPU blit) instead of just the
+// upload. The bytes are served exactly as they sit on disk: this is UPSTREAM
+// of cocos2d-x's premultiply step, unlike the .rgbz files mechanism 5 uploads,
+// which are premultiplied on purpose. Never premultiply here.
+//
+// Gated on the pixel-graphics pref (g_file_subst_enabled, set by
+// nativeSetPixelGraphics) -- with it off, every call forwards untouched.
+// ---------------------------------------------------------------------------
+
+#define PIXEL_SYM_GETDATA \
+    "_ZN3ctr15ResourceManager7getDataERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEEPi"
+
+static uintptr_t *g_pixel_getdata_slot;
+static uintptr_t  g_pixel_getdata_orig;
+static int        g_pixel_getdata_orig_saved;
+static unsigned char *(*p_real_getData)(const void *stdstring, int *out_len);
+
+#define FILE_SUBST_MAX      1024
+#define FILE_SUBST_NAME_MAX 40
+#define FILE_SUBST_PATH_MAX 300
+typedef struct {
+    char name[FILE_SUBST_NAME_MAX]; // asset basename, e.g. "mapchip_0_117_0.png"
+    char path[FILE_SUBST_PATH_MAX]; // absolute path of the replacement file
+    int  logged;                    // one "substituted" log line per entry
+} file_subst_t;
+static file_subst_t    g_file_subst[FILE_SUBST_MAX];
+static int             g_file_subst_count;
+static pthread_mutex_t g_file_subst_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int             g_file_subst_enabled;   // pixel-graphics pref
+static uint32_t        g_file_subst_hits;      // reads actually substituted
+static uint32_t        g_file_subst_misses;    // matched a name but the file failed to load
+
+// Reads `path` whole into a fresh malloc() buffer (the ownership contract
+// getData's callers expect -- they free() it). Returns NULL on any failure,
+// leaving *out_len untouched.
+static unsigned char *file_subst_read_all(const char *path, int *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    unsigned char *buf = NULL;
+    long size = 0;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        size = ftell(f);
+        if (size > 0 && size < 64 * 1024 * 1024 && fseek(f, 0, SEEK_SET) == 0) {
+            buf = (unsigned char *) malloc((size_t) size);
+            if (buf && fread(buf, 1, (size_t) size, f) != (size_t) size) {
+                free(buf);
+                buf = NULL;
+            }
+        }
+    }
+    fclose(f);
+    if (buf) *out_len = (int) size;
+    return buf;
+}
+
+static unsigned char *hooked_getData(const void *stdstring, int *out_len) {
+    if (g_file_subst_enabled && g_file_subst_count > 0 && stdstring && out_len) {
+        char sbuf[512];
+        const char *full = sso_cstr((void *) stdstring, sbuf, sizeof(sbuf));
+        if (full && full[0]) {
+            const char *slash = strrchr(full, '/');
+            const char *base = slash ? slash + 1 : full;
+            // Everything needed from the registry -- the path, and whether
+            // this entry has logged yet -- is copied out under the mutex, and
+            // the `logged` flag is claimed there too, so nothing dereferences
+            // a registry slot afterwards: a concurrent re-registration (the
+            // settings toggle) rewrites the table wholesale and would
+            // otherwise invalidate a held pointer.
+            char path[FILE_SUBST_PATH_MAX];
+            int hit = 0, want_log = 0;
+            path[0] = 0;
+            pthread_mutex_lock(&g_file_subst_mutex);
+            for (int i = 0; i < g_file_subst_count; i++) {
+                if (strcmp(g_file_subst[i].name, base) == 0) {
+                    hit = 1;
+                    want_log = !g_file_subst[i].logged;
+                    g_file_subst[i].logged = 1;
+                    strncpy(path, g_file_subst[i].path, sizeof(path) - 1);
+                    path[sizeof(path) - 1] = 0;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_file_subst_mutex);
+            if (hit) {
+                // File IO deliberately outside the registry mutex: getData runs
+                // on whichever thread is loading (not necessarily the GL one),
+                // and holding a lock across a read would serialise them.
+                int len = 0;
+                unsigned char *bytes = file_subst_read_all(path, &len);
+                if (bytes) {
+                    g_file_subst_hits++;
+                    if (want_log) {
+                        LOGI("pixel-gfx: substituted %s (%d bytes) from %s", base, len, path);
+                    }
+                    *out_len = len;
+                    return bytes;
+                }
+                g_file_subst_misses++;
+                if (want_log) {
+                    LOGE("pixel-gfx: substitution %s: cannot read %s (errno=%d) -- using original",
+                         base, path, errno);
+                }
+            }
+        }
+    }
+    return p_real_getData ? p_real_getData(stdstring, out_len) : NULL;
 }
 
 // Replacement registry: up to TEX_REPL_MAX disk-backed entries, keyed by the
@@ -884,11 +1058,17 @@ static int pixel_repl_load_rgbz(const char *path, int expect_w, int expect_h,
 // This started as the intended fix for the soft-looking FIELD GROUND layer.
 // Static RE says there is nothing there to fix, and that is the finding:
 //
-//   * the field background is NOT the smoothed mapchip sheets. MapTable::
-//     Expansion @ 0x568af0 / ExpansionExt @ 0x569c28 CPU-composite a
-//     power-of-two-padded 1x RGBA8888 buffer whose RED channel is an 8-bit
-//     palette index (MapTable::writeChip @ 0x56b5f0), hand it to
-//     Texture2D::initWithData @ 0x568e78, and draw it through
+//   * [RETRACTED 2026-09-04 -- see NOTES.md "RESOLVED" and REPORT.md 8a. The
+//     field background IS the smoothed mapchip sheets: MapTable::Expansion @
+//     0x568af0 is never called (no PLT stub, no JUMP_SLOT), and the ground is
+//     blitted one 16x16-point sprite per metatile from the sheet Texture2D at
+//     MapTable+0x98 by MapTable::drawFrontChip @ 0x56bdac. The filtering
+//     evidence in the rest of this block still stands; only this bullet's
+//     conclusion about which texture reaches the screen was wrong.]
+//     ExpansionExt @ 0x569c28 CPU-composites a power-of-two-padded 1x
+//     RGBA8888 buffer whose RED channel is an 8-bit palette index
+//     (MapTable::writeChip @ 0x56b5f0), hands it to Texture2D::initWithData
+//     @ 0x568e78, and it is drawn through
 //     Shaders/ShaderDrawPalettedTexture.fsh (one index tap + one palette tap);
 //   * immediately after that initWithData, 0x568e84-0x568f00 loads the 16-byte
 //     constant at 0x374f60 -- {0x2600, 0x2600, 0x812F, 0x812F} =
@@ -907,8 +1087,9 @@ static int pixel_repl_load_rgbz(const char *path, int expect_w, int expect_h,
 //     so mechanism 2's GOT patch really did see every one of those calls.
 //
 // Which is exactly why mechanisms 1 and 2 "changed nothing": they were
-// no-ops on this path. The residual ground softness is GEOMETRIC, not
-// filtering -- AppDelegate::applicationDidFinishLaunching @ 0x6417f0 picks a
+// no-ops on this path. There is a further geometric effect on top (which is
+// NOT the ground blur -- that is the sheets' baked-in smoothing, see the
+// retraction above): AppDelegate::applicationDidFinishLaunching @ 0x6417f0 picks a
 // 568x320-point design resolution (the Size constant written at 0x641c34)
 // with Director::setContentScaleFactor(2.0f) @ 0x641afc and NO_BORDER, so on
 // a 1920x1080 panel one source texel covers 1920/568 = 3.380 screen pixels.
@@ -984,7 +1165,10 @@ static void pixel_probe_filter_after_upload(GLenum target, GLint level, GLsizei 
             return;
         }
     }
-    if (g_pixel_nearest_seen_count < PIXEL_NEAREST_SEEN_MAX) {
+    // Table full: stop logging entirely (the palette textures are recreated
+    // every frame and would otherwise flood logcat's 256 KiB ring buffer).
+    if (g_pixel_nearest_seen_count >= PIXEL_NEAREST_SEEN_MAX) return;
+    {
         g_pixel_nearest_seen[g_pixel_nearest_seen_count].width = width;
         g_pixel_nearest_seen[g_pixel_nearest_seen_count].height = height;
         g_pixel_nearest_seen[g_pixel_nearest_seen_count].has_pixels = has_pixels;
@@ -1019,23 +1203,23 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
                 break;
             }
         }
-        if (!seen) {
-            if (g_pixel_teximg_seen_count < PIXEL_TEXIMG_SEEN_MAX) {
-                g_pixel_teximg_seen[g_pixel_teximg_seen_count].width = width;
-                g_pixel_teximg_seen[g_pixel_teximg_seen_count].height = height;
-                g_pixel_teximg_seen[g_pixel_teximg_seen_count].internalformat =
-                    (GLenum) internalformat;
-                g_pixel_teximg_seen_count++;
-            }
+        if (!seen && g_pixel_teximg_seen_count < PIXEL_TEXIMG_SEEN_MAX) {
+            g_pixel_teximg_seen[g_pixel_teximg_seen_count].width = width;
+            g_pixel_teximg_seen[g_pixel_teximg_seen_count].height = height;
+            g_pixel_teximg_seen[g_pixel_teximg_seen_count].internalformat =
+                (GLenum) internalformat;
+            g_pixel_teximg_seen_count++;
             LOGI("pixel-gfx: texImage2D %dx%d fmt=0x%x type=0x%x level=%d",
                  width, height, (unsigned int) internalformat, type, level);
         }
     }
     if (g_pixel_teximage_calls % 200 == 0) {
         LOGI("pixel-gfx: stats texImage2D_calls=%u texParam_rewrites=%u nearest_probed=%u "
-             "nearest_was_linear=%u",
+             "nearest_was_linear=%u file_subst_registered=%d file_subst_hits=%u "
+             "file_subst_misses=%u",
              g_pixel_teximage_calls, g_pixel_texparami_rewrites, g_pixel_nearest_probed,
-             g_pixel_nearest_was_linear);
+             g_pixel_nearest_was_linear, g_file_subst_count, g_file_subst_hits,
+             g_file_subst_misses);
     }
 
     // Texture replacement (mechanism 5): if a registered replacement matches
@@ -1065,12 +1249,12 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
         if (!r) {
             int size_registered = 0;
             for (int i = 0; i < g_tex_repl_count; i++) {
-                // A path-only entry (both fingerprints zero -- see
-                // OrigArtCache#isPathKeyed) must never make an upload pay for
-                // a 4096-sample hash, and must never be a fingerprint
-                // candidate: the field chip sheets that use that keying have
-                // near-degenerate alpha masks (several are entirely
-                // transparent or entirely opaque) and would collide wildly.
+                // Defensive: an entry with both fingerprints zero can never
+                // be identified by content, so it must not make an upload pay
+                // for a 4096-sample hash. (Nothing writes such entries now --
+                // the field chip sheets that used to are substituted at the
+                // file level instead, mechanism 7 -- but a hand-edited
+                // index.txt could still produce one.)
                 if (g_tex_repl[i].alpha_fp == 0 && g_tex_repl[i].red_fp == 0) continue;
                 if (g_tex_repl[i].w == width && g_tex_repl[i].h == height) {
                     size_registered = 1;
@@ -1105,31 +1289,6 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
                             via_fingerprint = 1;
                             break;
                         }
-                    }
-                }
-            }
-        }
-
-        // Diagnostic, one-shot: a path-keyed entry (the field chip sheets --
-        // see OrigArtCache#isPathKeyed) can ONLY ever match via
-        // g_pending_tex_path. If an upload the size of a registered
-        // path-keyed entry arrives with no asset path in flight, the
-        // createTexture hook is probably not covering that load and the whole
-        // field-chip replacement is silently inert -- which has no other
-        // visible symptom. (An engine-generated texture that happens to be
-        // the same size would also trip this, hence "may".)
-        if (!r && generated) {
-            static int path_keyed_missed_logged;
-            if (!path_keyed_missed_logged) {
-                for (int i = 0; i < g_tex_repl_count; i++) {
-                    if (g_tex_repl[i].alpha_fp == 0 && g_tex_repl[i].red_fp == 0 &&
-                        g_tex_repl[i].w == width && g_tex_repl[i].h == height) {
-                        LOGE("pixel-gfx: %dx%d upload with no asset path in flight while "
-                             "path-keyed replacement %s is registered at that size -- the "
-                             "createTexture hook may not be covering this load",
-                             width, height, g_tex_repl[i].name);
-                        path_keyed_missed_logged = 1;
-                        break;
                     }
                 }
             }
@@ -1391,7 +1550,7 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetPixelGraphics(JNIEnv *env, jc
             pixel_patch_slot(g_pixel_addimage_slot, &g_pixel_addimage_orig,
                               &g_pixel_addimage_orig_saved, (uintptr_t) hooked_addImage, 1);
         }
-        p_real_createTexture = (void *(*)(void *, const void *)) dlsym(h, PIXEL_SYM_CREATETEXTURE);
+        p_real_createTexture = (void *(*)(const void *)) dlsym(h, PIXEL_SYM_CREATETEXTURE);
         if (!p_real_createTexture) {
             LOGI("pixel-gfx: symbol %s not found -- createTexture texture replacement unavailable",
                  PIXEL_SYM_CREATETEXTURE);
@@ -1400,8 +1559,25 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetPixelGraphics(JNIEnv *env, jc
             pixel_patch_slot(g_pixel_createtex_slot, &g_pixel_createtex_orig,
                               &g_pixel_createtex_orig_saved, (uintptr_t) hooked_createTexture, 1);
         }
+        // Mechanism 7: ctr::ResourceManager::getData -- the file-level asset
+        // read choke point (see its comment block above). Installed
+        // unconditionally like the two hooks above; whether it substitutes
+        // anything is decided by g_file_subst_enabled (set from `enable`
+        // below) plus a non-empty registry, so leaving it patched in with
+        // pixel graphics off costs one predictable branch per asset read.
+        p_real_getData = (unsigned char *(*)(const void *, int *)) dlsym(h, PIXEL_SYM_GETDATA);
+        if (!p_real_getData) {
+            LOGE("pixel-gfx: symbol %s not found -- file substitution unavailable",
+                 PIXEL_SYM_GETDATA);
+        } else {
+            g_pixel_getdata_slot = pixel_find_jump_slot(g_pixel_lib_base, PIXEL_SYM_GETDATA);
+            pixel_patch_slot(g_pixel_getdata_slot, &g_pixel_getdata_orig,
+                              &g_pixel_getdata_orig_saved, (uintptr_t) hooked_getData, 1);
+        }
         LOGI("pixel-gfx: texture-replacement hooks installed: addImage-slot=%p createTexture-slot=%p",
              (void *) g_pixel_addimage_slot, (void *) g_pixel_createtex_slot);
+        LOGI("pixel-gfx: file-substitution hook installed: getData-slot=%p (real=%p)",
+             (void *) g_pixel_getdata_slot, (void *) p_real_getData);
     }
 
     uintptr_t addr = (uintptr_t) g_pixel_got_slot;
@@ -1434,6 +1610,12 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetPixelGraphics(JNIEnv *env, jc
     // proves it live. Only a flag; the glTexImage2D hook that reads it is
     // installed unconditionally above.
     g_pixel_probe_filters = enable ? 1 : 0;
+
+    // Mechanism 7: file-level asset substitution (the field chip sheets).
+    // Only a flag; the getData hook that reads it is installed
+    // unconditionally above, so toggling the pref takes effect on the next
+    // asset read without re-patching anything.
+    g_file_subst_enabled = enable ? 1 : 0;
 
     pixel_patch_slot(g_pixel_texpi_slot, &g_pixel_texpi_orig, &g_pixel_texpi_orig_saved,
                       (uintptr_t) hooked_glTexParameteri, enable);
@@ -1475,9 +1657,70 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetPixelDecimate(JNIEnv *env, jc
 JNIEXPORT void JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeLogPixelStats(JNIEnv *env, jclass cls) {
     LOGI("pixel-gfx: stats texImage2D_calls=%u glGenerateMipmap_calls=%u texParam_rewrites=%u "
-         "nearest_probed=%u nearest_was_linear=%u",
+         "nearest_probed=%u nearest_was_linear=%u file_subst_registered=%d file_subst_hits=%u "
+         "file_subst_misses=%u",
          g_pixel_teximage_calls, g_pixel_genmipmap_calls, g_pixel_texparami_rewrites,
-         g_pixel_nearest_probed, g_pixel_nearest_was_linear);
+         g_pixel_nearest_probed, g_pixel_nearest_was_linear, g_file_subst_count,
+         g_file_subst_hits, g_file_subst_misses);
+}
+
+// Registers the mechanism-7 file-substitution table (see the
+// ctr::ResourceManager::getData comment block above): `names` are asset
+// BASENAMES as the game asks for them (e.g. "mapchip_0_117_0.png") and
+// `paths` the matching absolute paths of the replacement files on disk, one
+// per name, same length. The two arrays are kept parallel rather than
+// name + one shared directory so replacements can live in either of the two
+// scanned orig_art directories (externalFilesDir and filesDir) at once.
+//
+// Replaces the table wholesale (resets g_file_subst_count first), so it is
+// idempotent and safe to call again from the settings toggle. Nothing is read
+// from disk here -- only names and paths are stored, and the file itself is
+// read (into a fresh malloc()) inside hooked_getData on a hit -- so this is
+// cheap enough to call early, before OrigArtCache's PNG-decoding refresh
+// work, which matters: a field load that beats the registration would just
+// see the shipped smoothed sheets.
+//
+// Returns the number of entries registered.
+JNIEXPORT jint JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeRegisterFileSubstitutions(
+        JNIEnv *env, jclass cls, jobjectArray names, jobjectArray paths) {
+    int count = 0;
+    pthread_mutex_lock(&g_file_subst_mutex);
+    g_file_subst_count = 0;
+    if (names && paths) {
+        jsize n = (*env)->GetArrayLength(env, names);
+        jsize m = (*env)->GetArrayLength(env, paths);
+        if (n != m) {
+            LOGE("pixel-gfx: nativeRegisterFileSubstitutions: names/paths length mismatch "
+                 "(%d/%d) -- registering nothing", (int) n, (int) m);
+            n = 0;
+        }
+        for (jsize i = 0; i < n && g_file_subst_count < FILE_SUBST_MAX; i++) {
+            jstring jname = (jstring) (*env)->GetObjectArrayElement(env, names, i);
+            jstring jpath = (jstring) (*env)->GetObjectArrayElement(env, paths, i);
+            const char *cname = jname ? (*env)->GetStringUTFChars(env, jname, NULL) : NULL;
+            const char *cpath = jpath ? (*env)->GetStringUTFChars(env, jpath, NULL) : NULL;
+            if (cname && cpath && cname[0] && cpath[0] &&
+                strlen(cname) < FILE_SUBST_NAME_MAX && strlen(cpath) < FILE_SUBST_PATH_MAX) {
+                file_subst_t *slot = &g_file_subst[g_file_subst_count++];
+                memset(slot, 0, sizeof(*slot));
+                strncpy(slot->name, cname, sizeof(slot->name) - 1);
+                strncpy(slot->path, cpath, sizeof(slot->path) - 1);
+            } else if (cname) {
+                LOGE("pixel-gfx: file substitution: name/path empty or too long, skipping: %s",
+                     cname);
+            }
+            if (cname) (*env)->ReleaseStringUTFChars(env, jname, cname);
+            if (cpath) (*env)->ReleaseStringUTFChars(env, jpath, cpath);
+            if (jname) (*env)->DeleteLocalRef(env, jname);
+            if (jpath) (*env)->DeleteLocalRef(env, jpath);
+        }
+        count = g_file_subst_count;
+    }
+    pthread_mutex_unlock(&g_file_subst_mutex);
+    LOGI("pixel-gfx: registered %d file substitution(s) (hook=%s, enabled=%d)",
+         count, g_pixel_getdata_slot ? "installed" : "MISSING", g_file_subst_enabled);
+    return count;
 }
 
 // Loads the whole replacement registry from a text index built by Java's

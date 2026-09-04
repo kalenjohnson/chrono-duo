@@ -299,102 +299,201 @@ page 0 (Guardia-prison-style barred cells) and `(23,33)` page 0 (a sky gradient)
 
 ## 8. Feasibility of runtime replacement
 
-### 8a. Where the mapchip sheets are actually used — **not** the field background
+### 8a. Where the mapchip sheets are actually used — **the whole field, ground included**
 
-This is the finding that matters most for the intended swap, and it is the
-opposite of the working assumption.
+**RETRACTED AND REPLACED (2026-09-04).** This section previously argued the
+opposite: that the walkable ground was CPU-composited at 1x from the cg banks
+into a paletted index texture, and that the smoothed 2x sheets fed only the
+animated/front chips. That reading was built on `MapTable::Expansion` @ 0x568af0
+and `MapTable::writeChip` @ 0x56b5f0 — and **`MapTable::Expansion` is never
+called.** It has **no PLT stub, no `JUMP_SLOT` relocation, and zero direct `bl`s**
+to 0x568af0, while its live sibling `ExpansionExt` @ 0x569c28 has a stub at
+0xb3f860 taking 4 calls. (In this binary *every* intra-library call goes through
+a PLT stub — `bl 0x<body>` is 0 for `ExpansionExt`, `drawFrontChip` and
+`CreateSprites` too — so "no direct `bl`" alone proves nothing; the absence of a
+stub *and* a relocation is what settles it.) `writeChip` likewise has no stub and
+no direct call: it is reachable only from `draw`/`drawExt`/`drawZero`, which in
+turn only `Expansion`/`ExpansionExt` reach.
 
-`MapTable::writeChip(ImageArray<Color4B>&, ChipTable&, ...)` @ **0x56b5f0** —
-the primitive behind `MapTable::draw` @ 0x569008, `drawExt` @ 0x56a8dc and
-`drawZero` @ 0x56b09c, which are all that `MapTable::Expansion` @ 0x568af0 and
-`MapTable::ExpansionExt` @ 0x569c28 call — reads **one byte per pixel from
-`ChipTable + 0x3200 + (page<<16) + srcY*0x100 + srcX`** (0x56b648-0x56b65c),
-i.e. from the 1x index page of section 5, and writes `Color4B(index, 0, 0, 0)`
-into a CPU RGBA buffer, advancing **4 destination bytes per source pixel**
-(0x56b6bc-0x56b6c4). That is a **1:1, 1x copy** with the palette index in the
-red channel — the same trick the overworld uses.
+#### What actually paints the field: `MapTable::drawFrontChip` @ **0x56bdac**
 
-The destination buffer's *measured* dimensions confirm 1x independently of that
-stride argument. In `MapTable::Expansion` @ 0x568af0 the map's metatile width and
-height are loaded from two tables (0x568be0/0x568be4) and each **multiplied by
-16** — `lsl w9, w11, #4` @ 0x568bf0 and `lsl w8, w8, #4` @ 0x568c70 — then
-rounded up to the next power of two by the NEON `sshr`/`orr` chain at
-0x568c8c-0x568cb8. The result is `w28` (width) and `w19` (height); the buffer is
-allocated as `w28 * w19 * 4` bytes (0x568cc8-0x568cfc), `w28` is written to
-`ImageArray+0x18` (0x568d68) — which is exactly the stride `writeChip` reads at
-`[x19,#0x18]` — and the same pair is passed as `w4`/`w5` to
-`Texture2D::initWithData(data, len, PixelFormat=2 (RGBA8888), w, h, size)` @
-**0x568e78**, the index texture `Shaders/ShaderDrawPalettedTexture.fsh` samples.
-**16 px per metatile is 1x**; a 2x background would be `lsl #5`. So the field
-background texture is a power-of-two-padded 1x image (e.g. 1024x512 for a 48x28
-metatile map, painting 768x448).
+Read at the instruction level (0x56bdac-0x56be94):
 
-By contrast, the `Texture2D*`s that `MapTable::LoadTexture` stores at
-`this+0x98 / +0xa0 / +0xa8[i]` are read by **exactly two functions**
-(a scan of every `MapTable` method below 0x56d3fc): `MapTable::drawFrontChip` @
-**0x56bdac** and `MapTable::drawFrontChipExt` @ **0x56c88c**, which hand them to
-`MapTable::drawChip(Texture2D*, ...)` @ **0x56cf68** ->
-`Sprite::createWithTexture` -> `Node::visit`. Those are reached from
-`MapTable::CreateSprites` @ 0x56bbdc / `CreateSpritesExt` @ 0x56c220 /
-`drawAnimeChipExt` @ 0x56c6d8 — the **animated chips and the front/priority
-chips**, plus `CreateTakara` (treasure chests).
+```
+srcX = (chip & 0x0F) * 16                    ubfiz w22, w6, #4, #4   @ 0x56bddc
+srcY =  chip & 0xF0                          and   w23, w6, #0xf0    @ 0x56bdec
+mask = chipTable[0x3000 + page*0x100 + chip] ldrb  w26, [x9, #0x3000]@ 0x56be04
+if (!b) mask ^= 0xF                          eor/tst/csel   @ 0x56be3c-0x56be44
+if (mask == 0xF)                             cmp w26, #0xf  @ 0x56be48
+    Rect(srcX, srcY, 16.0f, 16.0f)           fmov s2/s3,#16.0 @ 0x56be5c/60
+    tex = this[0x98 + page*8]                ldr x21,[x8,#0x98] @ 0x56be68
+    Sprite::createWithTexture(tex, rect, false)                @ 0x56be7c
+    setPosition(x, y)  ->  Node::visit
+else  four 8x8 quadrant draws from the SAME texture (0x56bf0c/0x56bf78/0x56bfec/0x56c058)
+```
 
-**So the walkable field background is already composited from the original 1x
-cg tiles; the smoothed 2x mapchip sheets supply only the sprite-drawn animated
-and foreground chips.**
+`this + 0x98 + page*8` is exactly the `Texture2D*` array `MapTable::LoadTexture`
+@ 0x56b874 fills with the `mapchip_%d_%d_%d.png` sheets (section 6). The
+`b` argument inverts the priority mask, so **one call with `b = false` draws
+every *non*-priority metatile — the ground — and one with `b = true` draws the
+priority/front chips.** `MapTable::CreateSprites` @ 0x56bbdc drives it over the
+whole visible window with **no anim/priority filter** (loop 0x56bd2c-0x56bda4:
+one unconditional `bl drawFrontChip@plt` per cell, `w23 += 0x10` per column),
+and `FieldMap::makeField` @ 0x57520c calls `CreateSprites`/`CreateSpritesExt`
+eight times (0x5754ec, 0x57550c, 0x5755f4, 0x575614, 0x575688, 0x5756b8,
+0x5756e8, 0x575708). `CreateSprites` has 16 call sites via its stub 0xb3f8a0.
 
-> **Confirmed (2026-09-04).** Follow-up RE and a device screenshot both bear
-> this out, and additionally show there is **no LINEAR filtering anywhere in
-> the field path**: right after `initWithData` @ 0x568e78, 0x568e84-0x568f00
-> feeds `Texture2D::setTexParameters` the 16-byte constant at **0x374f60** =
-> `{0x2600, 0x2600, 0x812F, 0x812F}` = `{GL_NEAREST, GL_NEAREST,
-> GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE}` (the nearby conditional `mov w8,#0x2901`
-> = `GL_REPEAT` writes only the two WRAP fields). The palette texture
-> (`createPaletteTexture` @ 0x5be520 → `setAliasTexParameters` @ 0x5be7e8) and
-> every `RenderTexture` (`initWithWidthAndHeight` @ 0x895f38; 19 created by
-> `FieldMap::makeField` @ 0x57520c) are NEAREST too, and
-> `Texture2D::initWithMipmaps` @ 0x936b8c always sets MIN/MAG explicitly, so
-> nothing falls back to the GLES `MAG = GL_LINEAR` default. The residual
-> ground softness is **geometric**: `AppDelegate::applicationDidFinishLaunching`
-> @ 0x6417f0 uses a 568x320-point design resolution (constant at 0x641c34) with
-> `setContentScaleFactor(2.0f)` @ 0x641afc and NO_BORDER, so one source texel
-> covers `1920/568 = 3.380` screen pixels on a 1080p panel and NEAREST produces
-> blocks alternating 3 and 4 px wide. A screenshot's horizontal run lengths over
-> the ground, the front chips and the character sprite are the same 3/4-px
-> distribution, which rules out filtering on any of them. Whatever residual blur the background shows is runtime
-filtering/scaling of a 1x index texture, not baked-in smoothing — a different
-problem from the one the mapchip sheets cause. This should be re-checked in
-game before any work is scheduled: it predicts that today the field background
-is (up to runtime filtering) crisp original art and only the animated/foreground
-chips carry baked-in smoothing. The one link not read line-by-line is the body of
-`MapTable::draw` @ 0x569008 and `drawExt` @ 0x56a8dc, which have inlined
-`Color4B` writes on paths that do not go through `writeChip`; they cannot change
-the buffer's dimensions (measured above) but could in principle paint into it
-differently.
+**So the walkable ground is blitted from the smoothed 2x mapchip sheets, one
+16x16-point sprite per metatile.** The baked smoothing survives at 1:1: with
+`setContentScaleFactor(2.0)`, `Sprite::setTextureCoords` converts the 16x16-point
+`Rect` to **32x32 pixels** of the 512x512 sheet — precisely one cell of its
+16x16 grid — onto a 16x16-point footprint that is 32x32 device pixels. Source
+and destination match exactly, so nothing resamples the sheet and nothing
+recovers the 1x original.
 
-### 8b. If the mapchip sheets are to be replaced anyway
+#### The NPOT uploads were RenderTextures, not composited buffers
 
-They go through `ctr::ResourceManager::createTexture(const std::string&)` (calls
-at 0x56b8c0, 0x56b8f4, 0x56b96c), which is **already hooked** by
-`gamestate.c`'s mechanism 5 (`PIXEL_SYM_CREATETEXTURE` / `hooked_createTexture`,
-which parks the asset path in `g_pending_tex_path` for the duration of the
-call). So a **path-based** swap needs no new hook at all: when
-`g_pending_tex_path` matches `mapchip_*.png`, substitute the replacement in
-`hooked_glTexImage2D`. The upload itself is a plain 512x512 RGBA8888
-`glTexImage2D` (cocos2d-x expands the paletted PNG with `tRNS` to RGBA8888 in
-`Image::initWithPngData`), which is the shape mechanism 5 already handles, and
-the existing `.rgbz` cache format (premultiplied RGBA8, zlib) fits unchanged —
-`rebuild_mapchip.py` already emits a 512x512 RGBA PNG per page.
+The device log's 1792x1536 / 1536x1536 / 864x448 / 1280x512 uploads carried
+pixel data and no asset path, which was read as "CPU-composited colour buffers".
+They are not. `RenderTexture::initWithWidthAndHeight`
+(`cocos/2d/CCRenderTexture.cpp:205-231`) scales w/h by
+`CC_CONTENT_SCALE_FACTOR()` (2.0), skips `ccNextPOT` when `supportsNPOT()`, then
+`malloc`s and `memset(0)`s the buffer before `initWithData` — so **every
+RenderTexture uploads non-NULL zeroed data with no path in flight, at NPOT
+size.** `FieldMap::makeField` matches them literally:
 
-The **alpha fingerprint** used for character sheets is a poor key here and
-should not be relied on: a mapchip page's alpha channel is just the index-0
-mask, and many sheets share large flat regions (four sheets are entirely
-transparent or entirely opaque). Use the path, which is unique and free.
+| site | call | upload |
+|---|---|---|
+| 0x57543c/0x575440 | `RenderTexture::create(640, 256)` | **1280x512** |
+| 0x57571c/0x575720 | `RenderTexture::create(432, 224)` | **864x448** |
+| 0x5716a8 / 0x575b04 … | `create([FieldMap+0x330], [FieldMap+0x334])` (map size in points) | 896x768 -> **1792x1536**, 768x768 -> **1536x1536** |
 
-Caveat for whoever implements it: `mapchip_23_33_ev.png`,
-`mapchip_23_33_ev_test.png`, `mapchip_23_33_test.png` and friends also ship —
-leftover authoring assets that `LoadTexture`'s `%d_%d_%d` format string can
-never name. Ignore them.
+`ExpansionExt`'s own geometry reading in the old text was right as far as it
+went — 0x569d50 `lsl w10, w11, #4` and 0x56a0d4 `lsl w8, w8, #4` are ×16, there
+is no `lsl #5` anywhere, and the POT round-up at 0x56a0e8-0x56a114 is real — so
+its paletted index texture is POT and 1x, and therefore **cannot** be any of the
+NPOT uploads above. The 512x512 no-path upload is the best candidate for it
+(direct `initWithData`, never through `createTexture`, so no path is parked).
+What the old text got wrong was not the arithmetic but the assumption that this
+texture is what reaches the screen.
+
+> **Not read line by line:** `MapTable::draw` @ 0x569008 / `drawExt` @ 0x56a8dc /
+> `drawZero` @ 0x56b09c, and where `ExpansionExt` stores (and whether anything
+> other than `~MapTable` @ 0x56bb4c consumes) the index texture. The positive
+> evidence above — a verified sprite blit of every ground metatile from the
+> mapchip sheet — stands on its own regardless of what that texture is for.
+
+### 8b. Runtime replacement — the GL-upload swap was INERT (our bug); the FILE swap is the better fix
+
+**Revised (2026-09-04).** The original text of this section said the sheets
+go through `ctr::ResourceManager::createTexture(const std::string&)`, which
+`gamestate.c`'s mechanism 5 already hooks, so a **path-based swap at
+`glTexImage2D` needs no new hook at all**. That was built, all 504 rebuilt
+pages were registered as path-keyed entries — and **it never fired**. On device
+(Guardia Forest, every page registered) there was never a `replaced mapchip_`
+line, while the one-shot alarm did fire:
+
+```
+E pixel-gfx: 512x512 upload with no asset path in flight while path-keyed
+             replacement mapchip_0_117_0.png is registered at that size
+I pixel-gfx: replaced c000_0.png by fingerprint     <- sprites DO swap
+```
+
+The premise was not wrong about the *call*: `MapTable::LoadTexture` @ 0x56b874
+really does reach `createTexture` through the PLT, so the GOT hook is live
+there —
+
+```
+56b8c0: bl 0xb3eed0 <_ZN3ctr15ResourceManager13createTextureE...@plt>
+```
+
+— it was wrong about the **ABI**, and that alone was enough to kill it.
+`cocos2d::TextureCache::addImage(const std::string&)` @ 0x93e518 is an ordinary
+member (`x0` = `this`, `x1` = the string), but **`ctr::ResourceManager::
+createTexture(const std::string&)` @ 0x5be3bc is STATIC** — `x0` *is* the
+string (0x5be3d4 `mov x19, x0`, then 0x5be3ec `mov x0, x19` into the
+`(string, Image*)` overload @ 0x5be450). `gamestate.c` hooked both with the
+member signature, so it read the path from `x1` for `createTexture` and
+`g_pending_tex_path` stayed empty on every one of those loads. Forwarding still
+worked by accident (`x0`/`x1` pass through untouched), so the failure was
+silent. **So the GL mechanism was never actually tested** — it did not fail, it
+never ran. (Section 8a, rewritten, settles the separate question of which layer
+consumes the sheets: all of it, ground included.)
+
+The signature is fixed, and with it the GL swap would very likely have worked —
+`drawFrontChip` @ 0x56bdac samples the uploaded `Texture2D` directly
+(`Sprite::createWithTexture` @ 0x56be7c), so replacing its pixels at
+`glTexImage2D` reaches the ground as well as the front chips. The chip sheets
+are still deliberately **not** put back on that path, because the file layer is
+strictly more general and has fewer ways to be silently inert: it substitutes
+*before decode*, so every consumer of the decoded image sees it; it needs no
+fingerprint, no `.rgbz`, and no agreement on size or pixel format with the
+upload; and the same hook covers `.dat`/`.bin` assets for anything later. After
+one mechanism that failed invisibly for a whole build cycle, that margin is
+worth taking.
+
+**The fix is to substitute the file, before it is ever decoded.** Every asset
+read in this game — archive entry and filesystem fallback alike — funnels
+through one function:
+
+```
+ctr::ResourceManager::getData(const std::string& path, int* outLen)
+    body 0x5be02c    PLT stub 0xb42b80    GOT slot 0xbcd038
+```
+
+* **Static member**: `x0` = `std::string*`, `x1` = `int*`, buffer returned in
+  `x0`. No `this`, no sret, no `cocos2d::Data`, no `ResizableBuffer` — the
+  string is read straight out of `x0` at 0x5be07c-0x5be090 (the `__ndk1` SSO
+  test `tst w8,#0x1` / `csinc` / `csel` pair).
+* **Covers both read paths.** It first calls `DetchmanResource::LoadFileEntry`
+  @ 0x55e810 (the ARC1 archive in `resources.bin`: XOR-descramble with the LCG
+  `seed = (base + fileOffset) * 0x41c64e6d + 0x3039`, taking `seed >> 24` per
+  byte; then a 4-byte **big-endian** raw size; then
+  `ZipUtils::inflateMemory`), and on a miss falls back to
+  `DeviceInfo::getMainBundlePath() + path` → `ResourceManager::readFile` @
+  0x5be9ec → `FileUtils::getDataFromFile`. Hooking `LoadFileEntry` would miss
+  the fallback; hooking `FileUtils` would never see an archive entry at all.
+* **Everything is downstream of it.** `ResourceData::ResourceData(const
+  std::string&)` @ 0x5bdfc4 — the wrapper behind all 149 `.dat`/`.bin` reads,
+  including `ChipData::Load`, `ChipTable::Load`, `MapInfo::Load` — is a thin
+  shim over it; and `ctr::ResourceManager::createTexture(path)` @ 0x5be3bc
+  reaches it via `createTexture(path, Image*)` @ 0x5be450, which does
+  `getData → Image::initWithImageData(bytes, len) → free(bytes) →
+  Texture2D::initWithImage`.
+* **No bypass.** `grep -cE "bl[[:space:]]+0x5be02c\b" full.asm` is **0** —
+  every call goes through the single PLT stub, and `llvm-objdump -R` shows
+  exactly one `R_AARCH64_JUMP_SLOT` for the symbol, at 0xbcd038. It is also an
+  exported dynamic symbol (`T` at 0x5be02c), so `dlsym` resolves the original.
+* **Ownership: `malloc`/`free`.** The buffer originates in
+  `ZipUtils::inflateMemory` (`malloc`/`realloc`) and callers free it plainly:
+  `ResourceData::~ResourceData` @ 0x5be118 is `ldr x0,[x0]; b free@plt`, and
+  `createTexture` does `bl initWithImageData; mov x0,x20; bl free@plt` at
+  0x5be494. A substitute buffer **must** come from `malloc()` — never `new[]`,
+  never a shared scratch buffer.
+
+`gamestate.c` mechanism 7 patches that slot with `pixel_find_jump_slot` (the
+same helper mechanisms 1/2/3/5 use) and, for reads whose basename matches a
+registered replacement, returns the rebuilt PNG's own bytes in a fresh
+`malloc()`. The game then decodes *our* sheet, so **every** consumer sees it —
+GL upload, sprite draw and any CPU blit alike.
+
+Two consequences for the rebuild pipeline:
+
+* the substituted bytes are served **verbatim**, upstream of cocos2d-x's
+  premultiply step — unlike the `.rgbz` payloads mechanism 5 uploads, which are
+  premultiplied on purpose. Never premultiply a file substitution;
+* the chip sheets need **no `.rgbz` at all**, and no fingerprint. The
+  path-keyed `.rgbz` entries and their `alphaFp == redFp == 0` sentinel are
+  gone; `OrigArtCache` now splits `mapchip_*.png` out of the cache and
+  registers name+path pairs through `nativeRegisterFileSubstitutions`.
+
+The **alpha fingerprint** remains a poor key here for the reason the original
+text gave: a page's alpha channel is just the index-0 mask, and four sheets are
+wholly transparent or wholly opaque. It is no longer used for them either way.
+
+Caveat unchanged: `mapchip_23_33_ev.png`, `mapchip_23_33_ev_test.png`,
+`mapchip_23_33_test.png` and friends also ship — leftover authoring assets that
+`LoadTexture`'s `%d_%d_%d` format string can never name. Ignore them.
 
 ## 9. Files not needed for this rebuild
 

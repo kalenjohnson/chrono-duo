@@ -92,6 +92,26 @@ public final class GameState {
      */
     public static native int nativeLoadTextureReplacementIndex(String indexPath, String rgbaDir);
 
+    /**
+     * Registers the file-level asset substitution table (gamestate.c
+     * mechanism 7): {@code names} are asset basenames exactly as the game
+     * asks for them (e.g. "mapchip_0_117_0.png") and {@code paths} the
+     * matching absolute paths of the replacement files, one per name.
+     *
+     * <p>The native hook sits on {@code ctr::ResourceManager::getData}, the
+     * single choke point every archive/filesystem asset read passes through,
+     * and returns the replacement file's bytes in place of the archive
+     * entry -- so the game DECODES our PNG and every consumer of the decoded
+     * image sees it, not just the glTexImage2D upload that {@link
+     * #nativeLoadTextureReplacementIndex}'s registry can reach. Bytes are
+     * served verbatim (this is upstream of cocos2d-x's premultiply step).
+     * Gated on the pixel-graphics pref, like the other mechanisms.</p>
+     *
+     * <p>Replaces the table wholesale; cheap (no file IO), so call it early.
+     * Returns the number of entries registered.</p>
+     */
+    public static native int nativeRegisterFileSubstitutions(String[] names, String[] paths);
+
     /** Clears the registered texture-replacement registry. See gamestate.c. */
     public static native void nativeClearTextureReplacements();
 

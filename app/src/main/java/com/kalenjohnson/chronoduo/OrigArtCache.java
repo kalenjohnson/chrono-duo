@@ -15,7 +15,10 @@ import java.io.OutputStreamWriter;
 import java.io.Writer;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.zip.Deflater;
@@ -48,10 +51,7 @@ import java.util.zip.Deflater;
  *     -- name is the replacement's basename (e.g. "c000_0.png", including
  *     the ".png"), w/h its pixel size, alphaFp/redFp the FNV-1a content
  *     fingerprints of the ORIGINAL (unmodified) game asset at that name (see
- *     {@link #fingerprint}) -- or BOTH ZERO for a path-keyed entry, the
- *     sentinel that tells gamestate.c to match this name only against
- *     the asset path the game asked for and never by content (see
- *     {@link #isPathKeyed}) -- formatted lowercase, zero-padded to 16 hex
+ *     {@link #fingerprint}) -- formatted lowercase, zero-padded to 16 hex
  *     digits ("%016x") so the native side's fixed-width sscanf can parse
  *     them without a delimiter, and pngMtime the source PNG's
  *     lastModified() at build time -- this trailing field is read only by
@@ -128,6 +128,26 @@ public final class OrigArtCache {
             }
         }
 
+        // File-level substitutions (the field chip sheets) are split off
+        // first and registered before any decode work: registration is just
+        // two string arrays, while the .rgbz pass below can take seconds, and
+        // a field load that beat it would show the shipped smoothed sheets.
+        // These names are then excluded from the .rgbz cache entirely --
+        // gamestate.c's getData hook serves their PNG bytes verbatim.
+        List<String> substNames = new ArrayList<>();
+        List<String> substPaths = new ArrayList<>();
+        for (Iterator<Map.Entry<String, File>> it = sources.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<String, File> se = it.next();
+            if (!isFileSubstituted(se.getKey())) continue;
+            substNames.add(se.getKey());
+            substPaths.add(se.getValue().getAbsolutePath());
+            it.remove();
+        }
+        int substCount = GameState.nativeRegisterFileSubstitutions(
+                substNames.toArray(new String[0]), substPaths.toArray(new String[0]));
+        Log.i(TAG, "orig_art_cache: registered " + substCount + " file substitution(s) of "
+                + substNames.size() + " found");
+
         Map<String, Entry> newIndex = new LinkedHashMap<>();
         int processed = 0, rebuilt = 0, total = sources.size();
         for (Map.Entry<String, File> se : sources.entrySet()) {
@@ -166,7 +186,7 @@ public final class OrigArtCache {
         // empty source dir must never be read as "everything was removed",
         // which would delete a good 629-sheet cache and force a full
         // rebuild next boot.
-        if (sources.isEmpty() && !oldIndex.isEmpty()) {
+        if (sources.isEmpty() && substNames.isEmpty() && !oldIndex.isEmpty()) {
             Log.w(TAG, "orig_art_cache: no source PNGs found this scan -- keeping existing cache as-is");
             newIndex.putAll(oldIndex);
         } else {
@@ -214,9 +234,8 @@ public final class OrigArtCache {
      * Maps an orig_art replacement filename to the resources.bin entry it
      * should be fingerprinted against. Only handles character sheet names
      * ("c000_0.png", "c123_1.png", ...) under Game/chara/png/; returns null
-     * for anything else -- including the PATH-KEYED names {@link
-     * #isPathKeyed} covers, which are matched by asset basename and need no
-     * fingerprint at all. A small standalone function so other directories
+     * for anything else -- including the names {@link #isFileSubstituted}
+     * covers, which never enter this cache at all. A small standalone function so other directories
      * (items, monsters, ...) can be added later without touching {@link
      * #refresh}.
      */
@@ -228,25 +247,31 @@ public final class OrigArtCache {
     }
 
     /**
-     * True for replacement names that are matched purely by the asset path the
-     * game asks for, never by content fingerprint -- currently the field chip
-     * sheets, "mapchip_&lt;chipTable&gt;_&lt;palette&gt;_&lt;page&gt;.png"
+     * True for replacement names that are substituted at the FILE level
+     * (gamestate.c mechanism 7) rather than uploaded as pixels by the
+     * glTexImage2D hook -- currently the field chip sheets,
+     * "mapchip_&lt;chipTable&gt;_&lt;palette&gt;_&lt;page&gt;.png"
      * (see {@link com.kalenjohnson.chronoduo.origart.MapchipRebuilder}).
      *
-     * <p>Those load through {@code MapTable::LoadTexture} ->
-     * {@code ctr::ResourceManager::createTexture("Game/field/mapchip/...")},
-     * which gamestate.c's mechanism-5 hook already parks in
-     * {@code g_pending_tex_path}, so the path is available, unique and free.
-     * The alpha fingerprint would be a <em>bad</em> key here: a chip sheet's
-     * alpha channel is just its index-0 mask, several sheets are entirely
-     * transparent or entirely opaque, and collisions across 500-odd
-     * same-sized sheets are near certain. Entries built for these names
-     * therefore carry {@code alphaFp == redFp == 0}, the sentinel gamestate.c
-     * reads as "path-only -- never consider this entry for a fingerprint
-     * match"; building them also skips extracting the original asset
-     * entirely, which is what makes a ~500-sheet field pass cheap.</p>
+     * <p>These used to be cached as path-keyed {@code .rgbz} entries matched
+     * against {@code g_pending_tex_path} inside the glTexImage2D hook. That
+     * never fired on device -- no {@code replaced mapchip_} line ever
+     * appeared -- because the decoded sheet is consumed by the field's own
+     * CPU/sprite compositing, not only by a path-in-flight texture upload, so
+     * swapping pixels at the GL boundary could not reach it.
+     *
+     * <p>They are now substituted one layer lower instead: the whole PNG file
+     * is handed to the game in place of the archive entry, inside
+     * {@code ctr::ResourceManager::getData}, so the game decodes our sheet and
+     * every consumer sees it. That needs no fingerprint, no decode here and no
+     * {@code .rgbz} -- just the name and the path -- which is why these are
+     * excluded from the cache entirely and registered by {@link
+     * GameState#nativeRegisterFileSubstitutions} instead. It also means the
+     * bytes must stay exactly as written: file substitution is UPSTREAM of
+     * cocos2d-x's premultiply, unlike the premultiplied {@code .rgbz}
+     * payloads.</p>
      */
-    private static boolean isPathKeyed(String name) {
+    private static boolean isFileSubstituted(String name) {
         return name.matches("mapchip_\\d+_\\d+_\\d+\\.png");
     }
 
@@ -388,8 +413,6 @@ public final class OrigArtCache {
         // check.
         long pngMtime = pngFile.lastModified();
 
-        if (isPathKeyed(name)) return buildPathKeyedEntry(name, pngFile, rgbzFile, pngMtime);
-
         String resEntry = origArtResourceEntry(name);
         if (resEntry == null) {
             Log.w(TAG, "orig_art_cache: no resources.bin mapping for " + name + " -- skipped");
@@ -475,53 +498,7 @@ public final class OrigArtCache {
         }
     }
 
-    /**
-     * Builds one PATH-KEYED cache entry (see {@link #isPathKeyed}): decodes
-     * the replacement premultiplied (matching the game's own upload order),
-     * takes w/h from the replacement itself -- there is no original to
-     * measure against, and none is extracted -- deflates its raw R,G,B,A
-     * bytes into the same RGBZ container every other entry uses, and emits an
-     * index line whose two fingerprint fields are both zero.
-     *
-     * <p>That all-zero pair is the sentinel gamestate.c reads as "path-only":
-     * such an entry is only ever matched against {@code g_pending_tex_path}
-     * and is skipped by the content-fingerprint fallback (and by its
-     * size pre-scan, so a 512x512 upload with no registered fingerprint entry
-     * of that size doesn't pay for a 4096-sample hash). The index line format
-     * is otherwise unchanged, so the native parser needs no new field.</p>
-     */
-    private static Entry buildPathKeyedEntry(String name, File pngFile, File rgbzFile,
-                                              long pngMtime) {
-        Bitmap replacement = null;
-        try {
-            BitmapFactory.Options opts = new BitmapFactory.Options();
-            opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
-            opts.inPremultiplied = true; // matches the game's own upload order
-            opts.inScaled = false;
-            replacement = BitmapFactory.decodeFile(pngFile.getAbsolutePath(), opts);
-            if (replacement == null) {
-                Log.w(TAG, "orig_art_cache: decode returned null for " + pngFile);
-                return null;
-            }
-            int w = replacement.getWidth(), h = replacement.getHeight();
 
-            byte[] rgbz = compressRgbz(w, h, bitmapRgbaBytes(replacement));
-            if (!writeAtomic(rgbzFile, rgbz)) {
-                Log.w(TAG, "orig_art_cache: failed to write " + rgbzFile);
-                return null;
-            }
-            String line = name + " " + w + " " + h + " "
-                    + String.format(Locale.ROOT, "%016x", 0L) + " "
-                    + String.format(Locale.ROOT, "%016x", 0L) + " "
-                    + pngMtime;
-            return new Entry(name, pngMtime, line);
-        } catch (Exception e) {
-            Log.w(TAG, "orig_art_cache: failed to process " + pngFile, e);
-            return null;
-        } finally {
-            if (replacement != null) replacement.recycle();
-        }
-    }
 
     /**
      * Parses an existing index.txt into name -> Entry; returns an empty map
