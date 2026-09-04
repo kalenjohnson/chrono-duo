@@ -112,6 +112,58 @@ public final class WorldMapRenderer {
         return allOk;
     }
 
+    // --- live re-composite support (see WorldMapLive) -------------------------
+    // The same sources renderOne uses, exposed so a live metatile grid pulled
+    // out of the running game (GameState.nativeGetWorldMapData) can be run
+    // through the identical pixel path instead of the on-disk Map_%04d.dat.
+
+    /** True if {@code world} is a world this renderer knows the chip/palette/map ids for. */
+    public static boolean isKnownWorld(int world) {
+        return world >= 0 && world < WORLD_INFO.length;
+    }
+
+    /** The {@code Map_%04d.dat} basename backing {@code world}, for the live-vs-file diff log. */
+    public static String mapFileName(int world) {
+        if (!isKnownWorld(world)) return null;
+        return String.format(Locale.US, "Map_%04d.dat", WORLD_INFO[world][2]);
+    }
+
+    /** Reads that file out of {@code dir} (the staged {@code filesDir/world_src}). */
+    public static byte[] readMapFile(File dir, int world) throws IOException {
+        String name = mapFileName(world);
+        if (name == null) throw new IOException("unknown world " + world);
+        return readAll(new File(dir, name));
+    }
+
+    /** {@link WorldMapCompositor#composite}'s {@code overlayLayer0OnTop} for {@code world} -- false only for Zeal/the sky. */
+    public static boolean overlayLayer0OnTop(int world) {
+        return world != NO_OVERLAY_WORLD;
+    }
+
+    /**
+     * Decodes {@code world}'s two 512x512 chip pages from {@code dir} as
+     * {@code {page0, page1}}, through the same non-premultiplied path
+     * {@link #renderOne} uses (the compositor does a pixel replace, not a
+     * blend, so premultiplied components would darken every chip edge).
+     * Expensive -- callers should cache the result per world.
+     */
+    public static int[][] loadChipPages(File dir, int world) throws IOException {
+        if (!isKnownWorld(world)) throw new IOException("unknown world " + world);
+        int chip = WORLD_INFO[world][0], plt = WORLD_INFO[world][1];
+        int dim = WorldMapCompositor.PAGE_DIM;
+        int[][] pages = new int[2][];
+        for (int page = 0; page < 2; page++) {
+            Bitmap b = decodePage(new File(dir, "worldchip_" + chip + "_" + plt + "_" + page + ".png"));
+            try {
+                pages[page] = new int[dim * dim];
+                b.getPixels(pages[page], 0, dim, 0, 0, dim, dim);
+            } finally {
+                b.recycle();
+            }
+        }
+        return pages;
+    }
+
     private static void renderOne(File dir, File out, int world) throws IOException {
         int[] info = WORLD_INFO[world];
         int chip = info[0], plt = info[1], mapId = info[2];

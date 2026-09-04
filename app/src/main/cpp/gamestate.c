@@ -66,6 +66,9 @@ static void  *(*p_list_getElement)(void *, int);
 typedef struct { float w, h; } CCSize;
 typedef struct { float x, y; } CCVec2;
 static int safe_read(const void *addr, void *out, size_t len);
+// Live overworld-map capture tick (definition at the end of this file);
+// called from nativeEnforceUiTick with the scene it already resolved.
+static void world_map_tick(void *scene);
 // libc++ std::string reader (defined later in the file); forward-declared so
 // the addImage/createTexture hooks below (which run well before the
 // definition) can use it, same as safe_read above.
@@ -2603,6 +2606,9 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeEnforceUiTick(JNIEnv *env, jclas
     void *scene = find_running_scene();
     if (scene) enforce_park_walk(scene, 0, 2);
     enforce_battle_ui_hide();
+    // Live overworld map: arms/performs the RenderTexture readback. Cheap on
+    // every non-overworld frame (one shallow depth-2 type search that misses).
+    world_map_tick(scene);
 }
 
 // Dump whole regions to files for offline analysis (adb pull + python).
@@ -2932,5 +2938,285 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeReadSfc(JNIEnv *env, jclass cls,
     jbyteArray arr = (*env)->NewByteArray(env, len);
     if (!arr) return NULL;
     (*env)->SetByteArrayRegion(env, arr, 0, len, (const jbyte *)(sfc + off));
+    return arr;
+}
+
+
+// ---------------------------------------------------------------------------
+// Live overworld map: the game's own map DATA (not its textures).
+//
+// FIRST ATTEMPT, ABANDONED -- recorded here so it is not retried. WorldMap
+// holds twelve cocos2d::RenderTextures (six terrain at +0x26868, six front
+// chips at +0x268c8) and `WorldMap::Init2` fills them at map load. Reading
+// them back through their own FBOs works perfectly (6/6 cells, ~20ms, no GL
+// error) but the CONTENT is wrong for our purpose: during gameplay those RTs
+// hold a 2x-magnified scrolling window around the party, tiled across the six
+// cells -- not the whole 1x world. The full-world 1536x1024 fill only happens
+// on `enterMiniMap`, i.e. only while the player is actually looking at the
+// game's map screen. See git history for the readback implementation.
+//
+// WHAT WE DO INSTEAD. The overworld is 96x64 metatiles in TWO u8 layers, and
+// WorldMap keeps them live and patched (bridges built, craters opened) at a
+// fixed offset. That is only 12KB, it is always current, and it is exactly the
+// on-disk `Map_%04d.dat` layout -- so we snapshot those bytes and re-run the
+// SAME `WorldMapCompositor` the first-launch offline renderer uses. The result
+// is a full 3072x2048 render that reflects live story state, with no GL work
+// at all.
+//
+// Offsets verified against llvm-objdump of libchrono.so v2.1.5 (arm64):
+//   WorldScene+0x320    WorldImpl*    (WorldScene::mapButton @0x60bc64:
+//                                      ldr x8,[x0,#0x320]; ldr x8,[x8])
+//   WorldImpl+0x00      Asm memory base                (same instruction pair)
+//   WorldImpl+0x1e78    WorldMap*     (@0x60b00c: str x1,[x0,#0x1e78])
+//   WorldMap+0x320      era / world index 0..6         (markMiniMap @0x60a548)
+//   WorldMap+0x237e0    world::MapData, the metatile grid:
+//                       WorldMap::GetMapData(l,x,y) @0x609b18 computes
+//                         mov w8,#0x1800 ; mov w9,#0x60
+//                         smaddl x8, l, 0x1800, this   ; layer stride 0x1800
+//                         smaddl x8, y, 0x60, x8       ; row stride 96
+//                         mov w9,#0x237e0 ; add x8,x8,x ; ldrb [x8,x9]
+//                       i.e. *(u8*)(this + 0x237e0 + l*0x1800 + y*96 + x).
+//                       PutMapData @0x609b3c writes through the identical
+//                       expression, and world::MapData::GetMapData @0x6066e0
+//                       is the same math with no +0x237e0 -- confirming
+//                       WorldMap embeds a world::MapData there.
+//                       So layer 0 is at +0x237e0 and layer 1 at +0x24fe0,
+//                       CONTIGUOUS and 0x1800 apart: the 0x3000-byte copy
+//                       matches Map_%04d.dat byte for byte (layer 0 at file
+//                       offset 0, layer 1 at 0x1800).
+//   WorldMap+0x26d88    u8 map-dirty flag: set by PutMapData @0x609ba4,
+//                       consumed at the top of WorldMap::update @0x608518
+//                       (ldrb w8,[x28,#0xd88]; cbz -> ReWrite; strb wzr).
+//
+// The snapshot is taken on the GL thread (the scene graph is unsafe to walk
+// off-thread) into a static buffer, so the accessors below never touch the
+// scene graph and are callable from any thread -- and, crucially, can never
+// read through a WorldMap* that the scene teardown has already freed.
+// ---------------------------------------------------------------------------
+
+#define WS_IMPL_OFFSET        0x320
+#define WIMPL_WORLDMAP_OFFSET 0x1e78
+#define WM_ERA_OFFSET         0x320
+#define WM_MAPDATA_OFFSET     0x237e0
+#define WM_DIRTY_OFFSET       0x26d88
+
+#define WM_LAYER_BYTES 0x1800              // 96 * 64
+#define WM_MAP_BYTES   (2 * WM_LAYER_BYTES) // 0x3000 -- one Map_%04d.dat
+
+// GL-thread snapshot of the live metatile grid, plus an FNV-1a hash of it so
+// the Java poller can detect a change with one JNI int call instead of hauling
+// 12KB across the boundary twice a second.
+static uint8_t  g_wm_map[WM_MAP_BYTES];
+static volatile int      g_wm_map_valid;
+static volatile uint32_t g_wm_map_hash;
+static volatile int g_wm_present;      // WorldScene + WorldMap both resolve
+static volatile int g_wm_last_dirty = -1;
+static volatile int g_wm_ready_wm_era = -1; // WorldMap+0x320 (diagnostic; NOT the panel's era id)
+static int g_wm_snapshots;
+
+static uint32_t wm_fnv1a(const uint8_t *p, size_t n) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+// WorldScene -> WorldImpl -> WorldMap, every read guarded. Returns NULL for
+// every non-overworld scene (field, battle, menus) without touching anything.
+static void *wm_resolve(void *scene) {
+    if (!scene) return NULL;
+    void *ws = find_node_by_type(scene, "WorldScene", 2);
+    if (!ws || !vtable_in_libchrono(ws)) return NULL;
+    void *impl = NULL;
+    if (!safe_read((uint8_t *) ws + WS_IMPL_OFFSET, &impl, 8) || !plausible_ptr(impl)) return NULL;
+    void *wm = NULL;
+    if (!safe_read((uint8_t *) impl + WIMPL_WORLDMAP_OFFSET, &wm, 8) || !plausible_ptr(wm)) return NULL;
+    if (!vtable_in_libchrono(wm)) return NULL;
+    return wm;
+}
+
+// Per-rendered-frame tick, called from nativeEnforceUiTick with the scene it
+// already resolved. On a non-overworld frame this is one shallow depth-2 type
+// search that misses immediately; on the overworld it adds a 12KB
+// process_vm_readv (single-digit microseconds) and an FNV pass.
+static void world_map_tick(void *scene) {
+    void *wm = wm_resolve(scene);
+    if (!wm) {
+        if (g_wm_present) {
+            LOGI("worldmap: WorldScene gone");
+            g_wm_present = 0;
+            g_wm_last_dirty = -1;
+            // The snapshot deliberately SURVIVES the scene: the panel keeps
+            // showing the last known world after the party goes indoors,
+            // which is exactly what the DS-style map wants.
+        }
+        return;
+    }
+    if (!g_wm_present) {
+        g_wm_present = 1;
+        LOGI("worldmap: WorldScene appeared");
+    }
+
+    uint8_t dirty = 0;
+    if (safe_read((uint8_t *) wm + WM_DIRTY_OFFSET, &dirty, 1)) g_wm_last_dirty = dirty;
+    // Snapshot only once the game has finished applying a change. PutMapData
+    // sets the dirty byte on every single metatile write, so a scripted map
+    // edit (a bridge, a crater) is a burst of writes across frames; sampling
+    // mid-burst would hash a half-applied grid and cost one extra recomposite.
+    if (dirty) return;
+
+    uint8_t buf[WM_MAP_BYTES];
+    if (!safe_read((uint8_t *) wm + WM_MAPDATA_OFFSET, buf, sizeof(buf))) return;
+    uint32_t h = wm_fnv1a(buf, sizeof(buf));
+    if (g_wm_map_valid && h == g_wm_map_hash) return;
+
+    int era = -1;
+    safe_read((uint8_t *) wm + WM_ERA_OFFSET, &era, 4);
+    memcpy(g_wm_map, buf, sizeof(buf));
+    g_wm_ready_wm_era = era;
+    // Release store pairs with the acquire loads in the accessors below:
+    // g_wm_map is filled by this (GL) thread and read by the main thread.
+    g_wm_map_hash = h;
+    __atomic_store_n(&g_wm_map_valid, 1, __ATOMIC_RELEASE);
+    g_wm_snapshots++;
+    LOGI("worldmap: map data snapshot #%d hash=0x%08x WorldMap+0x320=%d (%d bytes)",
+         g_wm_snapshots, h, era, WM_MAP_BYTES);
+}
+
+// --- JNI -------------------------------------------------------------------
+
+/** 1 while the running scene contains a WorldScene whose WorldMap resolves. */
+JNIEXPORT jboolean JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetWorldScenePresent(JNIEnv *env, jclass cls) {
+    return g_wm_present ? JNI_TRUE : JNI_FALSE;
+}
+
+/** The game's own map-dirty byte (WorldMap+0x26d88) as last seen by the GL tick; -1 = no WorldScene. */
+JNIEXPORT jint JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetWorldMapDirty(JNIEnv *env, jclass cls) {
+    return g_wm_present ? (jint) g_wm_last_dirty : -1;
+}
+
+/**
+ * FNV-1a hash of the live metatile grid, or 0 when nothing has been snapshotted
+ * yet. The cheap change signal: the Java poller compares this and only pulls
+ * the 12KB when it moves.
+ */
+JNIEXPORT jint JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetWorldMapHash(JNIEnv *env, jclass cls) {
+    if (!__atomic_load_n(&g_wm_map_valid, __ATOMIC_ACQUIRE)) return 0;
+    return (jint) g_wm_map_hash;
+}
+
+/** WorldMap+0x320 (the WorldMap object's own 0..6 world index) for the last snapshot, or -1. Diagnostic: this is NOT the same id space as nativeGetWorldEra(). */
+JNIEXPORT jint JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetWorldMapIndex(JNIEnv *env, jclass cls) {
+    return (jint) g_wm_ready_wm_era;
+}
+
+/**
+ * Copies the live 96x64 x2-layer metatile grid (12288 bytes, exactly the
+ * Map_%04d.dat layout: layer 0 at offset 0, layer 1 at 0x1800) into
+ * {@code out}. False when no snapshot exists yet (never been on the overworld)
+ * or the array is too small. Any thread -- reads the GL thread's static
+ * snapshot, never the scene graph.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetWorldMapData(JNIEnv *env, jclass cls,
+                                                                jbyteArray out) {
+    if (!out || !__atomic_load_n(&g_wm_map_valid, __ATOMIC_ACQUIRE)) return JNI_FALSE;
+    if ((*env)->GetArrayLength(env, out) < WM_MAP_BYTES) return JNI_FALSE;
+    (*env)->SetByteArrayRegion(env, out, 0, WM_MAP_BYTES, (const jbyte *) g_wm_map);
+    return JNI_TRUE;
+}
+
+/** Size of the buffer {@link #nativeGetWorldMapData} wants (0x3000). */
+JNIEXPORT jint JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetWorldMapDataSize(JNIEnv *env, jclass cls) {
+    return WM_MAP_BYTES;
+}
+
+// Pixel-granular party/Epoch position, straight out of the same Asm memory
+// WorldMap::markMiniMap @0x60a4f0 reads (verified instruction by
+// instruction):
+//   party  Px = u16 @0x2E283            (0x60a52c: mov w8,#0xe283; ldrh)
+//          Py = u16 @0x2E285            (0x60a544: mov w8,#0xe285; ldrh)
+//   Epoch shown only when  (i8)asmmem[0x2E294] < 0   (0x60a6f4: ldrsb; tbz #31)
+//                    and   u16@0x2E100 == u16@0x2E29F (0x60a708/0x60a718)
+//          Ex = asmmem[0x2E290] | (asmmem[0x2E291] << 8)  (0x60a734/0x60a738)
+//          Ey = u16 @0x2E292                              (0x60a744: mov w9,#0xe292)
+//
+// CALIBRATED ON DEVICE (2026-09-04): these are already world-image pixels at
+// 1x with a top-left origin -- logcat showed partyRaw=(280,280) against
+// tile=(35,35) and partyRaw=(280,296) against tile=(37 -> 296/8), i.e.
+// raw == tile*8 exactly, on both axes. The (-256, +256) shift derived
+// statically from markMiniMap's node-space transform does NOT apply (that
+// algebra described the RenderTexture mosaic's own space, which we no longer
+// use), and neither does the modulo wrap. So the conversion is the identity,
+// and the raw values are returned alongside the derived ones purely so the
+// log line stays self-checking.
+// Plain safe_read off the global Asm buffer, so callable from any thread.
+#define WM_PARTY_X_OFFSET    0x2E283
+#define WM_PARTY_Y_OFFSET    0x2E285
+#define WM_EPOCH_FLAG_OFFSET 0x2E294
+#define WM_EPOCH_ERA_OFFSET  0x2E29F
+#define WM_EPOCH_X_OFFSET    0x2E290
+#define WM_EPOCH_Y_OFFSET    0x2E292
+
+// Full world in 1x pixels: 96 x 64 metatiles of 16px. The composited render is
+// 2x (3072x2048), but the panel maps proportionally, so markers stay in 1x.
+#define WM_WORLD_PX_W 1536
+#define WM_WORLD_PX_H 1024
+
+/** {partyImgX, partyImgY, epochImgX, epochImgY, epochVisible, rawPx, rawPy,
+ *  rawEx, rawEy} in 1x world-image pixels, top-left origin. Party entries are
+ *  -1 if unreadable or out of range; Epoch entries are -1 unless epochVisible
+ *  is 1. NULL when the Asm buffer isn't attached. */
+JNIEXPORT jintArray JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetWorldPixelPos(JNIEnv *env, jclass cls) {
+    jint buf[9];
+    for (int i = 0; i < 9; i++) buf[i] = -1;
+    buf[4] = 0;
+    if (!g_asm_mem_slot) return NULL;
+    uint8_t *mem = *g_asm_mem_slot;
+    if (!plausible_ptr(mem)) return NULL;
+
+    uint16_t px = 0, py = 0;
+    if (safe_read(mem + WM_PARTY_X_OFFSET, &px, 2) && safe_read(mem + WM_PARTY_Y_OFFSET, &py, 2)) {
+        buf[5] = px;
+        buf[6] = py;
+        if (px < WM_WORLD_PX_W && py < WM_WORLD_PX_H) {
+            buf[0] = px;
+            buf[1] = py;
+        }
+    }
+
+    int8_t flag = 0;
+    uint16_t era_now = 0, era_epoch = 0;
+    if (safe_read(mem + WM_EPOCH_FLAG_OFFSET, &flag, 1) && flag < 0
+            && safe_read(mem + WORLD_ERA_RAW_OFFSET, &era_now, 2)
+            && safe_read(mem + WM_EPOCH_ERA_OFFSET, &era_epoch, 2)
+            && era_now == era_epoch) {
+        uint8_t exlo = 0, exhi = 0;
+        uint16_t ey = 0;
+        if (safe_read(mem + WM_EPOCH_X_OFFSET, &exlo, 1)
+                && safe_read(mem + WM_EPOCH_X_OFFSET + 1, &exhi, 1)
+                && safe_read(mem + WM_EPOCH_Y_OFFSET, &ey, 2)) {
+            int ex = exlo | (exhi << 8);
+            buf[7] = ex;
+            buf[8] = ey;
+            if (ex < WM_WORLD_PX_W && ey < WM_WORLD_PX_H) {
+                buf[2] = ex;
+                buf[3] = ey;
+                buf[4] = 1;
+            }
+        }
+    }
+
+    jintArray arr = (*env)->NewIntArray(env, 9);
+    if (!arr) return NULL;
+    (*env)->SetIntArrayRegion(env, arr, 0, 9, buf);
     return arr;
 }

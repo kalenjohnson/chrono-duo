@@ -163,6 +163,21 @@ public final class PartySnapshot {
     // open per WorldScene::mapButton -- see world_era_report.md). Both are
     // plain safe_read, so cheap to fill every snapshot regardless of mode.
     public int worldEra = -1, worldMapMode = -1;
+    // True while the running scene actually contains a WorldScene whose
+    // WorldMap resolves (GameState.nativeGetWorldScenePresent, cached by the
+    // per-frame GL tick) -- worldEra alone can stay valid from Asm memory
+    // after the party goes indoors, and the live map capture must not be
+    // requested when the RenderTextures no longer exist.
+    public boolean worldScenePresent;
+    // Pixel-granular overworld marker positions in the captured world image's
+    // 1536x1024 top-left-origin space, from the same Asm addresses the game's
+    // own map screen reads (GameState.nativeGetWorldPixelPos). -1 = unknown;
+    // PartyPanelView falls back to the 8px-granular worldX/worldY above.
+    public int worldPixelX = -1, worldPixelY = -1;
+    // Epoch ("silverd") marker, drawn only when the Epoch is parked in this
+    // era -- epochVisible mirrors markMiniMap's own gate.
+    public int epochPixelX = -1, epochPixelY = -1;
+    public boolean epochVisible;
     // Current field-map/location id, from GameState.nativeGetFieldMapId()
     // (ChronoCanvas+0x12300). -1 when unknown/unattached. Used by
     // PartyPanelView to look up a rendered DS-style area map bitmap for
@@ -207,7 +222,22 @@ public final class PartySnapshot {
             snap.fieldX = fieldPos[0];
             snap.fieldY = fieldPos[1];
         }
+        snap.worldScenePresent = GameState.nativeGetWorldScenePresent();
         if (snap.mapName.isEmpty()) {
+            // Gated on "on the overworld" exactly like the tile read below:
+            // these Asm bytes are not cleared when the party goes indoors, so
+            // reading them unconditionally would both report stale overworld
+            // coordinates off-overworld and, because sameAs() compares them,
+            // make the panel repaint every poll if anything else happens to
+            // write that memory during a field map or battle.
+            int[] wp = GameState.nativeGetWorldPixelPos();
+            if (wp != null && wp.length >= 5) {
+                snap.worldPixelX = wp[0];
+                snap.worldPixelY = wp[1];
+                snap.epochPixelX = wp[2];
+                snap.epochPixelY = wp[3];
+                snap.epochVisible = wp[4] == 1;
+            }
             byte[] pos = GameState.nativeReadAsmMem(0x2E102, 2);
             if (pos != null) {
                 snap.worldX = pos[0] & 0xff;
@@ -357,6 +387,10 @@ public final class PartySnapshot {
                 || !mapName.equals(o.mapName)
                 || worldX != o.worldX || worldY != o.worldY
                 || worldEra != o.worldEra || worldMapMode != o.worldMapMode
+                || worldScenePresent != o.worldScenePresent
+                || worldPixelX != o.worldPixelX || worldPixelY != o.worldPixelY
+                || epochVisible != o.epochVisible
+                || epochPixelX != o.epochPixelX || epochPixelY != o.epochPixelY
                 || fieldMapId != o.fieldMapId
                 || !feq(fieldX, o.fieldX) || !feq(fieldY, o.fieldY)) return false;
         if (inBattle != o.inBattle || enemies.size() != o.enemies.size()) return false;

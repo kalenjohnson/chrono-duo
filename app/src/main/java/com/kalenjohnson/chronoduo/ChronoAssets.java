@@ -9,6 +9,7 @@ import android.graphics.Paint;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.HashSet;
@@ -31,6 +32,11 @@ public final class ChronoAssets {
 
     private static Bitmap facePng;
     private static Bitmap minimapMark;
+    // Cell 2 of Game/common/minimap_mark.png. WorldMap::markMiniMap uses it
+    // for the Epoch ("silverd" -- シルバード), the time machine, drawn on the
+    // world map only while the Epoch is parked in the era being shown. It is
+    // NOT the generic "point of interest" pin an earlier reading assumed.
+    private static Bitmap epochMark;
     private static Bitmap windowTex;
     // 0-based line index into Localize/en/msg/monster.txt == monster id
     // (line 146 = "Gato", verified live). Null until extraction finishes.
@@ -125,6 +131,8 @@ public final class ChronoAssets {
 
     public static Bitmap getFace() { return facePng; }
     public static Bitmap getMinimapMark() { return minimapMark; }
+    /** Cell 2 of minimap_mark.png -- the Epoch marker; see {@link #epochMark}. */
+    public static Bitmap getEpochMark() { return epochMark; }
     public static Bitmap getWindowTex() { return windowTex; }
     public static String[] getMonsterNames() { return monsterNames; }
     public static byte[] getMonsterFlags() { return monsterFlags; }
@@ -207,6 +215,10 @@ public final class ChronoAssets {
     // PartySnapshot#worldEra). Set once from AppActivity, mirroring
     // setExternalFilesDir/setFilesDir above.
     private static File worldMapDir;
+    // Highest overworld id GameState.nativeGetWorldEra() can return (raw
+    // 0x1FA - 0x1F0); WorldMapRenderer only renders 0..7, the rest can only
+    // ever come from a live capture.
+    private static final int WORLD_ERA_MAX = 10;
     private static final int WORLD_MAP_CACHE_CAP = 3;
     private static final Map<Integer, Bitmap> worldMapCache =
             new LinkedHashMap<Integer, Bitmap>(WORLD_MAP_CACHE_CAP, 0.75f, true) {
@@ -224,8 +236,40 @@ public final class ChronoAssets {
     // (see PartyPanelView's letterboxing comment on the old single-map field).
     private static Bitmap miniMapFallback;
 
+    // Live re-composites of the game's own metatile grid (see WorldMapLive /
+    // GameState.nativeGetWorldMapData), keyed by the same panel-space era id
+    // as the on-disk PNGs. Preferred over the decode cache
+    // and the offline render by getWorldMap(), because it reflects story
+    // changes (bridges, craters, the Ocean Palace) the offline render can't.
+    // Not LRU-capped: at most a handful of eras are ever visited in one
+    // session, and evicting a live capture would silently fall back to a stale
+    // picture. The PNG is written to disk too, so a restart keeps the change.
+    private static final Map<Integer, Bitmap> worldMapLive = new HashMap<>();
+
     /** Records the directory {@link #getWorldMap(int)} looks in for {@code worldmap_era<N>.png}. Set once from AppActivity. */
     public static void setWorldMapDir(File dir) { worldMapDir = dir; }
+
+    /**
+     * Installs a live re-composite of the game's own world map for {@code era}
+     * as the bitmap {@link #getWorldMap(int)} returns from now on, tinted
+     * through the same {@link #sepiaTint} as the offline render so the two
+     * look identical on the panel. Also drops any cached decode of the
+     * (now superseded) on-disk PNG for that era. Main thread only, like the
+     * rest of ChronoAssets; notifies listeners so a panel already showing the
+     * old image repaints immediately instead of waiting for the next poll.
+     */
+    public static void setLiveWorldMap(int era, Bitmap capture) {
+        if (era < 0 || capture == null) return;
+        worldMapLive.put(era, sepiaTint(capture));
+        worldMapCache.remove(era);
+        worldMapMisses.remove(era);
+        notifyListeners();
+    }
+
+    /** True when a live capture (not the offline render) is currently backing {@code era}. */
+    public static boolean hasLiveWorldMap(int era) {
+        return era >= 0 && worldMapLive.containsKey(era);
+    }
 
     /** Stores the wb_mini.png-derived fallback bitmap (tinted once, see {@link #sepiaTint}), shown by {@link #getWorldMap(int)} for any era with no rendered PNG on disk yet. */
     public static void setMiniMapFallback(Bitmap b) {
@@ -247,6 +291,8 @@ public final class ChronoAssets {
      */
     public static Bitmap getWorldMap(int era) {
         if (era < 0) return miniMapFallback;
+        Bitmap live = worldMapLive.get(era);
+        if (live != null) return live;
         Bitmap cached = worldMapCache.get(era);
         if (cached != null) return cached;
         if (worldMapMisses.contains(era)) return miniMapFallback;
@@ -277,7 +323,10 @@ public final class ChronoAssets {
      * single-map field this replaces.
      */
     public static boolean isWorldMapNaturalAspect(int era) {
-        return era >= 0 && worldMapCache.containsKey(era);
+        // Live captures are 1536x1024 and the offline renders 3072x2048 --
+        // both already at the world's true 1.5:1 aspect, unlike the wb_mini
+        // fallback, so either one counts as natural.
+        return era >= 0 && (worldMapLive.containsKey(era) || worldMapCache.containsKey(era));
     }
 
     /**
@@ -288,6 +337,9 @@ public final class ChronoAssets {
      * (or a previous capture) for this era repaints.
      */
     public static void invalidateWorldMap(int era) {
+        // Deliberately does NOT drop a live capture: the offline render this
+        // is announcing is strictly older information than a readback of the
+        // game's own RenderTextures.
         worldMapCache.remove(era);
         worldMapMisses.remove(era);
         notifyListeners();
@@ -309,13 +361,18 @@ public final class ChronoAssets {
     public static List<Integer> capturedWorldMapEras() {
         List<Integer> eras = new ArrayList<>();
         if (worldMapDir == null) return eras;
-        for (int era = 0; era < WorldMapRenderer.worldCount(); era++) {
-            if (resolveWorldMapFile(era) != null) eras.add(era);
+        // Up to WORLD_ERA_MAX, not WorldMapRenderer.worldCount(): the offline
+        // renderer covers worlds 0..7, but a live capture is keyed by
+        // GameState.nativeGetWorldEra(), which reaches 10 for the special
+        // maps -- worldmap_era8..10.png can exist on disk.
+        for (int era = 0; era <= WORLD_ERA_MAX; era++) {
+            if (worldMapLive.containsKey(era) || resolveWorldMapFile(era) != null) eras.add(era);
         }
         return eras;
     }
 
     public static void setMinimapMark(Bitmap b) { minimapMark = b; notifyListeners(); }
+    public static void setEpochMark(Bitmap b) { epochMark = b; notifyListeners(); }
     public static void setWindowTex(Bitmap b) { windowTex = b; notifyListeners(); }
 
     /** Stores the monster name table (line index == monster id) and notifies listeners, so a battle panel already open when extraction finishes repaints with real names. */
@@ -442,6 +499,7 @@ public final class ChronoAssets {
     public static void addListener(Listener l) {
         listeners.add(l);
         if (facePng != null || miniMapFallback != null || !worldMapCache.isEmpty()
+                || !worldMapLive.isEmpty()
                 || minimapMark != null || windowTex != null
                 || monsterNames != null || monsterFlags != null
                 || techNames != null || itemNames != null

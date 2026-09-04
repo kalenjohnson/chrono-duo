@@ -23,6 +23,9 @@ screen via Android's standard `Presentation` API.
 - [x] All 8 overworld maps rendered on device, at first launch, straight from
       the game's own map/chip data (no screenshot capture, no ROM needed) --
       see "World maps" below
+- [x] Live overworld map: re-composited from the game's own live map data, so
+      story changes (bridges, craters) appear on the companion screen and
+      persist across launches
 - [x] Live battle mode: real-time party HP, named enemy bars (honoring the
       game's hidden-info flags by default, eye-toggle to reveal), fades and
       results window on the bottom screen

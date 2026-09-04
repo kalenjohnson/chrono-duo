@@ -385,3 +385,126 @@ tile coordinate by 3), so the full overworld spans X in 0..191, Y in 0..127
 regardless of render scale -- `PartyPanelView.drawOverworldContent` maps
 proportionally by those spans (`worldX/192`, `worldY/128`) through whatever
 rect the map bitmap is drawn into, not a flat 256-unit range.
+
+## Live overworld map from the game's own map data (2026-09-04)
+
+The offline render above is now only the **first-launch fallback**. The panel
+re-composites the world from the game's own **live metatile grid**, so story
+changes (the Zenan bridge, the Lavos crater, the Ocean Palace) show up on the
+second screen. All offsets below were verified instruction-by-instruction
+against `llvm-objdump` of `libchrono.so` v2.1.5 arm64.
+
+### Dead end: the RenderTextures are a 2x scrolling window, not the world
+
+`WorldMap` holds twelve `cocos2d::RenderTexture`s — six terrain at
+`WorldMap+0x26868`, six front-chip at `+0x268c8`, each 512x512 — and
+`worldmap_screen_re.md` concluded they hold a complete 1536x1024 picture of the
+whole world. **They do not, during gameplay.** Reading them back through their
+own FBOs works perfectly (6/6 cells, ~20 ms, no GL error, on device), but the
+content is a **2x-magnified scrolling window around the party**, tiled across
+the six cells. The full-world 1x fill only happens on `enterMiniMap`, i.e. only
+while the player is actually looking at the game's map screen — which is exactly
+the state we did not want to force. The readback implementation (RT `_FBO` at
+`+0x32c`, `_texture` at `+0x340`, both from `RenderTexture::initWithWidthAndHeight`
+@0x895f38; `cocos2d::Image` layout `_data@0x28, _dataLen@0x30, _width@0x38,
+_height@0x3c` from `initWithRawData` @0x8bb2a0) is in git history if it is ever
+useful for capturing the map screen itself. **Do not retry it for a live map.**
+
+### What we do instead: snapshot the metatile grid
+
+The world is 96x64 metatiles in **two** u8 layers — 12 KB — and `WorldMap` keeps
+that grid live and patched. `WorldMap::GetMapData(l,x,y)` @0x609b18 is:
+
+```
+mov w8,#0x1800 ; mov w9,#0x60
+smaddl x8, l, 0x1800, this      ; layer stride 0x1800
+smaddl x8, y, 0x60, x8          ; row stride 96
+mov w9,#0x237e0 ; add x8,x8,x ; ldrb w0,[x8,x9]
+```
+
+i.e. `*(u8*)(this + 0x237e0 + l*0x1800 + y*96 + x)`. `PutMapData` @0x609b3c
+writes through the identical expression, and `world::MapData::GetMapData`
+@0x6066e0 is the same math **without** the `+0x237e0`, confirming that `WorldMap`
+embeds a `world::MapData` at that offset. So layer 0 is at `+0x237e0` and layer 1
+at `+0x24fe0`, **contiguous and 0x1800 apart** — the 0x3000-byte copy is
+byte-for-byte the on-disk `Map_%04d.dat` layout (layer 0 at file offset 0,
+layer 1 at 0x1800), so it drops straight into the existing
+`WorldMapCompositor.composite`.
+
+| Offset | Contents | Verified at |
+|---|---|---|
+| `WorldScene+0x320` | `WorldImpl*` (`+0x00` = Asm memory base) | `mapButton` @0x60bc64 |
+| `WorldImpl+0x1e78` | `WorldMap*` | @0x60b00c `str x1,[x0,#0x1e78]` |
+| `WorldMap+0x320` | era / world index 0..6 | `markMiniMap` @0x60a548 |
+| `WorldMap+0x237e0` | `world::MapData`, 2 x 0x1800 metatile layers | `GetMapData` @0x609b18, `PutMapData` @0x609b3c, `world::MapData::GetMapData` @0x6066e0 |
+| `WorldMap+0x26d88` | u8 map-dirty flag | set `PutMapData` @0x609ba4, cleared `update` @0x608518 |
+
+**Capture path.** `world_map_tick` in `gamestate.c` runs on the GL thread,
+piggybacked on the existing per-frame enforcer tick. It resolves
+WorldScene→WorldImpl→WorldMap (all `safe_read`-guarded, never cached across
+frames), and when the dirty byte is **0** (the game applies a scripted map edit
+as a burst of `PutMapData` calls, each setting that byte, so sampling mid-burst
+would hash a half-applied grid) it `safe_read`s the 12 KB into a static buffer
+and FNV-1a hashes it. The Java accessors read only that static snapshot, so they
+are callable from any thread and can never dereference a `WorldMap*` the scene
+teardown has already freed. `nativeGetWorldMapHash()` is the cheap poll;
+`nativeGetWorldMapData(byte[])` pulls the bytes only when it moves. No GL work.
+
+**Java side.** `WorldMapLive.tick(snap)` runs from the panel's existing 500 ms
+poll; on a hash change it re-runs `WorldMapCompositor.composite` on a background
+thread with the chip pages for that world (decoded from the `filesDir/world_src`
+PNGs that `AppActivity#renderWorldMaps` re-stages every launch, through
+`WorldMapRenderer.loadChipPages` — the same non-premultiplied decode, since the
+compositor does a pixel replace and not a blend), publishes the 3072x2048 result
+through `ChronoAssets.setLiveWorldMap`, and writes it over
+`worldmap_era<N>.png`. A `worldmap_era<N>.hash` sidecar holds the grid hash the
+on-disk PNG was made from, so an unchanged map is never re-encoded. Chip pages
+are cached for the current world only (2 MB). One log line per recomposite with
+world id, hash, composite ms, and any skip reason; plus, once per world per
+session, a diff count of the live grid against the shipped `Map_%04d.dat` —
+which says directly whether the game had already patched story state in.
+
+**Two id spaces — do not confuse them.** `WorldMap+0x320` (0..6) is the
+`WorldMap` object's own world index (exposed as `nativeGetWorldMapIndex()`, for
+logs only); `GameState.nativeGetWorldEra()` (Asm u16 @0x2E100 − 0x1F0, 0..10) is
+what `PartySnapshot#worldEra`, `ChronoAssets.getWorldMap(era)` and
+`worldmap_era<N>.png` are keyed by. Everything user-facing uses the latter.
+
+**Party and Epoch markers — pixel-granular, CALIBRATED.** `WorldMap::markMiniMap`
+@0x60a4f0 does not use the 8px tile bytes: party `Px = u16 @asmmem 0x2E283`
+(@0x60a52c), `Py = u16 @0x2E285` (@0x60a544). The Epoch ("silverd" = シルバード,
+**not** a generic POI) is drawn only when `(i8)asmmem[0x2E294] < 0` (@0x60a6f4)
+*and* `u16@0x2E100 == u16@0x2E29F` (@0x60a708/@0x60a718), at
+`Ex = asmmem[0x2E290] | asmmem[0x2E291]<<8` (@0x60a734), `Ey = u16 @0x2E292`
+(@0x60a744). On-device logs settled the transform: `partyRaw=(280,280)` against
+`tile=(35,35)` and `partyRaw=(280,296)` against `tile=(35,37)` — i.e.
+`raw == tile*8` exactly on both axes, so **the raw values already are 1x
+world-image pixels with a top-left origin**. The (−256, +256) shift and modulo
+wrap derived statically from `markMiniMap`'s node-space transform described the
+RenderTexture mosaic's own space and do **not** apply; the conversion is the
+identity. `PartyPanelView` maps `x/1536`, `y/1024` proportionally into whatever
+rect the (2x, 3072x2048) render is drawn into, and falls back to the 8px tile
+bytes at 0x2E102/0x2E103 when the pixel values are unreadable.
+`Game/common/minimap_mark.png` is 48x16 = three 16x16 cells: cell 1 = party,
+**cell 2 = the Epoch** (`ChronoAssets.getEpochMark`).
+
+**Era 5 (Zeal) comes out right for free** — `WorldMapCompositor` already has the
+swapped-layer / no-overlay special case, and the live path reuses it via
+`WorldMapRenderer.overlayLayer0OnTop(world)`.
+
+**Scene lifetime.** `WorldScene` is a real scene swap; going indoors destroys the
+`WorldMap`. The `WorldMap*` is re-resolved every tick and never cached, but the
+12 KB snapshot deliberately *survives* the scene, so the panel keeps showing the
+last known world after the party goes indoors.
+
+**Dev trigger.** `adb shell am broadcast -a com.kalenjohnson.chronoduo.WORLD_MAP_CAPTURE`
+forces a recomposite even when the hash is unchanged, logs the live-vs-file diff
+count, the grid hash, WorldScene/dirty state and the raw/derived marker values,
+and writes `<externalFilesDir>/worldmap_capture_debug.png`. Unlike the previous
+RenderTexture version it cannot be starved by the normal path consuming a
+one-shot — there is no one-shot; a forced composite always runs from the
+current snapshot.
+
+**Still unverified on device:** that a live grid actually diverges from the
+shipped `Map_%04d.dat` after a story event (the diff-count log answers it in one
+line), and the recomposite wall time for a 3072x2048 composite on the Thor.

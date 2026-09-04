@@ -236,6 +236,46 @@ public final class GameState {
     public static native int[] nativeGetBattleResults();
 
     // --- frame-perfect UI enforcer -----------------------------------------
+    // --- live overworld map (see gamestate.c's world_map_tick) --------------
+    // The panel re-composites the world from the game's OWN live metatile
+    // grid, so story changes (bridges, craters) show up on the second screen.
+    // Not from the game's RenderTextures: those hold a 2x scrolling window
+    // around the party during play, and only become the whole 1x world inside
+    // the game's own map screen -- see the NOTES.md record.
+
+    /** True while the running scene contains a WorldScene whose WorldMap resolves (GL-tick cached). */
+    public static native boolean nativeGetWorldScenePresent();
+    /** The game's own map-dirty byte (WorldMap+0x26d88) as last seen by the GL tick; -1 = no WorldScene. */
+    public static native int nativeGetWorldMapDirty();
+    /**
+     * FNV-1a hash of the live 96x64x2 metatile grid, 0 before the first
+     * snapshot. The cheap change signal -- poll this and only pull the 12KB
+     * via {@link #nativeGetWorldMapData} when it moves.
+     */
+    public static native int nativeGetWorldMapHash();
+    /**
+     * Copies the live metatile grid into {@code out}: {@link
+     * #nativeGetWorldMapDataSize()} bytes in exactly the {@code Map_%04d.dat}
+     * layout (layer 0 at 0, layer 1 at 0x1800), so it drops straight into
+     * {@link WorldMapCompositor#composite}. False if nothing is snapshotted
+     * yet or the array is too small. Any thread.
+     */
+    public static native boolean nativeGetWorldMapData(byte[] out);
+    public static native int nativeGetWorldMapDataSize();
+    /** {@code WorldMap+0x320}, the WorldMap object's own 0..6 world index, for the last snapshot; -1 if none. Diagnostic only -- NOT the same id space as {@link #nativeGetWorldEra()}. */
+    public static native int nativeGetWorldMapIndex();
+    /**
+     * Pixel-granular overworld marker positions, the same Asm values the
+     * game's own map screen uses (WorldMap::markMiniMap): {@code {partyImgX,
+     * partyImgY, epochImgX, epochImgY, epochVisible, rawPartyX, rawPartyY,
+     * rawEpochX, rawEpochY}} in 1x world-image pixels (1536x1024, top-left
+     * origin). Calibrated on device: the raw values already ARE those pixels
+     * (raw == tile*8 on both axes), so no shift is applied. Party entries are
+     * -1 when unreadable, Epoch entries -1 unless {@code epochVisible == 1}.
+     * Null when the Asm buffer isn't attached.
+     */
+    public static native int[] nativeGetWorldPixelPos();
+
     // Idempotent start gate (native side) for the per-rendered-frame GL tick
     // below -- see startFrameEnforcer(). Returns true only the first time.
     public static native boolean nativeStartFrameEnforcer();

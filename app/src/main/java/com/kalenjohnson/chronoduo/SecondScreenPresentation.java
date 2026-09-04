@@ -37,6 +37,11 @@ public final class SecondScreenPresentation extends Presentation {
                 org.cocos2dx.lib.Cocos2dxHelper.runOnGLThread(GameState::nativeUpdateBattleFlag);
             }
             PartySnapshot snap = PartySnapshot.read();
+            // Live overworld map: arms a capture of the game's own pre-
+            // rendered world RenderTextures when the overworld appears or the
+            // era changes, and publishes any capture the GL thread finished.
+            // Cheap (two JNI scalar reads) when there's nothing to do.
+            WorldMapLive.tick(snap);
             if (last == null || !snap.sameAs(last)) {
                 last = snap;
                 panel.update(snap);

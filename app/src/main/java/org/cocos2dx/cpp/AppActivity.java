@@ -122,6 +122,12 @@ public class AppActivity extends Cocos2dxActivity {
         // WorldMapRenderer/renderWorldMaps below) live in the same external
         // files dir -- see ChronoAssets.getWorldMap.
         com.kalenjohnson.chronoduo.ChronoAssets.setWorldMapDir(ext != null ? ext : getFilesDir());
+        // Live world maps: re-composited from the game's own metatile grid
+        // (see WorldMapLive) using the chip pages renderWorldMaps stages under
+        // filesDir/world_src, and written over the same worldmap_era<N>.png
+        // files, so story changes persist across launches.
+        com.kalenjohnson.chronoduo.WorldMapLive.setDirs(
+                ext != null ? ext : getFilesDir(), new File(getFilesDir(), "world_src"));
         // Private files dir: where DsMapImporter writes DS-derived maps
         // decoded on-device from a user-supplied ROM (see requestRomImport/
         // importRomFromUri below) -- checked before externalFilesDir by
@@ -251,6 +257,11 @@ public class AppActivity extends Cocos2dxActivity {
             h.postDelayed(cleanUi, 700);
         }
 
+        // dev trigger: adb shell am broadcast -a com.kalenjohnson.chronoduo.WORLD_MAP_CAPTURE
+        // -- forces a re-composite of the world from the game's live metatile
+        // grid and logs the live-vs-Map_%04d.dat diff count, the grid hash,
+        // the WorldScene/dirty state and the raw/derived marker values, then
+        // writes <externalFilesDir>/worldmap_capture_debug.png.
         // dev trigger: adb shell am broadcast -a com.kalenjohnson.chronoduo.SCENE_DUMP
         // dev trigger: adb shell am broadcast -a com.kalenjohnson.chronoduo.BATTLE_HIDE_MASK
         // --ei mask N -- blanks direct children of the battle node by index
@@ -258,9 +269,16 @@ public class AppActivity extends Cocos2dxActivity {
         android.content.IntentFilter filter =
                 new android.content.IntentFilter("com.kalenjohnson.chronoduo.SCENE_DUMP");
         filter.addAction("com.kalenjohnson.chronoduo.BATTLE_HIDE_MASK");
+        filter.addAction("com.kalenjohnson.chronoduo.WORLD_MAP_CAPTURE");
         android.content.BroadcastReceiver devReceiver = new android.content.BroadcastReceiver() {
             @Override public void onReceive(Context c, android.content.Intent i) {
                 String action = i.getAction();
+                if ("com.kalenjohnson.chronoduo.WORLD_MAP_CAPTURE".equals(action)) {
+                    File dir = getExternalFilesDir(null);
+                    com.kalenjohnson.chronoduo.WorldMapLive.requestDebugCapture(
+                            dir != null ? new File(dir, "worldmap_capture_debug.png") : null);
+                    return;
+                }
                 if ("com.kalenjohnson.chronoduo.BATTLE_HIDE_MASK".equals(action)) {
                     int mask = i.getIntExtra("mask", 0);
                     Cocos2dxHelper.runOnGLThread(
@@ -484,6 +502,7 @@ public class AppActivity extends Cocos2dxActivity {
                 // AppActivity#renderWorldMaps.
                 final android.graphics.Bitmap map = cropWorldMap(files.get("Game/common/wb_mini.png"));
                 final android.graphics.Bitmap mark = cropMarkerTile(files.get("Game/common/minimap_mark.png"));
+                final android.graphics.Bitmap epochMark = cropEpochTile(files.get("Game/common/minimap_mark.png"));
                 final android.graphics.Bitmap windowTex = cropWindowTexture(files.get("Extension/menu_win.png"));
                 final String[] monsterNames = readNameTable(files.get("Localize/en/msg/monster.txt"));
                 final String[] techNames = readNameTable(files.get("Localize/en/msg/tech.txt"));
@@ -500,6 +519,7 @@ public class AppActivity extends Cocos2dxActivity {
                     if (face != null) com.kalenjohnson.chronoduo.ChronoAssets.setFace(face);
                     if (map != null) com.kalenjohnson.chronoduo.ChronoAssets.setMiniMapFallback(map);
                     if (mark != null) com.kalenjohnson.chronoduo.ChronoAssets.setMinimapMark(mark);
+                    if (epochMark != null) com.kalenjohnson.chronoduo.ChronoAssets.setEpochMark(epochMark);
                     if (windowTex != null) com.kalenjohnson.chronoduo.ChronoAssets.setWindowTex(windowTex);
                     if (monsterNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setMonsterNames(monsterNames);
                     if (techNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setTechNames(techNames);
@@ -661,6 +681,25 @@ public class AppActivity extends Cocos2dxActivity {
             return android.graphics.Bitmap.createBitmap(sheet, 16, 0, 16, 16);
         } catch (Exception e) {
             Log.w(TAG, "marker tile crop failed", e);
+            return null;
+        }
+    }
+
+    // Tile 2 of the same 48x16 strip: the yellow ring the game draws for the
+    // Epoch (WorldMap::markMiniMap's "silverd" child, rect (16,0,8,8) at 2x
+    // content scale = the 16x16 cell at x=32). Drawn on the overworld panel
+    // only while the Epoch is parked in the era being shown.
+    private static android.graphics.Bitmap cropEpochTile(File f) {
+        android.graphics.Bitmap sheet = decodeBitmap(f);
+        if (sheet == null) return null;
+        if (sheet.getWidth() < 48 || sheet.getHeight() < 16) {
+            Log.w(TAG, "minimap_mark.png smaller than expected, skipping Epoch tile crop");
+            return null;
+        }
+        try {
+            return android.graphics.Bitmap.createBitmap(sheet, 32, 0, 16, 16);
+        } catch (Exception e) {
+            Log.w(TAG, "Epoch tile crop failed", e);
             return null;
         }
     }

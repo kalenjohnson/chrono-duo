@@ -2056,8 +2056,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             drawBattleContent(c, parchment, s, live);
             return;
         }
-        boolean overworld = s.mapName == null || s.mapName.isEmpty();
-        String title = overworld ? "World Map" : s.mapName;
+        // Overworld only when the game's WorldScene is actually live. A
+        // nameless field scene (e.g. story cutscenes with no location) used
+        // to be mistaken for the overworld and showed a map that didn't apply.
+        boolean overworld = s.worldScenePresent;
+        boolean nameless = s.mapName == null || s.mapName.isEmpty();
+        String title = overworld ? "World Map" : (nameless ? "" : s.mapName);
         if (overworld) {
             drawOverworldContent(c, parchment, s, title);
         } else {
@@ -2074,6 +2078,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         c.drawText(title, parchment.centerX(), parchment.top + h * 0.085f, text);
 
         float mx = parchment.centerX(), my = parchment.centerY() + h * 0.03f;
+        // Epoch marker position; NaN until a valid pixel position is known.
+        float ex = Float.NaN, ey = Float.NaN;
         Bitmap map = ChronoAssets.getWorldMap(s.worldEra);
         if (map != null) {
             // area between the title and the gold/time corner text
@@ -2102,7 +2108,24 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             // in dst (the rendered 3072x2048 map or the letterboxed wb_mini
             // fallback) -- map proportionally by those spans, not a flat
             // 256-unit range.
-            if (s.worldX >= 0 && s.worldY >= 0) {
+            // Preferred: the pixel-granular position the game's OWN map
+            // screen uses (WorldMap::markMiniMap reads u16 pairs at Asm
+            // 0x2E283/0x2E285), already converted to the world image's
+            // 1536x1024 top-left-origin space by the native side. Both the
+            // 1x live capture (1536x1024) and the 2x offline render
+            // (3072x2048) cover that space exactly, so the proportional
+            // mapping below is correct for either without a scale factor.
+            if (s.worldPixelX >= 0 && s.worldPixelY >= 0) {
+                mx = dst.left + dst.width() * (s.worldPixelX / 1536f);
+                my = dst.top + dst.height() * (s.worldPixelY / 1024f);
+                if (s.epochVisible && s.epochPixelX >= 0 && s.epochPixelY >= 0) {
+                    ex = dst.left + dst.width() * (s.epochPixelX / 1536f);
+                    ey = dst.top + dst.height() * (s.epochPixelY / 1024f);
+                }
+            } else if (s.worldX >= 0 && s.worldY >= 0) {
+                // Fallback: the 8px-granular tile bytes at 0x2E102/0x2E103,
+                // so the full overworld spans X in 0..191 (1536/8) and Y in
+                // 0..127 (1024/8) -- see WorldImpl::GetPartyCharPos.
                 mx = dst.left + dst.width() * (s.worldX / 192f);
                 my = dst.top + dst.height() * (s.worldY / 128f);
             } else {
@@ -2112,6 +2135,15 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         }
 
         Bitmap mark = ChronoAssets.getMinimapMark();
+        // The Epoch ("silverd") marker, drawn first so the party pin stays on
+        // top when both sit on the same square -- cell 2 of minimap_mark.png,
+        // which the game itself uses for the parked Epoch (NOT a generic POI).
+        Bitmap epoch = ChronoAssets.getEpochMark();
+        if (epoch != null && !Float.isNaN(ex)) {
+            float es = h * 0.026f;
+            RectF epochDst = new RectF(ex - es, ey - es * 1.4f, ex + es, ey + es * 0.6f);
+            c.drawBitmap(epoch, null, epochDst, markerPaint);
+        }
         if (mark != null) {
             float ms = h * 0.03f;
             RectF markDst = new RectF(mx - ms, my - ms * 1.4f, mx + ms, my + ms * 0.6f);
