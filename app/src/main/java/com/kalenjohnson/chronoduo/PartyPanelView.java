@@ -323,31 +323,35 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         invalidate();
     }
 
-    // Original-sprites row, pushed from AppActivity via setOrigArtStatus as
-    // the background OrigArtRebuilder pass (see SettingsHost#requestOrigArtBuild)
-    // advances -- same idle/building/error shape as the DS-import row above,
-    // just without a "stage" string (rebuildAll's progress callback only ever
-    // reports a done/total sheet count). origArtError is non-null only after
-    // a failed build; cleared by the next attempt.
+    // Original-art row, pushed from AppActivity via setOrigArtStatus as the
+    // background rebuild (see SettingsHost#requestOrigArtBuild) advances --
+    // same idle/building/error shape as the DS-import row above. The build
+    // runs in two phases (character sprites, then field chip sheets), each
+    // with its own done/total count, so origArtPhase names the phase in
+    // flight ("sprites" / "field chips") and is null when idle.
     private boolean origArtBuilding;
     private int origArtDone, origArtTotal;
+    private String origArtPhase;
     private String origArtError;
-    // Hit box for the "Build original sprites" button -- left empty while
+    // Hit box for the "Build original art" button -- left empty while
     // building, same double-fire guard as importButtonHitBox.
     private final RectF origArtButtonHitBox = new RectF();
 
     /**
-     * Pushes live original-sprite-rebuild progress/result to the settings
-     * screen (see {@link #drawSettingsScreen}); called from AppActivity on
-     * the main thread as the background {@code OrigArtRebuilder.rebuildAll}
-     * pass advances. Mirrors {@link #setImportStatus}'s building/error/idle
-     * shape -- idle falls back to counting {@code *.png} files under
-     * {@code <filesDir>/orig_art}, see {@link #countOrigArtSheets}.
+     * Pushes live original-art rebuild progress/result to the settings screen
+     * (see {@link #drawSettingsScreen}); called from AppActivity on the main
+     * thread as the background {@code OrigArtRebuilder.rebuildAll} /
+     * {@code MapchipRebuilder.rebuildAll} passes advance. Mirrors {@link
+     * #setImportStatus}'s building/error/idle shape -- idle falls back to
+     * counting {@code *.png} files under {@code <filesDir>/orig_art}, see
+     * {@link #countOrigArtSheets}. {@code phase} labels which of the two
+     * rebuild passes the done/total belongs to, and may be null.
      */
-    public void setOrigArtStatus(boolean building, int done, int total, String error) {
+    public void setOrigArtStatus(boolean building, int done, int total, String phase, String error) {
         this.origArtBuilding = building;
         this.origArtDone = done;
         this.origArtTotal = total;
+        this.origArtPhase = phase;
         this.origArtError = error;
         invalidate();
     }
@@ -1909,17 +1913,18 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         return n > 0 ? (n + " maps") : "not imported";
     }
 
-    /** Counts {@code *.png} files directly under {@code <filesDir>/orig_art} for the settings screen's "Original sprites" status row -- see {@link #drawSettingsScreen}. Mirrors {@link #countDsMaps}; this is the same directory {@link org.cocos2dx.cpp.AppActivity}'s OrigArtRebuilder writes into and scanOrigArtReplacements() scans. */
+    /** Counts {@code *.png} files directly under {@code <filesDir>/orig_art} for the settings screen's "Original art" status row -- see {@link #drawSettingsScreen}. Mirrors {@link #countDsMaps}; this is the same directory {@link org.cocos2dx.cpp.AppActivity}'s OrigArtRebuilder and MapchipRebuilder write into and scanOrigArtReplacements() scans, so the count covers character sheets and field chip sheets together. */
     private int countOrigArtSheets() {
         File dir = new File(getContext().getFilesDir(), "orig_art");
         File[] files = dir.listFiles((d, name) -> name.endsWith(".png"));
         return files != null ? files.length : 0;
     }
 
-    /** Builds the "Original sprites: ..." status line's value half -- mirrors {@link #importStatusText}'s building/error/idle shape (see {@link #setOrigArtStatus}). */
+    /** Builds the "Original art: ..." status line's value half -- mirrors {@link #importStatusText}'s building/error/idle shape (see {@link #setOrigArtStatus}). */
     private String origArtStatusText() {
         if (origArtBuilding) {
-            return "building... " + origArtDone + "/" + origArtTotal;
+            String what = (origArtPhase != null && !origArtPhase.isEmpty()) ? (origArtPhase + " ") : "";
+            return "building " + what + origArtDone + "/" + origArtTotal;
         }
         if (origArtError != null) return "error: " + origArtError;
         int n = countOrigArtSheets();
@@ -1935,7 +1940,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     /**
      * The settings screen: same parchment chrome as the normal panel (title,
      * "DS maps: <status>" row + import button, "Pixel graphics: On/Off"
-     * button, "Original sprites: <status>" row + "Build original sprites"
+     * button, "Original art: <status>" row + "Build original art"
      * button -- disabled, no hit box, while {@link #origArtBuilding} -- and a
      * "Back" button that returns to the normal panel). Drawn instead of
      * {@link #drawContent}/the status boxes/gold-time corners whenever
@@ -1968,14 +1973,14 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
         setText(h * 0.032f, INK, false, Paint.Align.LEFT, false);
         text.setTypeface(Typeface.MONOSPACE);
-        c.drawText("Original sprites: " + origArtStatusText(), parchment.left + w * 0.06f,
+        c.drawText("Original art: " + origArtStatusText(), parchment.left + w * 0.06f,
                 parchment.top + h * 0.462f, text);
 
         setText(h * 0.022f, Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK)),
                 false, Paint.Align.LEFT, false);
-        c.drawText("Rebuilds the character sprites from the game's own",
+        c.drawText("Rebuilds character sprites and field chips from the",
                 parchment.left + w * 0.06f, parchment.top + h * 0.488f, text);
-        c.drawText("original pixel art. Only applies when Pixel graphics is On.",
+        c.drawText("game's own 1x art. Only applies when Pixel graphics is On.",
                 parchment.left + w * 0.06f, parchment.top + h * 0.514f, text);
 
         setText(h * 0.022f, Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK)),
@@ -2018,7 +2023,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         float origArtBtnH = h * 0.065f;
         RectF origArtBtn = new RectF(parchment.centerX() - origArtBtnW / 2f, parchment.top + h * 0.545f,
                 parchment.centerX() + origArtBtnW / 2f, parchment.top + h * 0.545f + origArtBtnH);
-        drawCommandButton(c, origArtBtn, "Build original sprites", winTex, false);
+        drawCommandButton(c, origArtBtn, "Build original art", winTex, false);
         if (origArtBuilding) {
             fill.setShader(null);
             fill.setColor(Color.argb(150, 0, 0, 0));

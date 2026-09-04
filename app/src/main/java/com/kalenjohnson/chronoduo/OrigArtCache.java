@@ -48,7 +48,10 @@ import java.util.zip.Deflater;
  *     -- name is the replacement's basename (e.g. "c000_0.png", including
  *     the ".png"), w/h its pixel size, alphaFp/redFp the FNV-1a content
  *     fingerprints of the ORIGINAL (unmodified) game asset at that name (see
- *     {@link #fingerprint}), formatted lowercase, zero-padded to 16 hex
+ *     {@link #fingerprint}) -- or BOTH ZERO for a path-keyed entry, the
+ *     sentinel that tells gamestate.c to match this name only against
+ *     the asset path the game asked for and never by content (see
+ *     {@link #isPathKeyed}) -- formatted lowercase, zero-padded to 16 hex
  *     digits ("%016x") so the native side's fixed-width sscanf can parse
  *     them without a delimiter, and pngMtime the source PNG's
  *     lastModified() at build time -- this trailing field is read only by
@@ -209,17 +212,42 @@ public final class OrigArtCache {
 
     /**
      * Maps an orig_art replacement filename to the resources.bin entry it
-     * should be fingerprinted against. For now only handles character sheet
-     * names ("c000_0.png", "c123_1.png", ...) under Game/chara/png/; returns
-     * null (skip, unsupported name) for anything else. A small standalone
-     * function so other directories (items, monsters, ...) can be added
-     * later without touching {@link #refresh}.
+     * should be fingerprinted against. Only handles character sheet names
+     * ("c000_0.png", "c123_1.png", ...) under Game/chara/png/; returns null
+     * for anything else -- including the PATH-KEYED names {@link
+     * #isPathKeyed} covers, which are matched by asset basename and need no
+     * fingerprint at all. A small standalone function so other directories
+     * (items, monsters, ...) can be added later without touching {@link
+     * #refresh}.
      */
     private static String origArtResourceEntry(String name) {
         if (name.matches("c\\d\\d\\d_\\d\\.png")) {
             return "Game/chara/png/" + name;
         }
         return null;
+    }
+
+    /**
+     * True for replacement names that are matched purely by the asset path the
+     * game asks for, never by content fingerprint -- currently the field chip
+     * sheets, "mapchip_&lt;chipTable&gt;_&lt;palette&gt;_&lt;page&gt;.png"
+     * (see {@link com.kalenjohnson.chronoduo.origart.MapchipRebuilder}).
+     *
+     * <p>Those load through {@code MapTable::LoadTexture} ->
+     * {@code ctr::ResourceManager::createTexture("Game/field/mapchip/...")},
+     * which gamestate.c's mechanism-5 hook already parks in
+     * {@code g_pending_tex_path}, so the path is available, unique and free.
+     * The alpha fingerprint would be a <em>bad</em> key here: a chip sheet's
+     * alpha channel is just its index-0 mask, several sheets are entirely
+     * transparent or entirely opaque, and collisions across 500-odd
+     * same-sized sheets are near certain. Entries built for these names
+     * therefore carry {@code alphaFp == redFp == 0}, the sentinel gamestate.c
+     * reads as "path-only -- never consider this entry for a fingerprint
+     * match"; building them also skips extracting the original asset
+     * entirely, which is what makes a ~500-sheet field pass cheap.</p>
+     */
+    private static boolean isPathKeyed(String name) {
+        return name.matches("mapchip_\\d+_\\d+_\\d+\\.png");
     }
 
     // ---- FNV-1a content fingerprint (must stay bit-identical to
@@ -360,6 +388,8 @@ public final class OrigArtCache {
         // check.
         long pngMtime = pngFile.lastModified();
 
+        if (isPathKeyed(name)) return buildPathKeyedEntry(name, pngFile, rgbzFile, pngMtime);
+
         String resEntry = origArtResourceEntry(name);
         if (resEntry == null) {
             Log.w(TAG, "orig_art_cache: no resources.bin mapping for " + name + " -- skipped");
@@ -441,6 +471,54 @@ public final class OrigArtCache {
         } finally {
             if (origNonPremul != null) origNonPremul.recycle();
             if (origPremul != null) origPremul.recycle();
+            if (replacement != null) replacement.recycle();
+        }
+    }
+
+    /**
+     * Builds one PATH-KEYED cache entry (see {@link #isPathKeyed}): decodes
+     * the replacement premultiplied (matching the game's own upload order),
+     * takes w/h from the replacement itself -- there is no original to
+     * measure against, and none is extracted -- deflates its raw R,G,B,A
+     * bytes into the same RGBZ container every other entry uses, and emits an
+     * index line whose two fingerprint fields are both zero.
+     *
+     * <p>That all-zero pair is the sentinel gamestate.c reads as "path-only":
+     * such an entry is only ever matched against {@code g_pending_tex_path}
+     * and is skipped by the content-fingerprint fallback (and by its
+     * size pre-scan, so a 512x512 upload with no registered fingerprint entry
+     * of that size doesn't pay for a 4096-sample hash). The index line format
+     * is otherwise unchanged, so the native parser needs no new field.</p>
+     */
+    private static Entry buildPathKeyedEntry(String name, File pngFile, File rgbzFile,
+                                              long pngMtime) {
+        Bitmap replacement = null;
+        try {
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
+            opts.inPremultiplied = true; // matches the game's own upload order
+            opts.inScaled = false;
+            replacement = BitmapFactory.decodeFile(pngFile.getAbsolutePath(), opts);
+            if (replacement == null) {
+                Log.w(TAG, "orig_art_cache: decode returned null for " + pngFile);
+                return null;
+            }
+            int w = replacement.getWidth(), h = replacement.getHeight();
+
+            byte[] rgbz = compressRgbz(w, h, bitmapRgbaBytes(replacement));
+            if (!writeAtomic(rgbzFile, rgbz)) {
+                Log.w(TAG, "orig_art_cache: failed to write " + rgbzFile);
+                return null;
+            }
+            String line = name + " " + w + " " + h + " "
+                    + String.format(Locale.ROOT, "%016x", 0L) + " "
+                    + String.format(Locale.ROOT, "%016x", 0L) + " "
+                    + pngMtime;
+            return new Entry(name, pngMtime, line);
+        } catch (Exception e) {
+            Log.w(TAG, "orig_art_cache: failed to process " + pngFile, e);
+            return null;
+        } finally {
             if (replacement != null) replacement.recycle();
         }
     }

@@ -724,13 +724,15 @@ static void *hooked_createTexture(void *self, const void *stdstring) {
 // Guarded by g_tex_repl_mutex since loading and consultation run on
 // different threads. Entries never hold decoded pixels -- see the mechanism
 // 5 comment block above.
+// 629 character sheets + ~504 field chip sheet pages ~= 1133 entries with
+// both pipelines built, so this cap has roughly 2x of headroom left.
 #define TEX_REPL_MAX 2048
 #define TEX_REPL_NAME_MAX 32
 #define TEX_REPL_CAND_MAX 16
 typedef struct {
     char     name[TEX_REPL_NAME_MAX];
     int      w, h;
-    uint64_t alpha_fp;       // FNV-1a over a 64x64 alpha-channel sample grid of the ORIGINAL asset (see tex_fingerprint)
+    uint64_t alpha_fp;       // FNV-1a over a 64x64 alpha-channel sample grid of the ORIGINAL asset (see tex_fingerprint); 0 with red_fp == 0 means PATH-ONLY (never fingerprint-matched)
     uint64_t red_fp;         // same grid, red channel -- tiebreaker when alpha_fp collides across entries
     char     rgba_path[300]; // "<rgbaDir>/<name>.rgbz", RGBZ-header + zlib-compressed PREMULTIPLIED RGBA8888, w*h*4 bytes raw
     int      replaced_logged;
@@ -875,13 +877,137 @@ static int pixel_repl_load_rgbz(const char *path, int expect_w, int expect_h,
     return 1;
 }
 
+// ---------------------------------------------------------------------------
+// Pixel graphics, mechanism 6 (diagnostic only): PROBE the filter state of
+// ENGINE-GENERATED textures, right after their glTexImage2D.
+//
+// This started as the intended fix for the soft-looking FIELD GROUND layer.
+// Static RE says there is nothing there to fix, and that is the finding:
+//
+//   * the field background is NOT the smoothed mapchip sheets. MapTable::
+//     Expansion @ 0x568af0 / ExpansionExt @ 0x569c28 CPU-composite a
+//     power-of-two-padded 1x RGBA8888 buffer whose RED channel is an 8-bit
+//     palette index (MapTable::writeChip @ 0x56b5f0), hand it to
+//     Texture2D::initWithData @ 0x568e78, and draw it through
+//     Shaders/ShaderDrawPalettedTexture.fsh (one index tap + one palette tap);
+//   * immediately after that initWithData, 0x568e84-0x568f00 loads the 16-byte
+//     constant at 0x374f60 -- {0x2600, 0x2600, 0x812F, 0x812F} =
+//     {GL_NEAREST, GL_NEAREST, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE} -- and
+//     passes it to Texture2D::setTexParameters. (The conditional
+//     mov w8,#0x2901 = GL_REPEAT nearby writes only the two WRAP fields, at
+//     [x29,#-0x58]/[x29,#-0x54].) So the index texture is already NEAREST;
+//   * the palette texture (ctr::ResourceManager::createPaletteTexture @
+//     0x5be520) ends with setAliasTexParameters @ 0x5be7e8, and every
+//     RenderTexture (RenderTexture::initWithWidthAndHeight @ 0x895f38, 19 of
+//     them from FieldMap::makeField @ 0x57520c) does the same -- all NEAREST;
+//   * Texture2D::initWithMipmaps @ 0x936b8c always sets MIN/MAG explicitly, so
+//     no texture in this engine ever falls back to the GLES defaults
+//     (MIN = NEAREST_MIPMAP_LINEAR, MAG = LINEAR), and cocos2d-x is statically
+//     linked into libchrono.so with glTexParameteri a real JUMP_SLOT import,
+//     so mechanism 2's GOT patch really did see every one of those calls.
+//
+// Which is exactly why mechanisms 1 and 2 "changed nothing": they were
+// no-ops on this path. The residual ground softness is GEOMETRIC, not
+// filtering -- AppDelegate::applicationDidFinishLaunching @ 0x6417f0 picks a
+// 568x320-point design resolution (the Size constant written at 0x641c34)
+// with Director::setContentScaleFactor(2.0f) @ 0x641afc and NO_BORDER, so on
+// a 1920x1080 panel one source texel covers 1920/568 = 3.380 screen pixels.
+// NEAREST at a non-integer 3.38x gives blocks that alternate between 3 and 4
+// pixels wide, which reads as softness without any filter being involved.
+// (Confirmed on a device screenshot: horizontal run lengths over the ground,
+// the front chips and the character sprite are the same 3/4-px distribution --
+// a LINEAR-sampled region would show almost no equal neighbours at all.)
+// Fixing that properly means changing the design resolution so the scale is
+// an integer, which shrinks or grows the visible play area -- a
+// gameplay-visible trade, deliberately not made here.
+//
+// What remains is worth keeping and cheap, but it is a PROBE, not a patch:
+// after the real glTexImage2D returns, the texture just uploaded is still
+// bound to the active unit, so this reads back its MIN/MAG filters with
+// glGetTexParameteriv and LOGs -- once per distinct texture shape -- what it
+// found. If any engine-generated texture ever is not NEAREST (something the
+// static read above says should not happen), the log names its size instead
+// of it being invisible, and the fix can then be made deliberately for that
+// specific texture.
+//
+// It deliberately does NOT write the filter. The static evidence says every
+// texture on this path is already NEAREST, so a write would be inert where it
+// matters -- while still landing on textures nothing here has reasoned about,
+// notably the RenderTextures from FieldMap::makeField / RewriteBg / Scroll /
+// drawGate. Forcing NEAREST on a transition buffer that is sampled BELOW 1:1
+// trades correct minification for shimmer: a regression bought for nothing.
+// If nearest_was_linear ever comes back non-zero, that is the moment to add a
+// targeted write, not before.
+//
+// Scope: only uploads with NO asset path in flight (g_pending_tex_path empty),
+// i.e. engine-generated textures -- the field/world index textures, palette
+// LUTs and render-target allocations -- and only GL_RGBA ones, which leaves
+// cocos2d::FontAtlas's A8/LUMINANCE_ALPHA glyph atlases alone. File-loaded
+// sheets keep going through mechanisms 1/2 as before. Gated on the pixel-
+// graphics pref (g_pixel_probe_filters), unlike texture replacement.
+// ---------------------------------------------------------------------------
+
+static int g_pixel_probe_filters;
+
+#define GL_TEXTURE_2D 0x0DE1
+
+static void (*p_glGetTexParameteriv)(GLenum target, GLenum pname, GLint *params);
+
+// One log line per distinct (width, height, had-pixels) shape so the probe is
+// checkable on device without flooding logcat -- grep "pixel-gfx: generated".
+#define PIXEL_NEAREST_SEEN_MAX 32
+typedef struct { GLsizei width, height; int has_pixels; } pixel_nearest_seen_t;
+static pixel_nearest_seen_t g_pixel_nearest_seen[PIXEL_NEAREST_SEEN_MAX];
+static int      g_pixel_nearest_seen_count;
+static uint32_t g_pixel_nearest_probed;     // generated textures whose filter was read back
+static uint32_t g_pixel_nearest_was_linear; // ... of which were NOT already NEAREST
+
+static void pixel_probe_filter_after_upload(GLenum target, GLint level, GLsizei width,
+                                              GLsizei height, GLenum format,
+                                              const void *pixels, int generated) {
+    if (!g_pixel_probe_filters || !generated || level != 0) return;
+    if (target != GL_TEXTURE_2D || format != GL_RGBA) return;
+    if (!p_glGetTexParameteriv) return;
+
+    GLint had_min = 0, had_mag = 0;
+    p_glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &had_min);
+    p_glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &had_mag);
+    int was_linear = (had_min && had_min != GL_NEAREST) || (had_mag && had_mag != GL_NEAREST);
+    if (was_linear) g_pixel_nearest_was_linear++;
+    g_pixel_nearest_probed++;
+
+    int has_pixels = pixels != NULL;
+    for (int i = 0; i < g_pixel_nearest_seen_count; i++) {
+        if (g_pixel_nearest_seen[i].width == width &&
+            g_pixel_nearest_seen[i].height == height &&
+            g_pixel_nearest_seen[i].has_pixels == has_pixels) {
+            return;
+        }
+    }
+    if (g_pixel_nearest_seen_count < PIXEL_NEAREST_SEEN_MAX) {
+        g_pixel_nearest_seen[g_pixel_nearest_seen_count].width = width;
+        g_pixel_nearest_seen[g_pixel_nearest_seen_count].height = height;
+        g_pixel_nearest_seen[g_pixel_nearest_seen_count].has_pixels = has_pixels;
+        g_pixel_nearest_seen_count++;
+    }
+    LOGI("pixel-gfx: generated %dx%d RGBA texture (%s, no asset path): min=0x%x mag=0x%x%s",
+         width, height, has_pixels ? "with data" : "render-target alloc",
+         had_min, had_mag, was_linear ? " <-- NOT NEAREST" : " (NEAREST, as expected)");
+}
+
 static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat,
                                  GLsizei width, GLsizei height, GLint border,
                                  GLenum format, GLenum type, const void *pixels) {
+    // Sampled before anything else: an empty pending path means no
+    // addImage/createTexture call is in flight, i.e. this upload is an
+    // engine-generated texture (initWithData / RenderTexture) rather than a
+    // file-loaded sheet. Both mechanism 5's diagnostics and mechanism 6's
+    // filter forcing key off it.
+    const int generated = (g_pending_tex_path[0] == 0);
     g_pixel_teximage_calls++;
     if (g_pixel_teximage_calls <= 40) {
-        LOGI("pixel-gfx: texImage2D %dx%d fmt=0x%x type=0x%x level=%d path=%s",
-             width, height, (unsigned int) internalformat, type, level,
+        LOGI("pixel-gfx: texImage2D %dx%d fmt=0x%x type=0x%x level=%d data=%d path=%s",
+             width, height, (unsigned int) internalformat, type, level, pixels != NULL,
              g_pending_tex_path_full[0] ? g_pending_tex_path_full : "-");
     } else {
         int seen = 0;
@@ -906,8 +1032,10 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
         }
     }
     if (g_pixel_teximage_calls % 200 == 0) {
-        LOGI("pixel-gfx: stats texImage2D_calls=%u texParam_rewrites=%u",
-             g_pixel_teximage_calls, g_pixel_texparami_rewrites);
+        LOGI("pixel-gfx: stats texImage2D_calls=%u texParam_rewrites=%u nearest_probed=%u "
+             "nearest_was_linear=%u",
+             g_pixel_teximage_calls, g_pixel_texparami_rewrites, g_pixel_nearest_probed,
+             g_pixel_nearest_was_linear);
     }
 
     // Texture replacement (mechanism 5): if a registered replacement matches
@@ -937,6 +1065,13 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
         if (!r) {
             int size_registered = 0;
             for (int i = 0; i < g_tex_repl_count; i++) {
+                // A path-only entry (both fingerprints zero -- see
+                // OrigArtCache#isPathKeyed) must never make an upload pay for
+                // a 4096-sample hash, and must never be a fingerprint
+                // candidate: the field chip sheets that use that keying have
+                // near-degenerate alpha masks (several are entirely
+                // transparent or entirely opaque) and would collide wildly.
+                if (g_tex_repl[i].alpha_fp == 0 && g_tex_repl[i].red_fp == 0) continue;
                 if (g_tex_repl[i].w == width && g_tex_repl[i].h == height) {
                     size_registered = 1;
                     break;
@@ -954,6 +1089,7 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
                 static tex_replacement_t *candidates[TEX_REPL_CAND_MAX];
                 int ncand = 0;
                 for (int i = 0; i < g_tex_repl_count; i++) {
+                    if (g_tex_repl[i].alpha_fp == 0 && g_tex_repl[i].red_fp == 0) continue;
                     if (g_tex_repl[i].w == width && g_tex_repl[i].h == height &&
                         g_tex_repl[i].alpha_fp == alpha_fp) {
                         if (ncand < TEX_REPL_CAND_MAX) candidates[ncand++] = &g_tex_repl[i];
@@ -969,6 +1105,31 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
                             via_fingerprint = 1;
                             break;
                         }
+                    }
+                }
+            }
+        }
+
+        // Diagnostic, one-shot: a path-keyed entry (the field chip sheets --
+        // see OrigArtCache#isPathKeyed) can ONLY ever match via
+        // g_pending_tex_path. If an upload the size of a registered
+        // path-keyed entry arrives with no asset path in flight, the
+        // createTexture hook is probably not covering that load and the whole
+        // field-chip replacement is silently inert -- which has no other
+        // visible symptom. (An engine-generated texture that happens to be
+        // the same size would also trip this, hence "may".)
+        if (!r && generated) {
+            static int path_keyed_missed_logged;
+            if (!path_keyed_missed_logged) {
+                for (int i = 0; i < g_tex_repl_count; i++) {
+                    if (g_tex_repl[i].alpha_fp == 0 && g_tex_repl[i].red_fp == 0 &&
+                        g_tex_repl[i].w == width && g_tex_repl[i].h == height) {
+                        LOGE("pixel-gfx: %dx%d upload with no asset path in flight while "
+                             "path-keyed replacement %s is registered at that size -- the "
+                             "createTexture hook may not be covering this load",
+                             width, height, g_tex_repl[i].name);
+                        path_keyed_missed_logged = 1;
+                        break;
                     }
                 }
             }
@@ -997,6 +1158,8 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
                         p_real_glTexImage2D(target, level, internalformat, width, height, border,
                                              format, type, scratch);
                     }
+                    pixel_probe_filter_after_upload(target, level, width, height, format,
+                                                      scratch, generated);
                     if (!r->replaced_logged) {
                         if (via_fingerprint) {
                             LOGI("pixel-gfx: replaced %s by fingerprint (inflate %.2f ms)",
@@ -1049,6 +1212,8 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
                 p_real_glTexImage2D(target, level, internalformat, out_w, out_h, border, format,
                                      type, scratch);
             }
+            pixel_probe_filter_after_upload(target, level, out_w, out_h, format, scratch,
+                                              generated);
             return;
         }
         LOGE("pixel-gfx: decimate scratch alloc failed (%dx%d, %zu bytes) -- uploading full-size",
@@ -1059,6 +1224,7 @@ static void hooked_glTexImage2D(GLenum target, GLint level, GLint internalformat
         p_real_glTexImage2D(target, level, internalformat, width, height, border, format,
                              type, pixels);
     }
+    pixel_probe_filter_after_upload(target, level, width, height, format, pixels, generated);
 }
 
 static void hooked_glGenerateMipmap(GLenum target) {
@@ -1190,6 +1356,15 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetPixelGraphics(JNIEnv *env, jc
                               &g_pixel_teximg_orig_saved, (uintptr_t) hooked_glTexImage2D, 1);
         }
 
+        // Mechanism 6's readback. Never GOT-patched -- just called directly,
+        // so a miss only costs the "was min=/mag=" detail in its log line.
+        p_glGetTexParameteriv = (void (*)(GLenum, GLenum, GLint *))
+            dlsym(RTLD_DEFAULT, "glGetTexParameteriv");
+        if (!p_glGetTexParameteriv && gl_h) {
+            p_glGetTexParameteriv = (void (*)(GLenum, GLenum, GLint *))
+                dlsym(gl_h, "glGetTexParameteriv");
+        }
+
         p_real_glGenerateMipmap = (void (*)(GLenum)) dlsym(RTLD_DEFAULT, PIXEL_SYM_GENMIPMAP);
         if (!p_real_glGenerateMipmap && gl_h) {
             p_real_glGenerateMipmap = (void (*)(GLenum)) dlsym(gl_h, PIXEL_SYM_GENMIPMAP);
@@ -1252,6 +1427,14 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetPixelGraphics(JNIEnv *env, jc
         // just means this page is left more permissive than it started.
     }
 
+    // Mechanism 6: probe (read back and log, never write) the filter state of
+    // engine-generated textures after their upload -- the field/world paletted
+    // index textures, palette LUTs and render-target allocations. Static RE
+    // says these are already NEAREST; the value here is the log line that
+    // proves it live. Only a flag; the glTexImage2D hook that reads it is
+    // installed unconditionally above.
+    g_pixel_probe_filters = enable ? 1 : 0;
+
     pixel_patch_slot(g_pixel_texpi_slot, &g_pixel_texpi_orig, &g_pixel_texpi_orig_saved,
                       (uintptr_t) hooked_glTexParameteri, enable);
     pixel_patch_slot(g_pixel_texpf_slot, &g_pixel_texpf_orig, &g_pixel_texpf_orig_saved,
@@ -1291,8 +1474,10 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeSetPixelDecimate(JNIEnv *env, jc
 // LOGI line, on demand from Java.
 JNIEXPORT void JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeLogPixelStats(JNIEnv *env, jclass cls) {
-    LOGI("pixel-gfx: stats texImage2D_calls=%u glGenerateMipmap_calls=%u texParam_rewrites=%u",
-         g_pixel_teximage_calls, g_pixel_genmipmap_calls, g_pixel_texparami_rewrites);
+    LOGI("pixel-gfx: stats texImage2D_calls=%u glGenerateMipmap_calls=%u texParam_rewrites=%u "
+         "nearest_probed=%u nearest_was_linear=%u",
+         g_pixel_teximage_calls, g_pixel_genmipmap_calls, g_pixel_texparami_rewrites,
+         g_pixel_nearest_probed, g_pixel_nearest_was_linear);
 }
 
 // Loads the whole replacement registry from a text index built by Java's

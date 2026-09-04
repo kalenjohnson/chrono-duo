@@ -34,9 +34,11 @@ screen via Android's standard `Presentation` API.
 - [x] DS-style room maps: indoor area floor plans with live position marker
       when the user imports their own Chrono Trigger DS ROM from the settings
       page (.nds or .zip; nothing from the ROM is shipped)
-- [x] Original pixel-art sprites: a settings toggle restores the unfiltered
-      SNES-style character sprites, rebuilt on-device from art the game itself
-      ships (no ROM needed); field tiles remain the port's smoothed versions
+- [x] Original pixel art: a settings toggle restores the unfiltered SNES-style
+      character sprites **and field chip sheets**, both rebuilt on-device from
+      art the game itself ships (no ROM needed) -- the field chips come back
+      from the port's own 1x 4bpp tile banks, so tree roots, chests and
+      animated tiles lose their baked-in 2x smoothing
 - [ ] Someday: ATB gauges, optional cheats via the game's own ExperiencePlus
 
 ## Build

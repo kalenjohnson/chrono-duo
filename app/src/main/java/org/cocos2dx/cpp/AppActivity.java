@@ -565,24 +565,37 @@ public class AppActivity extends Cocos2dxActivity {
     }
 
     /**
-     * Runs {@link com.kalenjohnson.chronoduo.origart.OrigArtRebuilder#rebuildAll}
-     * on a background thread, writing into {@code <filesDir>/orig_art} --
-     * exactly the directory {@link #scanOrigArtReplacements} already scans --
-     * posting progress to the bottom-screen panel's settings view throughout
-     * (see {@link #updateOrigArtStatus}). Called from the {@link
-     * PartyPanelView.SettingsHost} wired onto SecondScreenManager in {@link
-     * #onCreate}, i.e. from a tap on the panel's "Build original sprites"
-     * button. A no-op if a build is already in flight ({@link
-     * #origArtBuilding}). On completion (success or failure) re-runs {@link
-     * #scanOrigArtReplacements} so any newly written sheets are picked up as
-     * texture replacements immediately, then posts the final status. Catches
-     * Throwable, not just Exception -- like {@link #importRomFromUri}, a
-     * background-thread Error would otherwise kill the whole process instead
-     * of just failing this build.
+     * Runs the two original-art rebuild passes on one background thread,
+     * writing into {@code <filesDir>/orig_art} -- exactly the directory
+     * {@link #scanOrigArtReplacements} already scans -- and posting progress
+     * to the bottom-screen panel's settings view throughout (see {@link
+     * #updateOrigArtStatus}):
+     * <ol>
+     *   <li>{@link com.kalenjohnson.chronoduo.origart.OrigArtRebuilder#rebuildAll}
+     *       -- the ~629 character sheets, rebuilt from their paired 1x
+     *       {@code Game/chara/bmp} art;</li>
+     *   <li>{@link com.kalenjohnson.chronoduo.origart.MapchipRebuilder#rebuildAll}
+     *       -- the ~252 field chip sheet pairs (pages 0 and 1 each), rebuilt
+     *       from the 4bpp cg banks + ChipTable + palette.</li>
+     * </ol>
+     * Both write into the same directory and are picked up by the same
+     * replacement machinery, so one button covers both; the phase label
+     * ("sprites" / "field chips") is what tells the two done/total counters
+     * apart on screen.
+     *
+     * <p>Called from the {@link PartyPanelView.SettingsHost} wired onto
+     * SecondScreenManager in {@link #onCreate}, i.e. from a tap on the
+     * panel's "Build original art" button. A no-op if a build is already in
+     * flight ({@link #origArtBuilding}). On completion (success or failure)
+     * re-runs {@link #scanOrigArtReplacements} so any newly written sheets
+     * are picked up as texture replacements immediately, then posts the final
+     * status. Catches Throwable, not just Exception -- like {@link
+     * #importRomFromUri}, a background-thread Error would otherwise kill the
+     * whole process instead of just failing this build.</p>
      */
     private void requestOrigArtBuild() {
         if (!origArtBuilding.compareAndSet(false, true)) return;
-        updateOrigArtStatus(true, 0, 0, null);
+        updateOrigArtStatus(true, 0, 0, "sprites", null);
         final Context appCtx = getApplicationContext();
         final android.content.res.AssetManager gameAssets = runtime.getChronoAssets();
         final File outDir = new File(getFilesDir(), "orig_art");
@@ -590,25 +603,34 @@ public class AppActivity extends Cocos2dxActivity {
             try {
                 com.kalenjohnson.chronoduo.origart.OrigArtRebuilder.rebuildAll(
                         appCtx, gameAssets, outDir,
-                        (done, total, name) -> updateOrigArtStatus(true, done, total, null),
+                        (done, total, name) -> updateOrigArtStatus(true, done, total, "sprites", null),
                         () -> origArtBuildCancelled);
+                if (!origArtBuildCancelled) {
+                    updateOrigArtStatus(true, 0, 0, "field chips", null);
+                    com.kalenjohnson.chronoduo.origart.MapchipRebuilder.rebuildAll(
+                            appCtx, gameAssets, outDir,
+                            (done, total, name) ->
+                                    updateOrigArtStatus(true, done, total, "field chips", null),
+                            () -> origArtBuildCancelled);
+                }
                 scanOrigArtReplacements();
-                updateOrigArtStatus(false, 0, 0, null);
+                updateOrigArtStatus(false, 0, 0, null, null);
             } catch (Throwable t) {
-                Log.e(TAG, "original-sprite rebuild failed", t);
+                Log.e(TAG, "original-art rebuild failed", t);
                 scanOrigArtReplacements();
-                updateOrigArtStatus(false, 0, 0, t.getMessage() != null ? t.getMessage() : t.toString());
+                updateOrigArtStatus(false, 0, 0, null,
+                        t.getMessage() != null ? t.getMessage() : t.toString());
             } finally {
                 origArtBuilding.set(false);
             }
         }, "OrigArtRebuild").start();
     }
 
-    /** Posts original-sprite-rebuild progress/result to the bottom-screen panel's settings view, if one is currently showing -- a no-op otherwise. Safe from any thread. Mirrors {@link #updateImportStatus}. */
-    private void updateOrigArtStatus(boolean building, int done, int total, String error) {
+    /** Posts original-art rebuild progress/result to the bottom-screen panel's settings view, if one is currently showing -- a no-op otherwise. Safe from any thread. Mirrors {@link #updateImportStatus}. */
+    private void updateOrigArtStatus(boolean building, int done, int total, String phase, String error) {
         new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
             PartyPanelView panel = secondScreen != null ? secondScreen.getPanel() : null;
-            if (panel != null) panel.setOrigArtStatus(building, done, total, error);
+            if (panel != null) panel.setOrigArtStatus(building, done, total, phase, error);
         });
     }
 
