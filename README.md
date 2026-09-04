@@ -61,6 +61,16 @@ Java (`WorldMapCompositor`/`WorldMapRenderer`). No screenshot, no map-screen
 visit, no ROM required. See `tools/world_map/REPORT.md` for the on-disk
 format and `NOTES.md` for the summary.
 
+## Original pixel art
+
+With "Pixel graphics" on, ChronoDuo rebuilds the game's blurry 2x art from the
+original 1x SNES data it still ships, and serves the result in place of the
+shipped assets. One Build action covers three passes: the ~629 character
+sheets, the ~252 field chip-sheet pairs, and the overworld (7 `worldchip`
+sheet pairs plus the 14 `Game/world/gif` object/backdrop sheets). Format
+evidence and per-sheet verification live in `tools/field_art/REPORT.md` and
+`tools/world_art/REPORT.md`.
+
 ## How it works
 
 See `NOTES.md` for the research and design record.

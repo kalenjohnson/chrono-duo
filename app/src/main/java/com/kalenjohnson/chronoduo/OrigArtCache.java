@@ -249,9 +249,11 @@ public final class OrigArtCache {
     /**
      * True for replacement names that are substituted at the FILE level
      * (gamestate.c mechanism 7) rather than uploaded as pixels by the
-     * glTexImage2D hook -- currently the field chip sheets,
-     * "mapchip_&lt;chipTable&gt;_&lt;palette&gt;_&lt;page&gt;.png"
-     * (see {@link com.kalenjohnson.chronoduo.origart.MapchipRebuilder}).
+     * glTexImage2D hook -- the field chip sheets, the overworld chip sheets
+     * and the overworld object/backdrop sheets (see {@link #FILE_SUBSTITUTED}
+     * for the exact name patterns, and
+     * {@link com.kalenjohnson.chronoduo.origart.MapchipRebuilder} /
+     * {@link com.kalenjohnson.chronoduo.origart.WorldchipRebuilder}).
      *
      * <p>These used to be cached as path-keyed {@code .rgbz} entries matched
      * against {@code g_pending_tex_path} inside the glTexImage2D hook. That
@@ -272,8 +274,38 @@ public final class OrigArtCache {
      * payloads.</p>
      */
     private static boolean isFileSubstituted(String name) {
-        return name.matches("mapchip_\\d+_\\d+_\\d+\\.png");
+        for (java.util.regex.Pattern p : FILE_SUBSTITUTED) {
+            if (p.matcher(name).matches()) return true;
+        }
+        return false;
     }
+
+    /**
+     * The replacement basenames served by file substitution, as anchored
+     * patterns (never bare prefixes -- {@code worldchip_\d+_\d+_\d+} must not
+     * catch {@code worldchipScr3_0_2.png}, which has no 1x source and is never
+     * rebuilt). Each is the exact basename the game asks
+     * {@code ResourceManager} for, and each is unique across the whole
+     * resources.bin name table, which is what makes basename matching in the
+     * {@code getData} hook safe.
+     *
+     * <ul>
+     *   <li>{@code mapchip_<chipTable>_<palette>_<page>.png} -- field chip
+     *       sheets, {@link com.kalenjohnson.chronoduo.origart.MapchipRebuilder}</li>
+     *   <li>{@code worldchip_<chip>_<palette>_<page>.png} -- overworld chip
+     *       sheets, {@link com.kalenjohnson.chronoduo.origart.WorldchipRebuilder}</li>
+     *   <li>{@code <n>_wobj0.png} / {@code <n>_wobj1.png} / {@code <n>_wboa.png}
+     *       / {@code <n>_kodai_break.png} -- the {@code Game/world/gif/}
+     *       overworld object and backdrop sheets, same rebuilder</li>
+     * </ul>
+     */
+    private static final java.util.regex.Pattern[] FILE_SUBSTITUTED = {
+            java.util.regex.Pattern.compile("mapchip_\\d+_\\d+_\\d+\\.png"),
+            java.util.regex.Pattern.compile("worldchip_\\d+_\\d+_\\d+\\.png"),
+            java.util.regex.Pattern.compile("\\d+_wobj\\d+\\.png"),
+            java.util.regex.Pattern.compile("\\d+_wboa\\.png"),
+            java.util.regex.Pattern.compile("\\d+_kodai_break\\.png"),
+    };
 
     // ---- FNV-1a content fingerprint (must stay bit-identical to
     // gamestate.c's fnv1a_byte/fnv1a_u32/tex_fingerprint) ----

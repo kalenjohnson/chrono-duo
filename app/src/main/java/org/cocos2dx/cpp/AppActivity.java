@@ -565,7 +565,7 @@ public class AppActivity extends Cocos2dxActivity {
     }
 
     /**
-     * Runs the two original-art rebuild passes on one background thread,
+     * Runs the three original-art rebuild passes on one background thread,
      * writing into {@code <filesDir>/orig_art} -- exactly the directory
      * {@link #scanOrigArtReplacements} already scans -- and posting progress
      * to the bottom-screen panel's settings view throughout (see {@link
@@ -576,12 +576,17 @@ public class AppActivity extends Cocos2dxActivity {
      *       {@code Game/chara/bmp} art;</li>
      *   <li>{@link com.kalenjohnson.chronoduo.origart.MapchipRebuilder#rebuildAll}
      *       -- the ~252 field chip sheet pairs (pages 0 and 1 each), rebuilt
-     *       from the 4bpp cg banks + ChipTable + palette.</li>
+     *       from the 4bpp cg banks + ChipTable + palette;</li>
+     *   <li>{@link com.kalenjohnson.chronoduo.origart.WorldchipRebuilder#rebuildAll}
+     *       -- the overworld: 7 {@code worldchip} sheet pairs (14 pages) from
+     *       the world's own cg banks + Chip table + palette, plus the 14
+     *       {@code Game/world/gif} object/backdrop sheets from their 1x
+     *       {@code .bmp} siblings.</li>
      * </ol>
-     * Both write into the same directory and are picked up by the same
-     * replacement machinery, so one button covers both; the phase label
-     * ("sprites" / "field chips") is what tells the two done/total counters
-     * apart on screen.
+     * All three write into the same directory and are picked up by the same
+     * replacement machinery, so one button covers them all; the phase label
+     * ("sprites" / "field chips" / "overworld") is what tells the three
+     * done/total counters apart on screen.
      *
      * <p>Called from the {@link PartyPanelView.SettingsHost} wired onto
      * SecondScreenManager in {@link #onCreate}, i.e. from a tap on the
@@ -611,6 +616,14 @@ public class AppActivity extends Cocos2dxActivity {
                             appCtx, gameAssets, outDir,
                             (done, total, name) ->
                                     updateOrigArtStatus(true, done, total, "field chips", null),
+                            () -> origArtBuildCancelled);
+                }
+                if (!origArtBuildCancelled) {
+                    updateOrigArtStatus(true, 0, 0, "overworld", null);
+                    com.kalenjohnson.chronoduo.origart.WorldchipRebuilder.rebuildAll(
+                            appCtx, gameAssets, outDir,
+                            (done, total, name) ->
+                                    updateOrigArtStatus(true, done, total, "overworld", null),
                             () -> origArtBuildCancelled);
                 }
                 scanOrigArtReplacements();

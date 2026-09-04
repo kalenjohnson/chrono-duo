@@ -302,4 +302,215 @@ public final class MapchipCore {
         byte[] idx = expandPage(chipData, grid);
         return colorize2x(idx, loadPalette(plt));
     }
+
+    // ----------------------------------------------------------------------
+    // OVERWORLD ("worldchip") variant.
+    //
+    // The overworld runs a parallel, DIFFERENT implementation of the same idea
+    // -- world::ChipTable::Load @ 0x6044c8, world::ChipTable::Expansion @
+    // 0x604770, world::ChipTable::setChip_8_8 @ 0x604830, world::ChipData::Load
+    // @ 0x606d9c -- and its tile-reference bit layout is NOT the field's:
+    //
+    //   field  (setChip_8_8 @ 0x56212c):        0-9 tile, 10 hflip, 11 vflip,
+    //                                           12-15 palette (4 bits)
+    //   world  (world::setChip_8_8 @ 0x604830): 0-9 tile, 10-12 palette (3 bits),
+    //                                           13 priority, 14 hflip, 15 vflip
+    //
+    // and its Chip_%04d.dat stores 2 bytes per tile ref (no per-tile priority
+    // byte; priority is bit 13 of the word). Everything downstream of the index
+    // page -- loadPalette, colorize2x -- is shared verbatim.
+    // See tools/world_art/REPORT.md.
+    // ----------------------------------------------------------------------
+
+    /** world::ChipData::Load @ 0x606d9c: WorldMap::LoadMap fills slots 0..6; there is no ext heap. */
+    public static final int WORLD_CG_SLOTS = 7;
+    /**
+     * The ONLY "no bank" sentinel in world::ChipData::Load (`cmp w1, #0x80;
+     * b.eq <ret>`). Unlike the field, 0 is a REAL bank id here -- cg0.bin is
+     * world 0's slot 0 -- so {@link #bgsetSlots}' 0x00/0xFF rule must not be
+     * reused.
+     */
+    public static final int WORLD_CG_NONE = 128;
+    /** world::ChipTable::Load @ 0x6044c8: 256 metatiles x 4 x u16, no priority byte. */
+    public static final int WORLD_CHIPTABLE_PAGE_BYTES = 256 * 4 * 2; // 2048
+    /** A Chip_%04d.dat is exactly two pages (4096 bytes). */
+    public static final int WORLD_CHIPTABLE_PAGES = 2;
+
+    // world::ChipTable::setChip_8_8 @ 0x604830 tile-ref bit fields.
+    private static final int WORLD_PAL_SHIFT = 10;   // `lsr w13,w5,#6; and w9,w13,#0x70`
+    private static final int WORLD_PAL_MASK = 0x7;   // THREE bits, not four
+    private static final int WORLD_HFLIP_BIT = 0x4000; // `sbfx w14,w5,#14,#1` -> nibble select
+    private static final int WORLD_VFLIP_BIT = 0x8000; // `sbfx w9,w5,#15,#1`  -> ORs 7 into the row
+    /** bit 13 -- world::ChipTable::Load's per-metatile priority byte (`bfxil w8,w20,#13,#1`). Not used by the sheet rebuild. */
+    public static final int WORLD_PRIO_BIT = 0x2000;
+
+    /**
+     * {@code WorldMapInfo::G_WORLDMAPINFO} @ 0xbe2508 (resolved from the
+     * {@code R_AARCH64_GLOB_DAT} at 0xbc70d8; {@code WORLDMAPINFO_MAX} @
+     * 0xbe2688 reads 8, and 0xbe2688-0xbe2508 = 0x180 = 8 x 0x30), read as
+     * 8 rows of 24 little-endian u16. The columns kept here are the ones
+     * {@code WorldMap::LoadMap} @ 0x606a30 consumes for the chip sheets:
+     * <pre>
+     *   [0..6] u16 0..6 (+0x00..+0x0C) -> world::ChipData::Load(id, slot), slots 0..6
+     *   [7]    u16 10   (+0x14)        -> plt&lt;n&gt;.bin      -- the "b" in worldchip_a_b_p
+     *   [8]    u16 16   (+0x20)        -> Chip_%04d.dat  -- the "a" in worldchip_a_b_p
+     * </pre>
+     * Hardcoded rather than parsed: there is no {@code bgsettable} equivalent
+     * for the overworld in resources.bin (the bank ids live only in this
+     * in-binary table), and there are exactly 8 rows. {@code
+     * tools/world_art/rebuild_worldchip.py --libchrono} re-reads the table out
+     * of the ELF and {@code tools/world_art/JavaWorldchipCheck.java} proves
+     * this copy renders the same sheets, so the constant is checked, not
+     * trusted.
+     */
+    public static final int[][] WORLDMAPINFO = {
+            {0, 1, 2, 3, 4, 5, 6, 4, 0},          // world 0  1000 AD
+            {0, 1, 2, 3, 4, 5, 6, 5, 0},          // world 1   600 AD
+            {0, 1, 11, 12, 13, 14, 128, 7, 2},    // world 2  2300 AD   (slot 6 empty)
+            {27, 28, 29, 30, 31, 32, 33, 8, 3},   // world 3  65,000,000 BC
+            {0, 1, 2, 3, 15, 16, 17, 9, 4},       // world 4  12,000 BC, Zeal aloft
+            {18, 19, 22, 23, 24, 25, 26, 10, 5},  // world 5  Kingdom of Zeal (sky)
+            {0, 1, 2, 3, 15, 16, 17, 9, 4},       // world 6  12,000 BC, Zeal fallen
+            {0, 1, 7, 8, 9, 10, 6, 6, 1},         // world 7  advanced future (cutscene)
+    };
+    /** Index of the palette id inside a {@link #WORLDMAPINFO} row. */
+    public static final int WMI_PALETTE = 7;
+    /** Index of the ChipTable id inside a {@link #WORLDMAPINFO} row. */
+    public static final int WMI_CHIP = 8;
+
+    /**
+     * The distinct {@code (chip, palette, cgSlots[7])} sheet groups behind the
+     * 7 shipped {@code worldchip_<a>_<b>_{0,1}.png} pairs, in ascending
+     * (chip, palette) order. Worlds 4 and 6 share (4, 9) <em>and</em> have
+     * identical cg slots, so a sheet maps unambiguously to the banks that bake
+     * it (unlike the field's (62,21) bgset ambiguity); this method asserts
+     * that rather than assuming it.
+     *
+     * @return one {@code int[9]} per sheet pair, laid out like a
+     *         {@link #WORLDMAPINFO} row
+     */
+    public static int[][] worldSheetPairs() {
+        java.util.TreeMap<Integer, int[]> byKey = new java.util.TreeMap<>();
+        for (int[] row : WORLDMAPINFO) {
+            int key = (row[WMI_CHIP] << 16) | row[WMI_PALETTE];
+            int[] prev = byKey.get(key);
+            if (prev == null) {
+                byKey.put(key, row);
+            } else {
+                for (int s = 0; s < WORLD_CG_SLOTS; s++) {
+                    if (prev[s] != row[s]) {
+                        throw new IllegalStateException("ambiguous cg banks for worldchip_"
+                                + row[WMI_CHIP] + "_" + row[WMI_PALETTE]);
+                    }
+                }
+            }
+        }
+        return byKey.values().toArray(new int[0][]);
+    }
+
+    /**
+     * Builds the flat {@code WORLD_CG_SLOTS * 0x1000} ChipData buffer
+     * {@code WorldMap::LoadMap} assembles -- the same 128 x 448 px LINEAR 4bpp
+     * bitmap at stride 0x40 the field uses, but sized from the cg header's
+     * SECOND u16 alone: world::ChipData::Load @ 0x606e80-0x606e9c reads two
+     * {@code getShort()}s, <em>discards the first</em> and computes
+     * {@code size = rows &lt;&lt; 6}. Identical to the field's
+     * {@code b * ((a &gt;&gt; 1) &amp; 0x3FFF)} for every shipped bank (header
+     * {@code 80 80 40 00}), but the code genuinely differs.
+     *
+     * @param bankBySlot raw {@code cg<n>.bin} bytes per slot 0..6, null for an
+     *                   empty slot
+     */
+    public static byte[] worldBuildChipData(byte[][] bankBySlot) {
+        byte[] buf = new byte[WORLD_CG_SLOTS * CG_BANK_BYTES];
+        for (int slot = 0; slot < WORLD_CG_SLOTS; slot++) {
+            byte[] raw = (bankBySlot != null && slot < bankBySlot.length) ? bankBySlot[slot] : null;
+            if (raw == null || raw.length < 4) continue;
+            int rows = (raw[2] & 0xFF) | ((raw[3] & 0xFF) << 8);
+            int n = Math.min(Math.min(rows * CG_ROW_BYTES, raw.length - 4), CG_BANK_BYTES);
+            if (n <= 0) continue;
+            System.arraycopy(raw, 4, buf, slot * CG_BANK_BYTES, n);
+        }
+        return buf;
+    }
+
+    /**
+     * world::ChipTable::Load @ 0x6044c8 -> one page's 32x32 grid of u16 tile
+     * refs, in the order world::ChipTable::Expansion @ 0x604770 walks it. Per
+     * metatile the file holds four u16 in TL, TR, BL, BR order, landing at grid
+     * positions (2R,2C) (2R,2C+1) (2R+1,2C) (2R+1,2C+1) -- the runtime widens
+     * them to u32 at {@code page*0x1000 + Y*0x80 + X*4}.
+     */
+    public static int[] worldLoadChipTablePage(byte[] raw, int page) {
+        int[] grid = new int[32 * 32];
+        int off = page * WORLD_CHIPTABLE_PAGE_BYTES;
+        for (int row = 0; row < 16; row++) {
+            for (int col = 0; col < 16; col++) {
+                for (int k = 0; k < 4; k++) {
+                    int dy = k >> 1, dx = k & 1;   // TL, TR, BL, BR
+                    int w = 0;
+                    if (raw != null && off + 2 <= raw.length) {
+                        w = (raw[off] & 0xFF) | ((raw[off + 1] & 0xFF) << 8);
+                    }
+                    off += 2;
+                    grid[(row * 2 + dy) * 32 + (col * 2 + dx)] = w;
+                }
+            }
+        }
+        return grid;
+    }
+
+    /**
+     * world::ChipTable::Expansion @ 0x604770 + world::setChip_8_8 @ 0x604830:
+     * expands one 32x32 tile-ref grid into the 256x256 8-bit index page the
+     * runtime keeps at {@code chipTable + 0x2200 + page*0x10000}.
+     *
+     * <p>Same blank rule as the field ({@code bics wzr, #0x380, word} -- bits
+     * 7, 8 and 9 all set), same "nibble 0 -> output index 0" transparency key
+     * ({@code csel w13, wzr, w13, eq}), same HIGH-nibble-is-the-left-pixel
+     * packing. Only the palette/flip bits move (see the class comment).</p>
+     */
+    public static byte[] worldExpandPage(byte[] chipData, int[] grid) {
+        byte[] out = new byte[PAGE_PX * PAGE_PX];
+        int bankRowPx = CG_ROW_BYTES * 2; // 128 px per ChipData row
+        for (int y = 0; y < 32; y++) {
+            for (int x = 0; x < 32; x++) {
+                int w = grid[y * 32 + x] & 0xFFFF;
+                if ((w & BLANK_MASK) == BLANK_MASK) continue;
+                int tile = w & TILE_MASK;
+                int ty = (tile >> 4) * 8;
+                int tx = (tile & 0x0F) * 8;
+                boolean hflip = (w & WORLD_HFLIP_BIT) != 0;
+                boolean vflip = (w & WORLD_VFLIP_BIT) != 0;
+                int palHi = ((w >> WORLD_PAL_SHIFT) & WORLD_PAL_MASK) << 4;
+                for (int row = 0; row < 8; row++) {
+                    int srcRow = ty + (vflip ? 7 - row : row);
+                    int dstBase = (y * 8 + row) * PAGE_PX + x * 8;
+                    int rowByteBase = srcRow * CG_ROW_BYTES;
+                    for (int col = 0; col < 8; col++) {
+                        int v = tx + (hflip ? 7 - col : col);
+                        if (v >= bankRowPx) continue;
+                        int byteOff = rowByteBase + (v >> 1);
+                        if (byteOff < 0 || byteOff >= chipData.length) continue;
+                        int by = chipData[byteOff] & 0xFF;
+                        int nib = ((v & 1) == 1) ? (by & 0x0F) : (by >> 4);
+                        out[dstBase + col] = (byte) (nib == 0 ? 0 : (nib | palHi));
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * One-shot overworld convenience: raw file bytes in, 512x512
+     * non-premultiplied ARGB out. {@link #loadPalette} and {@link #colorize2x}
+     * are shared with the field path unchanged.
+     */
+    public static int[] worldRenderSheet2x(byte[][] bankBySlot, byte[] chipTable, byte[] plt, int page) {
+        byte[] chipData = worldBuildChipData(bankBySlot);
+        int[] grid = worldLoadChipTablePage(chipTable, page);
+        byte[] idx = worldExpandPage(chipData, grid);
+        return colorize2x(idx, loadPalette(plt));
+    }
 }
