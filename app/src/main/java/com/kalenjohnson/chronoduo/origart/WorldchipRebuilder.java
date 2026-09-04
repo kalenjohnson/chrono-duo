@@ -64,8 +64,14 @@ import java.util.function.BooleanSupplier;
  * {@code Game/world/worldchipScr3_<n>_{2,3}.png} (10 sheets -- authored
  * weather-layer textures that {@code WorldMap::initWeatherMap} @ 0x60802c
  * hands straight to {@code createTexture}, with no chip table or cg bank
- * anywhere in the path), {@code Game/common/worldChara.png} (no {@code .bmp}
- * sibling), and the seven {@code <n>_wboa.bmp} that ship without a PNG.</p>
+ * anywhere in the path), {@code Game/common/worldChara.png} and
+ * {@code Game/common/silbird.png} (no {@code .bmp} sibling; for
+ * {@code worldChara} the "the overworld frames are just the field frames"
+ * hypothesis is disproved by measurement too -- 0 of its 63 sprites match at
+ * the 60.0 threshold against all 16194 components of every one of the 708
+ * BMPs in the archive,
+ * see REPORT.md section 6.1 and {@code tools/world_art/rebuild_worldchara.py}),
+ * and the seven {@code <n>_wboa.bmp} that ship without a PNG.</p>
  *
  * <p>Threading contract is identical to {@link OrigArtRebuilder#rebuildAll}:
  * background thread only, callback invoked inline, cancellation polled at item

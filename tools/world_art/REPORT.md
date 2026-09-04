@@ -273,11 +273,90 @@ mapchips.
   chip file ships under `Game/world` (the archive has only
   `Chip/Chip_0000..0005.dat`, all 4096 bytes = 2 pages). These are authored 2x
   textures with no 1x source. Documented and skipped.
-* **`Game/common/worldChara.png`.** No `.bmp` sibling anywhere in
-  resources.bin, and no cg/chip-table path. Skipped.
+* **`Game/common/worldChara.png`** — the overworld party sprite sheet. No
+  `.bmp` sibling anywhere in resources.bin, and no cg/chip-table path. Now
+  also disproved by measurement — see 6.1.
+* **`Game/common/silbird.png`** — the Epoch ("silverd" / シルバード) overworld
+  sprite, the one other `Game/common` sheet the overworld draws. Same
+  category as `worldChara`: no `.bmp` sibling, so the pipeline is not extended
+  to `Game/common` for it. (`Game/common` does ship four PNG/BMP pairs —
+  `blackdream`, `lavos`, `warp_bg`, `warp_obj` — which are structurally the
+  same "2x PNG next to 1x BMP" case section 7 handles. Who loads them, and
+  whether any belongs in the pipeline, was **not chased**: out of scope here.)
 * **The seven `Game/world/gif/<n>_wboa.bmp` that ship without a `.png`**
   (`1,2,3,4,5,6,7_wboa`). There is nothing to replace: the game never reads a
   PNG at those names.
+
+### 6.1 `worldChara.png` — the measured negative
+
+`tools/world_art/rebuild_worldchara.py` tests the one remaining hypothesis:
+that the overworld frames are the *field* frames, and so can be found inside
+`Game/chara/bmp/c00N_*.bmp`. Run it to reproduce; it exits 1.
+
+```
+python3 tools/world_art/rebuild_worldchara.py <worldChara.png> <chara-bmp-dir> <out-dir> \
+    --corpus <dir-of-bmps> [--corpus <dir-of-bmps> ...]
+```
+
+Every directory argument is a flat directory of `.bmp` files extracted with
+`tools/ctres.py`; `<chara-bmp-dir>` needs at least `c000_0.bmp` ..
+`c006_1.bmp`, and the `--corpus` dirs together should cover all 708 shipped
+BMPs (`Game/chara/bmp/` 629, `Game/battle/oef/` 54, `Game/world/gif/` 21,
+`Game/common/` 4) to reproduce the numbers below.
+
+**The sheet.** 384x384 RGBA, 8 rows x 8 columns of 48x48 cells. Segmenting on
+`alpha > 0` — what `rebuild_sheet.segment_png` does — gives **2914**
+components, because the alpha channel carries a wide halo of 1..46-valued
+pixels. At any threshold in **64..192** it gives **71**, of which **63** are
+larger than 8x8 and 8 are sparkle specks. 63 = 7*8 + 7: rows 0..6 are the
+seven party members in character-id order at 8 frames each, row 7 is one
+extra pose per character. The layout is exactly as expected; only the source
+is missing.
+
+**It is a 2x upscale, but of something that does not ship.** 2x2 blocks
+aligned to phase (0,0) have a mean intra-block channel range of **66**, vs
+**141** at phase (1,1) — real 2x block structure. But only **4.6%** of those
+blocks are flat within +-8, and the sheet holds **31681** distinct opaque
+colours (a `Game/chara/png` sheet holds 256). This asset went through a lossy
+pipeline; there is no crisp 1x anywhere behind it.
+
+**No source in the corpus.** Each of the 63 sprites was alpha-weighted 2x2
+box-downsampled to 1x (more generous than `rebuild_sheet`'s "topleft"
+decimation, which on this sheet samples noise) and matched with
+`rebuild_sheet`'s masked SAD + horizontal flips against: its own character's
+bitmaps at the +-2 size gate; all seven characters' for row 7; and, as a
+fallback at a widened +-5 gate, the **whole corpus — every BMP in the
+archive: 16194 components from all 708** (629 `Game/chara/bmp/`, 54
+`Game/battle/oef/`, 21 `Game/world/gif/`, 4 `Game/common/`).
+
+| row | character | matched | best SAD | worst SAD |
+|---|---|---|---|---|
+| 0 | Crono | 0/8 | 201.1 | 212.4 |
+| 1 | Marle | 0/8 | 209.9 | 229.0 |
+| 2 | Lucca | 0/8 | 166.5 | 202.9 |
+| 3 | Robo | 0/8 | 168.0 | 198.0 |
+| 4 | Frog | 0/8 | 126.0 | 193.4 |
+| 5 | Ayla | 0/8 | 195.2 | 216.2 |
+| 6 | Magus | 0/8 | 181.1 | 192.5 |
+| 7 | extra pose | 0/7 | 166.5 | 216.3 |
+
+**0/63** against a `SCORE_THRESHOLD` of **60.0** — for scale, a true match
+scores near 0 (`7_wobj0` in section 7 is a plain pixel-double and rebuilds at
+0.0 on all 161 frames). Best whole-corpus shape agreement is IoU ~0.85, and it is always
+on the *wrong character*: `worldchara_sbs.png` (shipped left, best match
+right) shows the right-hand sheet filled with unrelated NPCs, monsters and
+rocks. The overworld party sprites are separate, smaller art (~12x22 at 1x,
+against ~16x24 for the field frames) that ships only as this one 2x PNG.
+
+**Not shipped: the box-downsample.** The 2x block structure does mean a box
+downsample recovers a clean-looking 1x, which re-doubled would give a crisp
+sheet — the script writes it as `worldchara_1x.png` for inspection. It is
+deliberately **not** wired into the pipeline: its colours are averages
+recovered from a lossy 2x asset, not palette entries, so it is a new authored
+asset, not the game's own original art. Everything behind the pixel-graphics
+switch outputs the game's own pixels (BMP palette entries via
+`SheetRebuilder`, `plt<n>.bin` colours via `MapchipCore`); a synthetic sheet
+does not belong behind the same switch.
 
 ## 7. `Game/world/gif/*` — 2x PNG next to 1x BMP, re-packed
 
@@ -414,6 +493,9 @@ adb logcat | grep -E 'pixel-gfx: substituted [0-9]+_(wobj|wboa|kodai)'
   `Chip_%04d.dat` layout, the 10–12/13/14/15 bit fields, the 256x256 page
   geometry, the `worldchip` filename argument order, the `worldchipScr3` and
   `worldChara` dead ends.
+* **High (measured):** the `worldChara` negative — 0 of 63 sprites match at
+  the 60.0 threshold against all 16194 components of all 708 shipped BMPs
+  (section 6.1), reproducible with `rebuild_worldchara.py`.
 * **High (proven + measured):** the 14-sheet rebuild — 0 invariant violations,
   11/3584 cells off, all of those colour-only.
 * **High (byte-level):** Java == Python on all 14 chip sheets and all 14 gif
