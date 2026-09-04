@@ -234,7 +234,8 @@ public final class ChronoAssets {
     // wb_mini.png, cropped and sepia-tinted once (see setMiniMapFallback):
     // shown for any era with no rendered PNG yet. Always non-natural-aspect
     // (see PartyPanelView's letterboxing comment on the old single-map field).
-    private static Bitmap miniMapFallback;
+    /** Last bitmap served by {@link #getWorldMap(int)}; reused while the era is momentarily unreadable. */
+    private static Bitmap lastWorldMap;
 
     // Live re-composites of the game's own metatile grid (see WorldMapLive /
     // GameState.nativeGetWorldMapData), keyed by the same panel-space era id
@@ -271,17 +272,11 @@ public final class ChronoAssets {
         return era >= 0 && worldMapLive.containsKey(era);
     }
 
-    /** Stores the wb_mini.png-derived fallback bitmap (tinted once, see {@link #sepiaTint}), shown by {@link #getWorldMap(int)} for any era with no rendered PNG on disk yet. */
-    public static void setMiniMapFallback(Bitmap b) {
-        miniMapFallback = b != null ? sepiaTint(b) : null;
-        notifyListeners();
-    }
-
     /**
      * Lazily decodes and caches (LRU, cap {@value #WORLD_MAP_CACHE_CAP}) the
      * rendered world map PNG for overworld/era id {@code era} --
      * {@code <worldMapDir>/worldmap_era<era>.png}. Falls back to the
-     * wb_mini-derived {@link #miniMapFallback} (or null, before extraction
+     * last served bitmap for a momentarily unknown era, else null
      * finishes) when {@code era} is negative (unknown), {@link #worldMapDir}
      * isn't set yet, or no PNG exists for this era -- i.e. on-device
      * rendering hasn't finished or failed for it (remembered as a miss so
@@ -290,21 +285,23 @@ public final class ChronoAssets {
      * thread only, like the rest of ChronoAssets.
      */
     public static Bitmap getWorldMap(int era) {
-        if (era < 0) return miniMapFallback;
+        // A momentarily unknown era (world id not readable this tick) keeps
+        // showing whatever was on screen rather than flashing to nothing.
+        if (era < 0) return lastWorldMap;
         Bitmap live = worldMapLive.get(era);
-        if (live != null) return live;
+        if (live != null) return lastWorldMap = live;
         Bitmap cached = worldMapCache.get(era);
-        if (cached != null) return cached;
-        if (worldMapMisses.contains(era)) return miniMapFallback;
+        if (cached != null) return lastWorldMap = cached;
+        if (worldMapMisses.contains(era)) return null;
         File f = resolveWorldMapFile(era);
         Bitmap decoded = f != null ? BitmapFactory.decodeFile(f.getAbsolutePath()) : null;
         if (decoded == null) {
             worldMapMisses.add(era);
-            return miniMapFallback;
+            return null;
         }
         Bitmap tinted = sepiaTint(decoded);
         worldMapCache.put(era, tinted);
-        return tinted;
+        return lastWorldMap = tinted;
     }
 
     /** Resolves the on-disk rendered PNG for {@code era} under {@link #worldMapDir} -- see {@link #getWorldMap(int)}. */
@@ -314,19 +311,9 @@ public final class ChronoAssets {
         return f.isFile() ? f : null;
     }
 
-    /**
-     * True when {@link #getWorldMap(int)} for {@code era} is currently
-     * serving a rendered per-era bitmap (already at display aspect);
-     * false when it would fall back to the wb_mini-derived {@link
-     * #miniMapFallback} (stored at half its display width -- see
-     * PartyPanelView's letterboxing comment). Per-bitmap, unlike the old
-     * single-map field this replaces.
-     */
+    /** Every bitmap {@link #getWorldMap(int)} serves (live 1536x1024 or rendered 3072x2048) is already at the world's true 1.5:1 aspect. */
     public static boolean isWorldMapNaturalAspect(int era) {
-        // Live captures are 1536x1024 and the offline renders 3072x2048 --
-        // both already at the world's true 1.5:1 aspect, unlike the wb_mini
-        // fallback, so either one counts as natural.
-        return era >= 0 && (worldMapLive.containsKey(era) || worldMapCache.containsKey(era));
+        return true;
     }
 
     /**
@@ -498,7 +485,7 @@ public final class ChronoAssets {
     /** Registers a listener; if any asset is already loaded, fires immediately so late attachers (e.g. a Presentation created after the background load finished) don't miss it. */
     public static void addListener(Listener l) {
         listeners.add(l);
-        if (facePng != null || miniMapFallback != null || !worldMapCache.isEmpty()
+        if (facePng != null || !worldMapCache.isEmpty()
                 || !worldMapLive.isEmpty()
                 || minimapMark != null || windowTex != null
                 || monsterNames != null || monsterFlags != null

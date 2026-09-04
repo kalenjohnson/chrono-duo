@@ -479,7 +479,6 @@ public class AppActivity extends Cocos2dxActivity {
                 // Localize/<lang>/msg/monster.txt but aren't wired up.
                 String[] names = {
                         "Extension/face.png",
-                        "Game/common/wb_mini.png",
                         "Game/common/minimap_mark.png",
                         "Extension/menu_win.png",
                         "Localize/en/msg/monster.txt",
@@ -495,12 +494,6 @@ public class AppActivity extends Cocos2dxActivity {
                         com.kalenjohnson.chronoduo.ChronoResources.extractAll(appCtx, gameAssets, names);
 
                 final android.graphics.Bitmap face = decodeBitmap(files.get("Extension/face.png"));
-                // wb_mini.png is the fallback shown by ChronoAssets.getWorldMap(era)
-                // for any era whose rendered worldmap_era<N>.png isn't on disk yet
-                // (rendering hasn't finished, or failed) -- see
-                // ChronoAssets.setWorldMapDir/setMiniMapFallback and
-                // AppActivity#renderWorldMaps.
-                final android.graphics.Bitmap map = cropWorldMap(files.get("Game/common/wb_mini.png"));
                 final android.graphics.Bitmap mark = cropMarkerTile(files.get("Game/common/minimap_mark.png"));
                 final android.graphics.Bitmap epochMark = cropEpochTile(files.get("Game/common/minimap_mark.png"));
                 final android.graphics.Bitmap windowTex = cropWindowTexture(files.get("Extension/menu_win.png"));
@@ -517,7 +510,6 @@ public class AppActivity extends Cocos2dxActivity {
 
                 new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                     if (face != null) com.kalenjohnson.chronoduo.ChronoAssets.setFace(face);
-                    if (map != null) com.kalenjohnson.chronoduo.ChronoAssets.setMiniMapFallback(map);
                     if (mark != null) com.kalenjohnson.chronoduo.ChronoAssets.setMinimapMark(mark);
                     if (epochMark != null) com.kalenjohnson.chronoduo.ChronoAssets.setEpochMark(epochMark);
                     if (windowTex != null) com.kalenjohnson.chronoduo.ChronoAssets.setWindowTex(windowTex);
@@ -668,31 +660,6 @@ public class AppActivity extends Cocos2dxActivity {
                     WIN_TEX_R - WIN_TEX_L, WIN_TEX_B - WIN_TEX_T);
         } catch (Exception e) {
             Log.w(TAG, "window texture crop failed", e);
-            return null;
-        }
-    }
-
-    // Game/common/wb_mini.png is a 256x256 sheet; the actual mini world-map
-    // content is a fixed 96x128 region at (16,48)-(112,176) in sheet pixels
-    // (measured directly, not auto-detected — the old autoCropContent()
-    // background-color heuristic isn't reliable against this art). The
-    // texture is stored at half its displayed width: the game's own map view
-    // is landscape ~1.5:1, so PartyPanelView stretches this crop 2x
-    // horizontally when drawing it (see the aspect-1.5 letterbox there).
-    private static final int WMAP_L = 16, WMAP_T = 48, WMAP_R = 112, WMAP_B = 176;
-
-    private static android.graphics.Bitmap cropWorldMap(File f) {
-        android.graphics.Bitmap sheet = decodeBitmap(f);
-        if (sheet == null) return null;
-        if (sheet.getWidth() < WMAP_R || sheet.getHeight() < WMAP_B) {
-            Log.w(TAG, "wb_mini.png smaller than expected, skipping world map crop");
-            return null;
-        }
-        try {
-            return android.graphics.Bitmap.createBitmap(sheet, WMAP_L, WMAP_T,
-                    WMAP_R - WMAP_L, WMAP_B - WMAP_T);
-        } catch (Exception e) {
-            Log.w(TAG, "world map crop failed", e);
             return null;
         }
     }
