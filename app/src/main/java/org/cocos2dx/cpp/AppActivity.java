@@ -116,8 +116,12 @@ public class AppActivity extends Cocos2dxActivity {
         Log.i(TAG, "boot calls done, external storage: " + extPath);
         // So ChronoAssets.getAreaMap() can find <externalFilesDir>/ds_maps/*.png
         // (user-pushed DS-style area minimaps -- same "external files dir"
-        // used below for worldmap_hd.png).
+        // used below for the rendered world maps).
         com.kalenjohnson.chronoduo.ChronoAssets.setExternalFilesDir(ext != null ? ext : getFilesDir());
+        // Per-era rendered world map PNGs (worldmap_era<N>.png, see
+        // WorldMapRenderer/renderWorldMaps below) live in the same external
+        // files dir -- see ChronoAssets.getWorldMap.
+        com.kalenjohnson.chronoduo.ChronoAssets.setWorldMapDir(ext != null ? ext : getFilesDir());
         // Private files dir: where DsMapImporter writes DS-derived maps
         // decoded on-device from a user-supplied ROM (see requestRomImport/
         // importRomFromUri below) -- checked before externalFilesDir by
@@ -173,6 +177,7 @@ public class AppActivity extends Cocos2dxActivity {
             }
         });
         extractCompanionAssets();
+        renderWorldMaps();
         // Original-sprite replacements ride on the pixel-graphics preference.
         if (com.kalenjohnson.chronoduo.GameState.getPixelGraphicsPref(this)) scanOrigArtReplacements();
 
@@ -373,6 +378,73 @@ public class AppActivity extends Cocos2dxActivity {
         super.onDestroy();
     }
 
+    // --- world map rendering -------------------------------------------------
+    // Renders all 8 overworld maps on device from the game's own asset files
+    // (Game/world/Map/Map_%04d.dat + Game/world/worldchip_<chip>_<plt>_{0,1}.png,
+    // pulled out of resources.bin) into <externalFilesDir>/worldmap_era<N>.png,
+    // N = the overworld/era id (GameState.nativeGetWorldEra() via
+    // PartySnapshot#worldEra) -- see WorldMapRenderer/WorldMapCompositor and
+    // tools/world_map/REPORT.md for the format this is ported from. Replaces
+    // the old PixelCopy-of-the-map-screen auto-capture, which needed the
+    // player to open the in-game map at least once per era and depended on a
+    // guessed crop rect.
+
+    /** Set true to force a re-render of every world even if worldmap_era<N>.png already exists (dev only). */
+    private static final boolean WORLD_MAP_FORCE_RERENDER = false;
+
+    /**
+     * Extracts the map/chip source files this render needs from resources.bin,
+     * stages them under a flat filesDir subdirectory (WorldMapRenderer expects
+     * plain "Map_0000.dat"/"worldchip_0_4_0.png" names, not resources.bin's
+     * full "Game/world/..." paths), then renders every world into
+     * getExternalFilesDir(null) -- the same directory ChronoAssets.
+     * setWorldMapDir was pointed at in onCreate. Entirely off the main
+     * thread; best-effort like the rest of the extraction pipeline.
+     */
+    private void renderWorldMaps() {
+        final File mapDir = getExternalFilesDir(null);
+        if (mapDir == null) return;
+        final Context appCtx = getApplicationContext();
+        final android.content.res.AssetManager gameAssets = runtime.getChronoAssets();
+        new Thread(() -> {
+            try {
+                java.util.List<String> flatNames = com.kalenjohnson.chronoduo.WorldMapRenderer.requiredAssetNames();
+                String[] entryNames = new String[flatNames.size()];
+                for (int i = 0; i < flatNames.size(); i++) {
+                    String flat = flatNames.get(i);
+                    entryNames[i] = flat.startsWith("Map_")
+                            ? "Game/world/Map/" + flat
+                            : "Game/world/" + flat;
+                }
+                java.util.Map<String, File> extracted =
+                        com.kalenjohnson.chronoduo.ChronoResources.extractAll(appCtx, gameAssets, entryNames);
+                if (extracted.size() != entryNames.length) {
+                    Log.w(TAG, "world map render: only extracted " + extracted.size() + "/" + entryNames.length
+                            + " source files from resources.bin");
+                }
+                File srcDir = new File(getFilesDir(), "world_src");
+                if (!srcDir.isDirectory() && !srcDir.mkdirs()) {
+                    Log.w(TAG, "world map render: cannot create " + srcDir);
+                    return;
+                }
+                for (java.util.Map.Entry<String, File> e : extracted.entrySet()) {
+                    String flat = e.getKey().substring(e.getKey().lastIndexOf('/') + 1);
+                    copyFile(e.getValue(), new File(srcDir, flat));
+                }
+                boolean ok = com.kalenjohnson.chronoduo.WorldMapRenderer.renderAll(
+                        srcDir, mapDir, WORLD_MAP_FORCE_RERENDER, msg -> Log.i(TAG, msg));
+                Log.i(TAG, "world map render: batch complete, ok=" + ok);
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                    for (int era = 0; era < com.kalenjohnson.chronoduo.WorldMapRenderer.worldCount(); era++) {
+                        com.kalenjohnson.chronoduo.ChronoAssets.invalidateWorldMap(era);
+                    }
+                });
+            } catch (Exception e) {
+                Log.w(TAG, "world map render failed", e);
+            }
+        }, "WorldMapRender").start();
+    }
+
     /**
      * Extracts the companion-UI art (portraits, world map sheet) from the
      * game's resources.bin off the main thread, then decodes and hands the
@@ -405,13 +477,12 @@ public class AppActivity extends Cocos2dxActivity {
                         com.kalenjohnson.chronoduo.ChronoResources.extractAll(appCtx, gameAssets, names);
 
                 final android.graphics.Bitmap face = decodeBitmap(files.get("Extension/face.png"));
-                // an HD map render pushed to the external files dir wins over
-                // the low-res wb_mini texture (user-local file, never shipped)
-                File hd = new File(getExternalFilesDir(null), "worldmap_hd.png");
-                final android.graphics.Bitmap hdMap =
-                        hd.isFile() ? android.graphics.BitmapFactory.decodeFile(hd.getAbsolutePath()) : null;
-                final android.graphics.Bitmap map =
-                        hdMap != null ? null : cropWorldMap(files.get("Game/common/wb_mini.png"));
+                // wb_mini.png is the fallback shown by ChronoAssets.getWorldMap(era)
+                // for any era whose rendered worldmap_era<N>.png isn't on disk yet
+                // (rendering hasn't finished, or failed) -- see
+                // ChronoAssets.setWorldMapDir/setMiniMapFallback and
+                // AppActivity#renderWorldMaps.
+                final android.graphics.Bitmap map = cropWorldMap(files.get("Game/common/wb_mini.png"));
                 final android.graphics.Bitmap mark = cropMarkerTile(files.get("Game/common/minimap_mark.png"));
                 final android.graphics.Bitmap windowTex = cropWindowTexture(files.get("Extension/menu_win.png"));
                 final String[] monsterNames = readNameTable(files.get("Localize/en/msg/monster.txt"));
@@ -427,11 +498,7 @@ public class AppActivity extends Cocos2dxActivity {
 
                 new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                     if (face != null) com.kalenjohnson.chronoduo.ChronoAssets.setFace(face);
-                    if (hdMap != null) {
-                        com.kalenjohnson.chronoduo.ChronoAssets.setWorldMap(hdMap, true);
-                    } else if (map != null) {
-                        com.kalenjohnson.chronoduo.ChronoAssets.setWorldMap(map);
-                    }
+                    if (map != null) com.kalenjohnson.chronoduo.ChronoAssets.setMiniMapFallback(map);
                     if (mark != null) com.kalenjohnson.chronoduo.ChronoAssets.setMinimapMark(mark);
                     if (windowTex != null) com.kalenjohnson.chronoduo.ChronoAssets.setWindowTex(windowTex);
                     if (monsterNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setMonsterNames(monsterNames);

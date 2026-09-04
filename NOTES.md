@@ -331,3 +331,57 @@ See `tech_mp_report.md` for the full calibration table and Java snippet.
 **Settings.** "Original sprites" row with Build action and progress. Refresh (~6 s on-device over 629 sheets) rebuilds only changed/missing `.rgba` files (inode-backed cache reuse).
 
 **Battle results window.** Keyed on `SceneBattle+0x22f4` step counter: step 0 = waiting for death animations, step 1 = first results window. Work struct at `*(SceneBattle+0x60)`: EXP @ +0x1640, gold @ +0x1694, TP @ +0x1758, items @ +0x16b0. Results phase unhides cell layer so game's windows re-appear; bottom-screen panel mirrors the results via live message crossfade.
+
+## Overworld map rendering (2026-09-04)
+
+**On-device render, no capture.** All 8 world maps are composited on first
+launch from the game's own data (replaced the old PixelCopy screenshot-of-the-
+map-screen capture, which needed the player to open the map once per era and
+depended on a guessed crop rect). Full disassembly evidence:
+`tools/world_map/REPORT.md`; reference implementation: `tools/world_map/render_world.py`.
+
+**Format.** `Game/world/Map/Map_%04d.dat` = 12,288 bytes = two 96x64 u8 layers
+(layer 0 at byte 0, layer 1 at 0x1800, stride 0x1800 each); byte 0 in either
+layer means "no metatile", not metatile 0. `Game/world/worldchip_<chip>_<plt>_<page>.png`
+is a 512x512 ARGB sheet of 256 metatiles (32x32px, 2x native), `row = b>>4, col = b&15`;
+page 0 backs map layer 0, page 1 backs layer 1. Per-cell compositing is per pixel
+("nonzero alpha wins", never blended): paint layer0/page0, then layer1/page1, then
+(for every world except world 5, Zeal/the sky, whose layers are swapped and whose
+overlay isn't baked) layer0/page0 again on top. Output 3072x2048 (2x).
+
+**World -> asset mapping** (world id == `PartySnapshot#worldEra`):
+
+| world | chip | plt | map file | era |
+|---|---|---|---|---|
+| 0 | 0 | 4 | Map_0000 | 1000 AD (Present) |
+| 1 | 0 | 5 | Map_0001 | 600 AD (Middle Ages) |
+| 2 | 2 | 7 | Map_0003 | 2300 AD (Future) |
+| 3 | 3 | 8 | Map_0004 | 65,000,000 BC (Prehistory) |
+| 4 | 4 | 9 | Map_0005 | 12,000 BC (Dark Ages, ground) |
+| 5 | 5 | 10 | Map_0007 | 12,000 BC (Zeal, sky) |
+| 6 | 4 | 9 | Map_0006 | 12,000 BC (Dark Ages, post-Zeal) |
+| 7 | 1 | 6 | Map_0002 | 1000 AD variant (Lavos-fallen / ending, cutscene) |
+
+World 7's map is normally overwritten at runtime from a baked table in
+`libchrono.so` (a cutscene-only variant); ChronoDuo does not reproduce that
+patch and just renders straight from `Map_0002.dat`, same as `render_world.py`
+without `--libchrono`.
+
+**Implementation.** `WorldMapCompositor` (pure Java, no android.* imports) is
+the pixel core -- `composite(map, page0, page1, overlayLayer0OnTop)` -- shared
+by `WorldMapRenderer` (Android, decodes via `BitmapFactory`/`Bitmap`) and the
+desktop check harness `tools/world_map/JavaRenderCheck.java` (decodes via
+`ImageIO`/`BufferedImage`). `AppActivity#renderWorldMaps` extracts the 8
+`Map_*.dat` + 14 `worldchip_*.png` entries from `resources.bin`, stages them
+flat under `filesDir/world_src`, and calls `WorldMapRenderer.renderAll` off
+the UI thread into `worldmap_era<N>.png` under the external files dir --
+same filename `ChronoAssets.getWorldMap(era)` already resolved, so no other
+call site changed. Verified against `render_world.py`'s reference output:
+`JavaRenderCheck` matches all 8 worlds pixel-for-pixel.
+
+**Party marker.** `PartySnapshot#worldX/worldY` are 8-pixel units at the
+world's native 1x scale (`WorldImpl::GetPartyCharPos` left-shifts the raw
+tile coordinate by 3), so the full overworld spans X in 0..191, Y in 0..127
+regardless of render scale -- `PartyPanelView.drawOverworldContent` maps
+proportionally by those spans (`worldX/192`, `worldY/128`) through whatever
+rect the map bitmap is drawn into, not a flat 256-unit range.

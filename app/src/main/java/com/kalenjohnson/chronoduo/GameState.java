@@ -169,6 +169,27 @@ public final class GameState {
      */
     public static native float[] nativeGetFieldPos();
 
+    /**
+     * Current overworld/era id, decoded from the u16 raw world selector at
+     * Asm mem 0x2E100 (id = raw - 0x1F0, valid for raw in [0x1F0, 0x1FA] i.e.
+     * id 0..10 -- era 0 = 1000 AD, 1 = 600 AD, 2 = 2300 AD, 3 = 65,000,000 BC,
+     * 4 = 12,000 BC, others are special maps -- see world_era_report.md).
+     * Plain safe_read off the same Asm buffer {@link #nativeReadAsmMem} uses,
+     * so safe to call from any thread. Returns -1 if unattached/unreadable or
+     * the raw value is out of range.
+     */
+    public static native int nativeGetWorldEra();
+
+    /**
+     * In-game overworld MAP overview mode byte, at Asm mem 0x2E27C --
+     * {@code WorldScene::mapButton()} writes 6 there when the player opens
+     * the map screen (see world_era_report.md); no other value is confirmed,
+     * so this is exposed as the raw byte (0..255), not a decoded bool --
+     * treat {@code == 6} as "map screen open". Plain safe_read, safe to call
+     * from any thread. Returns -1 if unattached/unreadable.
+     */
+    public static native int nativeGetWorldMapMode();
+
     public static native void nativeUpdateBattleFlag();           // GL thread only
     public static native boolean nativeGetBattleFlag();
     public static native void nativeDumpBattleBuffers(String dir); // any thread; uses cached node ptr

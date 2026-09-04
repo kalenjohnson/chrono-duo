@@ -30,7 +30,6 @@ public final class ChronoAssets {
     }
 
     private static Bitmap facePng;
-    private static Bitmap worldMap;
     private static Bitmap minimapMark;
     private static Bitmap windowTex;
     // 0-based line index into Localize/en/msg/monster.txt == monster id
@@ -85,7 +84,7 @@ public final class ChronoAssets {
     public static final int WINDOW_TEX_INSET = 16;
 
     // App's external files dir, set once from AppActivity (mirrors the
-    // pattern used to find worldmap_hd.png -- see AppActivity#extractCompanionAssets),
+    // pattern used to find the rendered world maps -- see AppActivity#renderWorldMaps),
     // so getAreaMap() below can locate <externalFilesDir>/ds_maps/*.png.
     private static File externalFilesDir;
     // App's private files dir (context.getFilesDir()), set once from
@@ -125,7 +124,6 @@ public final class ChronoAssets {
     private ChronoAssets() {}
 
     public static Bitmap getFace() { return facePng; }
-    public static Bitmap getWorldMap() { return worldMap; }
     public static Bitmap getMinimapMark() { return minimapMark; }
     public static Bitmap getWindowTex() { return windowTex; }
     public static String[] getMonsterNames() { return monsterNames; }
@@ -202,20 +200,121 @@ public final class ChronoAssets {
     // requires that exact class name for its JNI bindings.
     public static void setFace(Bitmap b) { facePng = b; notifyListeners(); }
 
-    /** Stores the world-map bitmap after tinting it once to a weathered sepia parchment look (see {@link #sepiaTint}). */
-    // true when the map bitmap is already at display aspect (HD override);
-    // false for wb_mini.png, which is stored at half its display width
-    private static boolean worldMapNaturalAspect;
+    // --- per-era world map cache --------------------------------------------
+    // Directory holding the per-era rendered world map PNGs (see
+    // AppActivity#renderWorldMaps / WorldMapRenderer): <dir>/worldmap_era<N>.png,
+    // N = the overworld/era id from GameState.nativeGetWorldEra() (see
+    // PartySnapshot#worldEra). Set once from AppActivity, mirroring
+    // setExternalFilesDir/setFilesDir above.
+    private static File worldMapDir;
+    private static final int WORLD_MAP_CACHE_CAP = 3;
+    private static final Map<Integer, Bitmap> worldMapCache =
+            new LinkedHashMap<Integer, Bitmap>(WORLD_MAP_CACHE_CAP, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<Integer, Bitmap> eldest) {
+                    return size() > WORLD_MAP_CACHE_CAP;
+                }
+            };
+    // Eras with no PNG on disk (the common case before capture runs), so
+    // repeated getWorldMap(era) calls -- once or more per frame from
+    // PartyPanelView -- don't re-hit the filesystem every time.
+    private static final Set<Integer> worldMapMisses = new HashSet<>();
+    // wb_mini.png, cropped and sepia-tinted once (see setMiniMapFallback):
+    // shown for any era with no rendered PNG yet. Always non-natural-aspect
+    // (see PartyPanelView's letterboxing comment on the old single-map field).
+    private static Bitmap miniMapFallback;
 
-    public static void setWorldMap(Bitmap b) { setWorldMap(b, false); }
+    /** Records the directory {@link #getWorldMap(int)} looks in for {@code worldmap_era<N>.png}. Set once from AppActivity. */
+    public static void setWorldMapDir(File dir) { worldMapDir = dir; }
 
-    public static void setWorldMap(Bitmap b, boolean naturalAspect) {
-        worldMap = b != null ? sepiaTint(b) : null;
-        worldMapNaturalAspect = naturalAspect;
+    /** Stores the wb_mini.png-derived fallback bitmap (tinted once, see {@link #sepiaTint}), shown by {@link #getWorldMap(int)} for any era with no rendered PNG on disk yet. */
+    public static void setMiniMapFallback(Bitmap b) {
+        miniMapFallback = b != null ? sepiaTint(b) : null;
         notifyListeners();
     }
 
-    public static boolean isWorldMapNaturalAspect() { return worldMapNaturalAspect; }
+    /**
+     * Lazily decodes and caches (LRU, cap {@value #WORLD_MAP_CACHE_CAP}) the
+     * rendered world map PNG for overworld/era id {@code era} --
+     * {@code <worldMapDir>/worldmap_era<era>.png}. Falls back to the
+     * wb_mini-derived {@link #miniMapFallback} (or null, before extraction
+     * finishes) when {@code era} is negative (unknown), {@link #worldMapDir}
+     * isn't set yet, or no PNG exists for this era -- i.e. on-device
+     * rendering hasn't finished or failed for it (remembered as a miss so
+     * repeated calls don't re-hit the filesystem -- see {@link
+     * #invalidateWorldMap(int)} to clear a miss once a render lands). Main
+     * thread only, like the rest of ChronoAssets.
+     */
+    public static Bitmap getWorldMap(int era) {
+        if (era < 0) return miniMapFallback;
+        Bitmap cached = worldMapCache.get(era);
+        if (cached != null) return cached;
+        if (worldMapMisses.contains(era)) return miniMapFallback;
+        File f = resolveWorldMapFile(era);
+        Bitmap decoded = f != null ? BitmapFactory.decodeFile(f.getAbsolutePath()) : null;
+        if (decoded == null) {
+            worldMapMisses.add(era);
+            return miniMapFallback;
+        }
+        Bitmap tinted = sepiaTint(decoded);
+        worldMapCache.put(era, tinted);
+        return tinted;
+    }
+
+    /** Resolves the on-disk rendered PNG for {@code era} under {@link #worldMapDir} -- see {@link #getWorldMap(int)}. */
+    private static File resolveWorldMapFile(int era) {
+        if (worldMapDir == null) return null;
+        File f = new File(worldMapDir, "worldmap_era" + era + ".png");
+        return f.isFile() ? f : null;
+    }
+
+    /**
+     * True when {@link #getWorldMap(int)} for {@code era} is currently
+     * serving a rendered per-era bitmap (already at display aspect);
+     * false when it would fall back to the wb_mini-derived {@link
+     * #miniMapFallback} (stored at half its display width -- see
+     * PartyPanelView's letterboxing comment). Per-bitmap, unlike the old
+     * single-map field this replaces.
+     */
+    public static boolean isWorldMapNaturalAspect(int era) {
+        return era >= 0 && worldMapCache.containsKey(era);
+    }
+
+    /**
+     * Drops the cached bitmap and known-missing flag for {@code era}, so the
+     * next {@link #getWorldMap(int)} call re-hits the filesystem instead of
+     * returning a stale miss/hit. Called after a new capture is saved for
+     * this era. Notifies listeners so a panel already showing the fallback
+     * (or a previous capture) for this era repaints.
+     */
+    public static void invalidateWorldMap(int era) {
+        worldMapCache.remove(era);
+        worldMapMisses.remove(era);
+        notifyListeners();
+    }
+
+    /**
+     * True when a rendered PNG for {@code era} exists on disk under
+     * {@link #worldMapDir} -- the single source of truth for "does this era
+     * already have an image", shared by {@link #getWorldMap(int)},
+     * {@link #capturedWorldMapEras()}, and AppActivity#renderWorldMaps
+     * ({@link #resolveWorldMapFile} is the single place that decides
+     * whether a world's render is present).
+     */
+    public static boolean hasWorldMap(int era) {
+        return resolveWorldMapFile(era) != null;
+    }
+
+    /** Eras (0..7 -- WorldMapRenderer.worldCount()) with a rendered PNG currently on disk under {@link #worldMapDir} -- for the settings screen's one-line status row. Does not consult the decode cache (so it reflects disk state even for an era not yet queried by {@link #getWorldMap(int)}). */
+    public static List<Integer> capturedWorldMapEras() {
+        List<Integer> eras = new ArrayList<>();
+        if (worldMapDir == null) return eras;
+        for (int era = 0; era < WorldMapRenderer.worldCount(); era++) {
+            if (resolveWorldMapFile(era) != null) eras.add(era);
+        }
+        return eras;
+    }
+
     public static void setMinimapMark(Bitmap b) { minimapMark = b; notifyListeners(); }
     public static void setWindowTex(Bitmap b) { windowTex = b; notifyListeners(); }
 
@@ -243,7 +342,7 @@ public final class ChronoAssets {
     /**
      * Records the app's external files dir, so {@link #getAreaMap(int)} can
      * find {@code <dir>/ds_maps/area_minimap_%03d.png}. Set once from
-     * AppActivity, the same place that resolves worldmap_hd.png.
+     * AppActivity, the same place that resolves the rendered world maps.
      */
     public static void setExternalFilesDir(File dir) { externalFilesDir = dir; }
 
@@ -342,7 +441,8 @@ public final class ChronoAssets {
     /** Registers a listener; if any asset is already loaded, fires immediately so late attachers (e.g. a Presentation created after the background load finished) don't miss it. */
     public static void addListener(Listener l) {
         listeners.add(l);
-        if (facePng != null || worldMap != null || minimapMark != null || windowTex != null
+        if (facePng != null || miniMapFallback != null || !worldMapCache.isEmpty()
+                || minimapMark != null || windowTex != null
                 || monsterNames != null || monsterFlags != null
                 || techNames != null || itemNames != null
                 || itemCategoryNames != null || techMp != null) {

@@ -1565,6 +1565,75 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeGetFieldPos(JNIEnv *env, jclass 
     return arr;
 }
 
+// Current overworld/era id, decoded from the u16 raw world selector at Asm
+// mem 0x2E100 (2 bytes before the party position halfwords at 0x2E102/
+// 0x2E103 -- see world_era_report.md, cross-checked against
+// WorldImpl::InitWorldMap's own decode: id = raw - 0x1F0, valid for raw in
+// [0x1F0, 0x1FA] i.e. id 0..10; era 0 = 1000 AD, 1 = 600 AD, 2 = 2300 AD,
+// 3 = 65,000,000 BC, 4 = 12,000 BC, others are special maps). Returns -1 if
+// the Asm buffer isn't attached/plausible, the read fails, or raw is out of
+// that range (WorldImpl itself keeps the previous decoded value when raw is
+// out of range; -1 here just means "don't trust this snapshot", callers
+// already treat -1 as unknown). Plain safe_read off the same global Asm
+// buffer nativeReadAsmMem uses, so safe to call from any thread.
+#define WORLD_ERA_RAW_OFFSET 0x2E100
+#define WORLD_ERA_RAW_MIN    0x1F0
+#define WORLD_ERA_RAW_MAX    0x1FA
+
+static int g_last_logged_world_era = -2; // -2 = never logged; distinct from the -1 "unknown" return value
+
+JNIEXPORT jint JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetWorldEra(JNIEnv *env, jclass cls) {
+    int era = -1;
+    if (g_asm_mem_slot) {
+        uint8_t *mem = *g_asm_mem_slot;
+        if (plausible_ptr(mem)) {
+            uint16_t raw;
+            if (safe_read(mem + WORLD_ERA_RAW_OFFSET, &raw, sizeof(raw))
+                    && raw >= WORLD_ERA_RAW_MIN && raw <= WORLD_ERA_RAW_MAX) {
+                era = raw - WORLD_ERA_RAW_MIN;
+            }
+        }
+    }
+    if (era != g_last_logged_world_era) {
+        LOGI("world era: %d (was %d)", era, g_last_logged_world_era);
+        g_last_logged_world_era = era;
+    }
+    return (jint) era;
+}
+
+// In-game overworld MAP overview mode byte, at Asm mem 0x2E27C --
+// WorldScene::mapButton() writes 6 there when the player opens the map
+// screen (see world_era_report.md); no confirmed value for "closed" was
+// found in the disassembly pass (no writer other than mapButton's own str
+// was located), so this is exposed as a raw byte (0..255) rather than a
+// decoded bool -- callers should treat "== 6" as "map screen open" and log/
+// observe live what it reads the rest of the time. Returns -1 if the Asm
+// buffer isn't attached/plausible or the read fails. Plain safe_read, safe
+// to call from any thread.
+#define WORLD_MAP_MODE_OFFSET 0x2E27C
+
+static int g_last_logged_world_map_mode = -2; // -2 = never logged; distinct from the -1 "unknown" return value
+
+JNIEXPORT jint JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetWorldMapMode(JNIEnv *env, jclass cls) {
+    int mode = -1;
+    if (g_asm_mem_slot) {
+        uint8_t *mem = *g_asm_mem_slot;
+        if (plausible_ptr(mem)) {
+            uint8_t raw;
+            if (safe_read(mem + WORLD_MAP_MODE_OFFSET, &raw, sizeof(raw))) {
+                mode = raw;
+            }
+        }
+    }
+    if (mode != g_last_logged_world_map_mode) {
+        LOGI("world map mode: %d (was %d)", mode, g_last_logged_world_map_mode);
+        g_last_logged_world_map_mode = mode;
+    }
+    return (jint) mode;
+}
+
 // ---------------------------------------------------------------------------
 // Battle flag: is the running scene (or a shallow child) a battle scene?
 // Must run on the GL thread (scene graph unsafe off-thread) -- cached like

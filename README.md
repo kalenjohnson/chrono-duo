@@ -18,8 +18,11 @@ screen via Android's standard `Presentation` API.
 
 - [x] Game boots and plays full-widescreen inside ChronoDuo (Ayn Thor Lite)
 - [x] DS-style second screen: real portraits in the game's own window chrome,
-      HD sepia world map (torn-paper parchment) with a live position marker,
-      live location name, gold and play time
+      sepia-toned overworld map (torn-paper parchment) with a live position
+      marker, live location name, gold and play time
+- [x] All 8 overworld maps rendered on device, at first launch, straight from
+      the game's own map/chip data (no screenshot capture, no ROM needed) --
+      see "World maps" below
 - [x] Live battle mode: real-time party HP, named enemy bars (honoring the
       game's hidden-info flags by default, eye-toggle to reveal), fades and
       results window on the bottom screen
@@ -31,8 +34,7 @@ screen via Android's standard `Presentation` API.
 - [x] Original pixel-art sprites: a settings toggle restores the unfiltered
       SNES-style character sprites, rebuilt on-device from art the game itself
       ships (no ROM needed); field tiles remain the port's smoothed versions
-- [ ] Someday: ATB gauges, overworld era maps, optional cheats via the
-      game's own ExperiencePlus
+- [ ] Someday: ATB gauges, optional cheats via the game's own ExperiencePlus
 
 ## Build
 
@@ -43,6 +45,16 @@ Requires an Android SDK (see `local.properties`) and a JDK Gradle supports
 ./gradlew assembleDebug
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
+
+## World maps
+
+On first launch, ChronoDuo renders all 8 overworld maps (1000 AD, 600 AD,
+2300 AD, 65,000,000 BC, and the three 12,000 BC states) straight from the
+game's own map and chip-sheet data pulled out of its `resources.bin` -- the
+same compositing the game itself does when it draws the overworld, ported to
+Java (`WorldMapCompositor`/`WorldMapRenderer`). No screenshot, no map-screen
+visit, no ROM required. See `tools/world_map/REPORT.md` for the on-disk
+format and `NOTES.md` for the summary.
 
 ## How it works
 

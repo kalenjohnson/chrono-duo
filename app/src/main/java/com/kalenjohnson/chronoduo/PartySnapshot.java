@@ -157,6 +157,12 @@ public final class PartySnapshot {
     // Overworld tile position (Asm mem 0x2E102/0x2E103, u8 each; world is
     // 256x256 tiles). Valid only when on the overworld (mapName empty).
     public int worldX = -1, worldY = -1;
+    // Current overworld/era id (GameState.nativeGetWorldEra(), -1 =
+    // unknown/off-overworld) and the in-game MAP-overview mode byte
+    // (GameState.nativeGetWorldMapMode(), -1 = unreadable; 6 = map screen
+    // open per WorldScene::mapButton -- see world_era_report.md). Both are
+    // plain safe_read, so cheap to fill every snapshot regardless of mode.
+    public int worldEra = -1, worldMapMode = -1;
     // Current field-map/location id, from GameState.nativeGetFieldMapId()
     // (ChronoCanvas+0x12300). -1 when unknown/unattached. Used by
     // PartyPanelView to look up a rendered DS-style area map bitmap for
@@ -194,6 +200,8 @@ public final class PartySnapshot {
         String mn = GameState.nativeGetMapName();
         snap.mapName = mn != null ? mn : "";
         snap.fieldMapId = GameState.nativeGetFieldMapId();
+        snap.worldEra = GameState.nativeGetWorldEra();
+        snap.worldMapMode = GameState.nativeGetWorldMapMode();
         float[] fieldPos = GameState.nativeGetFieldPos();
         if (fieldPos != null && fieldPos.length >= 2) {
             snap.fieldX = fieldPos[0];
@@ -348,6 +356,7 @@ public final class PartySnapshot {
         if (gold != o.gold || playSeconds != o.playSeconds
                 || !mapName.equals(o.mapName)
                 || worldX != o.worldX || worldY != o.worldY
+                || worldEra != o.worldEra || worldMapMode != o.worldMapMode
                 || fieldMapId != o.fieldMapId
                 || !feq(fieldX, o.fieldX) || !feq(fieldY, o.fieldY)) return false;
         if (inBattle != o.inBattle || enemies.size() != o.enemies.size()) return false;

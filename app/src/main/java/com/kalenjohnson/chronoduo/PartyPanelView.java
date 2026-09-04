@@ -1926,6 +1926,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         return n > 0 ? (n + " sheets") : "not built";
     }
 
+    /** Builds the settings screen's one-line "World maps: N/8 rendered" status row -- how many of the game's overworld/era ids (see {@link PartySnapshot#worldEra}, {@link WorldMapRenderer#worldCount()}) have an on-device-rendered PNG on disk, per {@link ChronoAssets#capturedWorldMapEras()}. */
+    private String worldMapStatusText() {
+        int rendered = ChronoAssets.capturedWorldMapEras().size();
+        return "World maps: " + rendered + "/" + WorldMapRenderer.worldCount() + " rendered";
+    }
+
     /**
      * The settings screen: same parchment chrome as the normal panel (title,
      * "DS maps: <status>" row + import button, "Pixel graphics: On/Off"
@@ -1971,6 +1977,11 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 parchment.left + w * 0.06f, parchment.top + h * 0.488f, text);
         c.drawText("original pixel art. Only applies when Pixel graphics is On.",
                 parchment.left + w * 0.06f, parchment.top + h * 0.514f, text);
+
+        setText(h * 0.022f, Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK)),
+                false, Paint.Align.LEFT, false);
+        text.setTypeface(Typeface.MONOSPACE);
+        c.drawText(worldMapStatusText(), parchment.left + w * 0.06f, parchment.top + h * 0.63f, text);
 
         c.restore();
         drawParchmentOverlay(c, parchment);
@@ -2063,7 +2074,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         c.drawText(title, parchment.centerX(), parchment.top + h * 0.085f, text);
 
         float mx = parchment.centerX(), my = parchment.centerY() + h * 0.03f;
-        Bitmap map = ChronoAssets.getWorldMap();
+        Bitmap map = ChronoAssets.getWorldMap(s.worldEra);
         if (map != null) {
             // area between the title and the gold/time corner text
             RectF area = new RectF(parchment.left + w * 0.06f, parchment.top + h * 0.13f,
@@ -2075,7 +2086,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             // map.getHeight(). drawBitmap below maps the full (undoubled)
             // source into a dst rect built from the doubled width, which
             // is what stretches it 2x horizontally.
-            float effW = ChronoAssets.isWorldMapNaturalAspect()
+            float effW = ChronoAssets.isWorldMapNaturalAspect(s.worldEra)
                     ? map.getWidth() : map.getWidth() * 2f;
             float effH = map.getHeight();
             float scale = Math.min(area.width() / effW, area.height() / effH);
@@ -2083,11 +2094,17 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             RectF dst = new RectF(area.centerX() - dw / 2f, area.centerY() - dh / 2f,
                     area.centerX() + dw / 2f, area.centerY() + dh / 2f);
             c.drawBitmap(map, null, dst, mapPaint);
-            // live position: overworld tiles (0..255 each axis) map
-            // linearly onto the drawn map rect
+            // Live position: worldX/worldY are 8-pixel units at the world's
+            // native 1x scale (WorldImpl::GetPartyCharPos left-shifts the raw
+            // SNES-RAM tile coordinate by 3 -- see tools/world_map/REPORT.md
+            // section 6), so the full overworld spans X in 0..191 (1536px/8)
+            // and Y in 0..127 (1024px/8) regardless of what's actually drawn
+            // in dst (the rendered 3072x2048 map or the letterboxed wb_mini
+            // fallback) -- map proportionally by those spans, not a flat
+            // 256-unit range.
             if (s.worldX >= 0 && s.worldY >= 0) {
-                mx = dst.left + dst.width() * (s.worldX / 256f);
-                my = dst.top + dst.height() * (s.worldY / 256f);
+                mx = dst.left + dst.width() * (s.worldX / 192f);
+                my = dst.top + dst.height() * (s.worldY / 128f);
             } else {
                 mx = dst.centerX();
                 my = dst.centerY();
