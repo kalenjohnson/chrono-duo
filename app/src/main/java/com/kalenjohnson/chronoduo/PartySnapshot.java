@@ -19,6 +19,33 @@ public final class PartySnapshot {
     private static final int CHARA_STRIDE = 0x120;
     private static final int NAMES_BASE = 0x19a8;
     private static final int NAME_STRIDE = 0x18;
+    // Active party list in the translated-65816 ("Asm") memory: 3 PC-id
+    // bytes, 0x80 = empty slot (SNES CT's $7E2980 convention). Same offset
+    // space as GameState.nativeReadAsmMem / the asmmem.bin dev dump.
+    private static final int PARTY_LIST_OFFSET = 0x20980;
+    private static final int PARTY_LIST_SLOTS = 3;
+    private static final int PARTY_LIST_EMPTY = 0x80;
+    // The C++ layer's OWN live active-party list: three i32 slots at
+    // ChronoCanvas+0x124e8/+0x124ec/+0x124f0 (cSfcWork-relative 0x124a8, the
+    // offset space nativeReadSfc uses). Each holds a GetCharaData index
+    // DOUBLED (the field engine does `asr #1` before cSfcWork::GetCharaData;
+    // see CHARA_DATA_BASE for the index->id mapping) or 0x80 for an empty
+    // slot. This is what FieldImpl::atel_partyM (the script's
+    // party-remove command), atel_partyMM and atel_split read and shift, so
+    // it changes the instant a character leaves in a field cutscene -- the
+    // Asm-memory copy at 0x20980 above is only re-synced on overworld entry,
+    // which is why Frog's portrait used to linger through the whole castle.
+    private static final int PARTY_SLOTS_OFFSET = 0x124a8;
+    private static final int PARTY_SLOT_STRIDE = 4;
+    // cSfcWork::GetCharaData(i) = cSfcWork+0x6924 + i*0x154; record +0x44 is
+    // the PC id (atel_partyM compares it against the script's id byte).
+    // The party-slot words above are GetCharaData indices x2, NOT PC ids x2:
+    // a live Crono+Marle party read 00000004 00000006, i.e. indices 2 and 3,
+    // so PCs sit at index id+2 and the id must be read back from +0x44.
+    private static final int CHARA_DATA_BASE = 0x6924;
+    private static final int CHARA_DATA_STRIDE = 0x154;
+    private static final int CHARA_DATA_ID_OFF = 0x44;
+    private static final int CHARA_DATA_COUNT = 16;
 
     // Battle actor array (see GameState.nativeReadBattleActors): stride 0x80
     // per actor, at least 10 slots. u16 LE +0x03 = current HP, +0x05 = max HP.
@@ -49,7 +76,7 @@ public final class PartySnapshot {
     public static final class Member {
         public String name;
         public int level, curHp, maxHp, curMp, maxMp;
-        public int slot; // 1-based party slot (record +0x11c); -1 = not in party
+        public int slot; // 1-based active-party position (party order)
         // Live battle HP, when inBattle -- overrides curHp/maxHp for display
         // purposes while a fight is active (see PartyPanelView).
         public int battleCurHp, battleMaxHp;
@@ -244,11 +271,38 @@ public final class PartySnapshot {
                 snap.worldY = pos[1] & 0xff;
             }
         }
+        // Active party membership/order, most-live source first:
+        //  1. the C++ layer's own slots at canvas+0x124e8 (PARTY_SLOTS_OFFSET)
+        //     -- updated the instant a field cutscene adds/removes someone;
+        //  2. the Asm-memory copy at 0x20980: three PC-id bytes, 0x80 =
+        //     empty (verified live: Crono+Lucca 00 02 80, +Frog 00 02 04),
+        //     but only re-synced when the party steps onto the overworld;
+        //  3. the record field +0x11c, a JOIN COUNTER (Crono 1, Marle 2,
+        //     Lucca 3, Frog 4 ... -1 = never joined / left), NOT a 1..3
+        //     slot: filtering on 1..3 dropped Frog the moment he joined.
+        int[] order = new int[7];
+        java.util.Arrays.fill(order, -1);
+        boolean haveList = readCanvasPartyList(order);
+        if (!haveList) {
+            // Fallback 1: the Asm-memory copy (stale inside field maps until
+            // the next overworld entry, but right on the overworld itself).
+            java.util.Arrays.fill(order, -1);
+            byte[] plist = GameState.nativeReadAsmMem(PARTY_LIST_OFFSET, PARTY_LIST_SLOTS);
+            if (plist != null && plist.length >= PARTY_LIST_SLOTS) {
+                for (int k = 0; k < PARTY_LIST_SLOTS; k++) {
+                    int id = plist[k] & 0xff;
+                    if (id < 7 && order[id] < 0) { order[id] = k + 1; haveList = true; }
+                    else if (id != PARTY_LIST_EMPTY) { haveList = false; break; } // garbage: fall back
+                }
+            }
+        }
         for (int i = 0; i < 7; i++) {
             byte[] b = GameState.nativeReadSfc(CHARA_BASE + i * CHARA_STRIDE, 0x120);
             if (b == null) break;
-            int slot = u32(b, 0x11c);
-            if (slot < 1 || slot > 3) continue; // not in the active party
+            int joined = u32(b, 0x11c);
+            // Fallback 2 (no readable list at all): +0x11c join-counter order.
+            int slot = haveList ? order[i] : joined;
+            if (slot < 1) continue; // empty / in the reserve, not the active party
             int level = u32(b, 0x40);
             int maxHp = u32(b, 0x10);
             if (level <= 0 || level > 99 || maxHp <= 0 || maxHp > 999) continue;
@@ -368,6 +422,52 @@ public final class PartySnapshot {
                     && snap.resultsStep >= 1 && snap.resultsStep <= 30; // step 0 = engine still waiting out death animations; 1 = first window is up
         }
         return snap;
+    }
+
+    // Last raw canvas party-slot words, for a change-only logcat line
+    // ("ChronoDuo party slots: ...") so a live run can confirm the decode.
+    private static int lastSlotsA = Integer.MIN_VALUE, lastSlotsB, lastSlotsC;
+
+    /**
+     * Fills {@code order[id]} with the 1-based active-party position from
+     * the C++ layer's live party list (see {@link #PARTY_SLOTS_OFFSET}).
+     * Returns false, leaving {@code order} untouched, when the three words
+     * don't decode as a well-formed list (unreadable, odd/out-of-range id,
+     * duplicate) so the caller can fall back to the Asm-memory copy.
+     */
+    private static boolean readCanvasPartyList(int[] order) {
+        byte[] w = GameState.nativeReadSfc(PARTY_SLOTS_OFFSET, PARTY_LIST_SLOTS * PARTY_SLOT_STRIDE);
+        if (w == null || w.length < PARTY_LIST_SLOTS * PARTY_SLOT_STRIDE) return false;
+        int a = u32(w, 0), b = u32(w, 4), c = u32(w, 8);
+        if (a != lastSlotsA || b != lastSlotsB || c != lastSlotsC) {
+            lastSlotsA = a; lastSlotsB = b; lastSlotsC = c;
+            android.util.Log.i("ChronoDuo", String.format("party slots: %08x %08x %08x", a, b, c));
+        }
+        int[] ids = new int[PARTY_LIST_SLOTS];
+        int count = 0;
+        for (int k = 0; k < PARTY_LIST_SLOTS; k++) {
+            int v = u32(w, k * PARTY_SLOT_STRIDE);
+            if (v == PARTY_LIST_EMPTY) { ids[k] = -1; continue; }
+            if (v < 0 || (v & 1) != 0 || (v >> 1) >= CHARA_DATA_COUNT) return false;
+            ids[k] = charaDataId(v >> 1);
+            if (ids[k] < 0 || ids[k] >= 7) return false;
+            for (int j = 0; j < k; j++) if (ids[j] == ids[k]) return false; // duplicate
+            count++;
+        }
+        if (count == 0) return false; // an empty party is never real; don't trust it
+        for (int k = 0; k < PARTY_LIST_SLOTS; k++) if (ids[k] >= 0) order[ids[k]] = k + 1;
+        return true;
+    }
+
+    /**
+     * PC id stored in cSfcWork::GetCharaData(idx)+0x44, or -1 if unreadable.
+     * Verified live 2026-09-05: Crono+Marle party slots 4/6 -> records 2/3
+     * -> +0x44 = 0/1 (+0x40 = 0/1 = party position).
+     */
+    private static int charaDataId(int idx) {
+        byte[] r = GameState.nativeReadSfc(CHARA_DATA_BASE + idx * CHARA_DATA_STRIDE, 0x48);
+        if (r == null) return -1;
+        return u32(r, CHARA_DATA_ID_OFF);
     }
 
     private static String readName(int id) {

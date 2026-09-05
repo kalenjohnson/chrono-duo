@@ -136,9 +136,29 @@ Verified live on device (values matched Crono/Marle/Lucca/… canonical stats):
   0x2e100–0x2fe00 live) — the C++ layer owns most state; SNES RAM-map addresses
   do NOT hold field-mode party data. `WorldImpl::PartyMember()` does read
   0x22980 ($7E2980) via `Asm::_ld16`, so some contexts (world map?) sync it.
-- **Party composition: SOLVED via differential dump** (before/after Marle
-  joined): character record field **+0x11c (i32) = 1-based party slot**,
-  -1 when not in the party. Crono=1, Marle=2 verified live.
+- **Party composition.** Character record field **+0x11c (i32) is a JOIN
+  COUNTER, not a slot**: Crono=1, Marle=2, Lucca=3, Frog=4 ... and -1 when
+  not (or no longer) in the party — a live dump after Frog joined (Marle
+  gone) read `1, -1, 3, -1, 4, -1, -1`, so the old `1..3` filter silently
+  dropped Frog (fixed 2026-09-05). The **active party list is in Asm memory
+  at 0x20980: 3 PC-id bytes in party order, 0x80 = empty** (SNES CT's
+  $7E2980 convention; Crono+Lucca dumps read `00 02 80`, Crono+Lucca+Frog
+  `00 02 04`) -- **but that copy is only re-synced on overworld entry**: after
+  Frog left in Guardia Castle his portrait stayed until the party walked out
+  onto the world map. The **live list is the C++ layer's own: three i32 slots
+  at ChronoCanvas+0x124e8/ec/f0 (cSfcWork-relative 0x124a8), value =
+  `cSfcWork::GetCharaData` index × 2 (the engine does `asr #1`), 0x80 =
+  empty**. That index is NOT the PC id: live Crono+Marle read `4, 6` (indices
+  2, 3), so the id is read back from the GetCharaData record (cSfcWork+0x6924
+  + i*0x154) at +0x44, which `atel_partyM` compares to the script's id byte.
+  Verified live: records 2/3 read +0x44 = 0/1 (Crono/Marle) and +0x40 = 0/1
+  (party position; `atel_partyM` writes 3 there on removal). So the earlier
+  "GetCharaData observed all-zero during field play" note was wrong for the
+  PC entries -- they are live. Portraits now update mid-cutscene. `FieldImpl::atel_partyM` (script party-remove) reads/shifts those
+  slots directly, as do `atel_partyMM` and `atel_split`. `PartySnapshot.read()`
+  uses that list first, then the Asm copy, then `+0x11c >= 1` ordering; a
+  change-only `party slots: xxxxxxxx ...` logcat line shows the raw words.
+  The reserve (SNES $7E2983+) reads as zeros in Asm memory, so it is not used.
 - Differential-dump workflow (the way to find any remaining field):
   `GameState.dumpToFiles()` writes sfcwork.bin (64KB) + asmmem.bin (192KB) to
   the app's external files dir every 8s (dev only); adb pull before/after a
