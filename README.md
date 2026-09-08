@@ -57,9 +57,9 @@ the last, so newer APKs install over older ones.
 ### Settings
 
 Tap the gear in the top-left corner of the bottom screen (outside battle) to
-open settings. From
-there you can import a DS ROM through the system file picker, build the
-original pixel-art sheets, and see how many world maps have been rendered.
+open settings. There you can import a DS ROM through the system file picker,
+build the original pixel-art sheets, and see how many world maps have been
+rendered.
 
 ## Build from source
 
@@ -84,7 +84,7 @@ request. Pushes to `main` refresh the rolling `latest` pre-release; pushing
 a tag such as `v0.2` creates a versioned release with generated notes.
 
 ```
-git tag v0.2 && git push origin v0.2
+git tag v0.2 && git push main v0.2
 ```
 
 Without a signing keystore the APK is signed with a throwaway debug key, and
