@@ -96,7 +96,7 @@ repository secrets:
 keytool -genkeypair -keystore release.jks -storetype PKCS12 -alias chronoduo \
   -keyalg RSA -keysize 4096 -validity 10000
 
-gh secret set KEYSTORE_BASE64 < <(base64 -w0 release.jks)
+base64 -w0 release.jks | gh secret set KEYSTORE_BASE64
 gh secret set KEYSTORE_PASSWORD
 gh secret set KEY_ALIAS --body chronoduo
 gh secret set KEY_PASSWORD
