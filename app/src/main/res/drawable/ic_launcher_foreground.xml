@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Two stacked screens: a clock on the top (Chrono), a parchment map with a
+     position marker on the bottom (the companion display). Original artwork. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group android:scaleX="1.06" android:scaleY="1.06" android:pivotX="54" android:pivotY="54">
+        <!-- top screen bezel + panel -->
+        <path android:fillColor="#0B0F22" android:strokeColor="#6C7394" android:strokeWidth="1.5"
+            android:pathData="M35,27h38a3,3 0 0 1 3,3v20a3,3 0 0 1 -3,3h-38a3,3 0 0 1 -3,-3v-20a3,3 0 0 1 3,-3z"/>
+        <!-- clock face -->
+        <path android:fillColor="#F0D27A" android:strokeColor="#8C6B22" android:strokeWidth="1.2"
+            android:pathData="M54,30.5a9.5,9.5 0 1 1 -0.01,0z"/>
+        <path android:strokeColor="#B48F3A" android:strokeWidth="0.6"
+            android:pathData="M54,32.4a7.6,7.6 0 1 1 -0.01,0z"/>
+        <!-- hour ticks -->
+        <path android:strokeColor="#6E4E12" android:strokeWidth="1" android:strokeLineCap="round"
+            android:pathData="M54,33.2v1.4 M54,45.4v1.4 M47.2,40h1.4 M59.4,40h1.4"/>
+        <!-- hands -->
+        <path android:strokeColor="#3B2A08" android:strokeWidth="1.5" android:strokeLineCap="round"
+            android:pathData="M54,40v-4.8 M54,40l4.2,2.4"/>
+        <path android:fillColor="#3B2A08" android:pathData="M54,38.9a1.1,1.1 0 1 1 -0.01,0z"/>
+        <!-- bottom screen bezel + parchment -->
+        <path android:fillColor="#CDB07A" android:strokeColor="#6C7394" android:strokeWidth="1.5"
+            android:pathData="M37,57h34a3,3 0 0 1 3,3v16a3,3 0 0 1 -3,3h-34a3,3 0 0 1 -3,-3v-16a3,3 0 0 1 3,-3z"/>
+        <path android:strokeColor="#8B6B3A" android:strokeWidth="0.6"
+            android:pathData="M38,59.5h32a1.5,1.5 0 0 1 1.5,1.5v14a1.5,1.5 0 0 1 -1.5,1.5h-32a1.5,1.5 0 0 1 -1.5,-1.5v-14a1.5,1.5 0 0 1 1.5,-1.5z"/>
+        <!-- land mass -->
+        <path android:fillColor="#B99A5E" android:strokeColor="#7A5A2E" android:strokeWidth="0.7"
+            android:pathData="M40,72C41,67 44,64 48,64C51,64 52,67 55,66C58,65 60,62 64,63C67,64 68,67 67,70C66,73 62,74 58,73C54,72 52,75 48,74C44,73 40,75 40,72z"/>
+        <!-- route -->
+        <path android:strokeColor="#7A5A2E" android:strokeWidth="0.7"
+            android:pathData="M45,70Q50,66 56,69T63,66"/>
+        <!-- marker -->
+        <path android:fillColor="#D3402C" android:strokeColor="#FFF1C2" android:strokeWidth="0.6"
+            android:pathData="M56,67.1a1.9,1.9 0 1 1 -0.01,0z"/>
+    </group>
+</vector>
