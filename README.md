@@ -7,7 +7,7 @@
 A dual-screen host for **Chrono Trigger (Upgrade Ver.)** on dual-screen Android
 handhelds such as the Ayn Thor. The real game runs full-widescreen on the top
 screen while the bottom screen becomes a DS-style companion display: a live
-world map, party status, inventory, and the whole battle command menu.
+world map, party status, and the whole battle command menu.
 
 ChronoDuo ships **no game code or assets**. It loads the official Chrono
 Trigger Android app you already own, inside its own process, and drives the
