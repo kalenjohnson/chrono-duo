@@ -13,6 +13,10 @@ ChronoDuo ships **no game code or assets**. It loads the official Chrono
 Trigger Android app you already own, inside its own process, and drives the
 second screen through Android's standard `Presentation` API.
 
+<p align="center">
+  <img src="docs/screenshots/overworld.webp" width="640" alt="Overworld on the top screen, the parchment world map with a live position marker on the bottom">
+</p>
+
 ## Requirements
 
 - A dual-screen Android device (developed on the Ayn Thor Lite). Any device
@@ -49,6 +53,11 @@ second screen through Android's standard `Presentation` API.
 - **Original pixel art**: a settings toggle rebuilds the unfiltered SNES-style
   character sprites, field chip sheets, and overworld tiles from the 1x art
   the game itself ships.
+
+<p align="center">
+  <img src="docs/screenshots/battle.webp" width="420" alt="Battle with the Attack, Tech and Item menu mirrored to the bottom screen">
+  <img src="docs/screenshots/forest.webp" width="420" alt="Guardia Forest with the DS area map on the bottom screen">
+</p>
 
 ### Settings
 
