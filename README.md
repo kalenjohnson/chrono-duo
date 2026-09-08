@@ -33,10 +33,6 @@ second screen through Android's standard `Presentation` API.
 3. Launch **ChronoDuo** instead of Chrono Trigger. The game boots on the top
    screen and the companion display appears on the bottom.
 
-Every push to `main` publishes a **Latest build** pre-release; tagged
-versions get their own release. Each build has a higher version code than
-the last, so newer APKs install over older ones.
-
 ## What the bottom screen does
 
 - **Overworld map** in a sepia, torn-parchment style with a live position
@@ -77,34 +73,11 @@ Adjust it, or override on the command line:
 ./gradlew -Dorg.gradle.java.home=/path/to/jdk21 assembleDebug
 ```
 
-### Continuous builds and releases
+### Releases
 
-`.github/workflows/build.yml` builds a release APK on every push and pull
-request. Pushes to `main` refresh the rolling `latest` pre-release; pushing
-a tag such as `v0.2` creates a versioned release with generated notes.
-
-```
-git tag v0.2 && git push main v0.2
-```
-
-Without a signing keystore the APK is signed with a throwaway debug key, and
-Android will refuse to install a build signed with a different key over an
-existing one. To sign consistently, create a keystore once and add it to the
-repository secrets:
-
-```
-keytool -genkeypair -keystore release.jks -storetype PKCS12 -alias chronoduo \
-  -keyalg RSA -keysize 4096 -validity 10000
-
-base64 -w0 release.jks | gh secret set KEYSTORE_BASE64
-gh secret set KEYSTORE_PASSWORD
-gh secret set KEY_ALIAS --body chronoduo
-gh secret set KEY_PASSWORD
-```
-
-Keep `release.jks` backed up. Locally, the same signing is picked up from the
-environment variables `CHRONODUO_KEYSTORE`, `CHRONODUO_KEYSTORE_PASSWORD`,
-`CHRONODUO_KEY_ALIAS`, and `CHRONODUO_KEY_PASSWORD`.
+GitHub Actions builds every push. Pushes to `main` refresh the rolling
+**Latest build** pre-release; a `v*` tag creates a versioned release. See
+`NOTES.md` for signing setup.
 
 ## How it works
 

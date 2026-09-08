@@ -554,3 +554,25 @@ current snapshot.
 **Still unverified on device:** that a live grid actually diverges from the
 shipped `Map_%04d.dat` after a story event (the diff-count log answers it in one
 line), and the recomposite wall time for a 3072x2048 composite on the Thor.
+
+## Releases and signing (2026-09-08)
+
+`.github/workflows/build.yml` runs on every push/PR. Pushes to `main` refresh the rolling
+`latest` pre-release; a `v*` tag makes a versioned release with generated notes
+(`git tag v0.2; git push main v0.2`). Each build passes `-PversionCode=$GITHUB_RUN_NUMBER`
+and `-PversionName=<tag or 0.1-<sha>>` so newer APKs install over older ones.
+
+Signing: `app/build.gradle` reads `CHRONODUO_KEYSTORE`, `CHRONODUO_KEYSTORE_PASSWORD`,
+`CHRONODUO_KEY_ALIAS`, `CHRONODUO_KEY_PASSWORD` from the environment; CI fills those from the
+repo secrets `KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`. With no
+keystore the release build is debug-signed with a per-run throwaway key, which means Android
+refuses to install one build over another. One-time setup (fish-safe):
+
+    keytool -genkeypair -keystore ~/.config/chronoduo/release.jks -storetype PKCS12 \
+      -alias chronoduo -keyalg RSA -keysize 4096 -validity 10000
+    base64 -w0 ~/.config/chronoduo/release.jks | gh secret set KEYSTORE_BASE64
+    gh secret set KEYSTORE_PASSWORD
+    gh secret set KEY_ALIAS --body chronoduo
+    gh secret set KEY_PASSWORD
+
+Back up the `.jks`; if it is lost, future builds cannot install over existing ones.
