@@ -10,8 +10,10 @@ android {
         applicationId 'com.kalenjohnson.chronoduo'
         minSdk 26
         targetSdk 35
-        versionCode 1
-        versionName '0.1'
+        // CI passes -PversionCode=<run number> -PversionName=<tag> so every
+        // published APK installs over the previous one.
+        versionCode (project.hasProperty('versionCode') ? project.versionCode.toInteger() : 1)
+        versionName (project.hasProperty('versionName') ? project.versionName : '0.1')
     }
 
     compileOptions {
@@ -25,6 +27,26 @@ android {
 
     externalNativeBuild {
         cmake { path 'src/main/cpp/CMakeLists.txt' }
+    }
+
+    // Release signing comes from the environment (see .github/workflows/build.yml).
+    // Without CHRONODUO_KEYSTORE the release build is debug-signed so it still installs.
+    def keystorePath = System.getenv('CHRONODUO_KEYSTORE')
+    signingConfigs {
+        if (keystorePath) {
+            release {
+                storeFile file(keystorePath)
+                storePassword System.getenv('CHRONODUO_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('CHRONODUO_KEY_ALIAS')
+                keyPassword System.getenv('CHRONODUO_KEY_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig keystorePath ? signingConfigs.release : signingConfigs.debug
+        }
     }
 
     lint {

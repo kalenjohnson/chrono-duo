@@ -1,89 +1,131 @@
 # ChronoDuo
 
-Dual-screen host app for **Chrono Trigger (Upgrade Ver.)** on dual-screen Android
-handhelds like the Ayn Thor: the real game runs full-widescreen on the top screen,
-and a companion display (map / party status / inventory, DS-style) runs on the
-bottom screen.
+[![Build](https://github.com/kalenjohnson/chrono-duo/actions/workflows/build.yml/badge.svg)](https://github.com/kalenjohnson/chrono-duo/actions/workflows/build.yml)
+[![Latest APK](https://img.shields.io/github/v/release/kalenjohnson/chrono-duo?include_prereleases&label=download)](https://github.com/kalenjohnson/chrono-duo/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-ChronoDuo ships **no game code or assets**. It requires the official
-[CHRONO TRIGGER (Upgrade Ver.)](https://play.google.com/store/apps/details?id=com.square_enix.android_googleplay.chrono)
-app (arm64 build, v2.1.5+) installed on the same device. The DS ROM is optional —
-import it from the settings page to enable indoor area maps on the companion screen.
-At startup ChronoDuo locates the game install, extracts its `libchrono.so`/`libc++_shared.so`
-into ChronoDuo's private storage, points the engine's asset loading at the game's own
-APK, and boots the engine inside ChronoDuo's process — where we control the second
-screen via Android's standard `Presentation` API.
+A dual-screen host for **Chrono Trigger (Upgrade Ver.)** on dual-screen Android
+handhelds such as the Ayn Thor. The real game runs full-widescreen on the top
+screen while the bottom screen becomes a DS-style companion display: a live
+world map, party status, inventory, and the whole battle command menu.
 
-## Status (2026-09-04)
+ChronoDuo ships **no game code or assets**. It loads the official Chrono
+Trigger Android app you already own, inside its own process, and drives the
+second screen through Android's standard `Presentation` API.
 
-- [x] Game boots and plays full-widescreen inside ChronoDuo (Ayn Thor Lite)
-- [x] DS-style second screen: real portraits in the game's own window chrome,
-      sepia-toned overworld map (torn-paper parchment) with a live position
-      marker, live location name, gold and play time
-- [x] All 8 overworld maps rendered on device, at first launch, straight from
-      the game's own map/chip data (no screenshot capture, no ROM needed) --
-      see "World maps" below
-- [x] Live overworld map: re-composited from the game's own live map data, so
-      story changes (bridges, craters) appear on the companion screen and
-      persist across launches
-- [x] Live battle mode: real-time party HP, named enemy bars (honoring the
-      game's hidden-info flags by default, eye-toggle to reveal), fades and
-      results window on the bottom screen
-- [x] Full battle mirroring: command menu (Attack/Tech/Item) + Tech/Item lists
-      on the bottom screen, top screen HUD-free
-- [x] DS-style room maps: indoor area floor plans with live position marker
-      when the user imports their own Chrono Trigger DS ROM from the settings
-      page (.nds or .zip; nothing from the ROM is shipped)
-- [x] Original pixel art: a settings toggle restores the unfiltered SNES-style
-      character sprites **and field chip sheets**, both rebuilt on-device from
-      art the game itself ships (no ROM needed) -- the field chips come back
-      from the port's own 1x 4bpp tile banks, so tree roots, chests and
-      animated tiles lose their baked-in 2x smoothing
-- [ ] Someday: ATB gauges, optional cheats via the game's own ExperiencePlus
+## Requirements
 
-## Build
+- A dual-screen Android device (developed on the Ayn Thor Lite). Any device
+  that exposes a second display to `Presentation` should work.
+- Android 8.0+ with an arm64 CPU.
+- The official [CHRONO TRIGGER (Upgrade Ver.)](https://play.google.com/store/apps/details?id=com.square_enix.android_googleplay.chrono)
+  from Google Play, version 2.1.5 or newer, installed on the same device.
+- Optional: your own Chrono Trigger DS ROM (`.nds` or `.zip`) to enable indoor
+  area maps. Nothing from the ROM is shipped or uploaded; it is decoded on
+  your device.
 
-Requires an Android SDK (see `local.properties`) and a JDK Gradle supports
-(`gradle.properties` pins `org.gradle.java.home`).
+## Install
+
+1. Install Chrono Trigger from Google Play and launch it once.
+2. Download `ChronoDuo-<version>.apk` from the
+   [Releases page](https://github.com/kalenjohnson/chrono-duo/releases) and
+   install it (allow installs from unknown sources, or `adb install`).
+3. Launch **ChronoDuo** instead of Chrono Trigger. The game boots on the top
+   screen and the companion display appears on the bottom.
+
+Every push to `main` publishes a **Latest build** pre-release; tagged
+versions get their own release. Each build has a higher version code than
+the last, so newer APKs install over older ones.
+
+## What the bottom screen does
+
+- **Overworld map** in a sepia, torn-parchment style with a live position
+  marker, the current location name, gold, and play time. All eight era maps
+  are rendered on first launch from the game's own map data, and story
+  changes such as bridges and craters show up as they happen.
+- **Party status** with real portraits in the game's own window chrome and
+  live HP and MP.
+- **Battle mirroring**: the Attack/Tech/Item menu and the Tech and Item
+  lists move to the bottom screen, driven by the d-pad, so the top screen
+  stays HUD-free. Enemy HP bars honor the game's hidden-info design by
+  default, with an eye toggle to reveal them.
+- **Indoor area maps** with a live marker once you import your DS ROM.
+- **Original pixel art**: a settings toggle rebuilds the unfiltered SNES-style
+  character sprites, field chip sheets, and overworld tiles from the 1x art
+  the game itself ships.
+
+### Settings
+
+Tap the gear in the top-left corner of the bottom screen (outside battle) to
+open settings. From
+there you can import a DS ROM through the system file picker, build the
+original pixel-art sheets, and see how many world maps have been rendered.
+
+## Build from source
+
+You need an Android SDK with NDK and CMake 3.22+, and a JDK 17 through 21.
 
 ```
 ./gradlew assembleDebug
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## World maps
+`gradle.properties` pins `org.gradle.java.home` to a local JDK 21 path.
+Adjust it, or override on the command line:
 
-On first launch, ChronoDuo renders all 8 overworld maps (1000 AD, 600 AD,
-2300 AD, 65,000,000 BC, and the three 12,000 BC states) straight from the
-game's own map and chip-sheet data pulled out of its `resources.bin` -- the
-same compositing the game itself does when it draws the overworld, ported to
-Java (`WorldMapCompositor`/`WorldMapRenderer`). No screenshot, no map-screen
-visit, no ROM required. See `tools/world_map/REPORT.md` for the on-disk
-format and `NOTES.md` for the summary.
+```
+./gradlew -Dorg.gradle.java.home=/path/to/jdk21 assembleDebug
+```
 
-## Original pixel art
+### Continuous builds and releases
 
-With "Pixel graphics" on, ChronoDuo rebuilds the game's blurry 2x art from the
-original 1x SNES data it still ships, and serves the result in place of the
-shipped assets. One Build action covers three passes: the ~629 character
-sheets, the ~252 field chip-sheet pairs, and the overworld (7 `worldchip`
-sheet pairs plus the 14 `Game/world/gif` object/backdrop sheets). The
-overworld party sprite sheet (`worldChara.png`) and the Epoch sprite
-(`silbird.png`) are further documented exceptions, alongside the 10
-`worldchipScr3_*` weather textures: no 1x original ships for any of them —
-measured, not assumed. Format evidence and per-sheet verification live in
-`tools/field_art/REPORT.md` and `tools/world_art/REPORT.md`.
+`.github/workflows/build.yml` builds a release APK on every push and pull
+request. Pushes to `main` refresh the rolling `latest` pre-release; pushing
+a tag such as `v0.2` creates a versioned release with generated notes.
+
+```
+git tag v0.2 && git push origin v0.2
+```
+
+Without a signing keystore the APK is signed with a throwaway debug key, and
+Android will refuse to install a build signed with a different key over an
+existing one. To sign consistently, create a keystore once and add it to the
+repository secrets:
+
+```
+keytool -genkeypair -keystore release.jks -storetype PKCS12 -alias chronoduo \
+  -keyalg RSA -keysize 4096 -validity 10000
+
+gh secret set KEYSTORE_BASE64 < <(base64 -w0 release.jks)
+gh secret set KEYSTORE_PASSWORD
+gh secret set KEY_ALIAS --body chronoduo
+gh secret set KEY_PASSWORD
+```
+
+Keep `release.jks` backed up. Locally, the same signing is picked up from the
+environment variables `CHRONODUO_KEYSTORE`, `CHRONODUO_KEYSTORE_PASSWORD`,
+`CHRONODUO_KEY_ALIAS`, and `CHRONODUO_KEY_PASSWORD`.
 
 ## How it works
 
-See `NOTES.md` for the research and design record.
+At startup ChronoDuo locates the game install, extracts its `libchrono.so`
+and `libc++_shared.so` into private storage, points the engine's asset
+loading at the game's own APK, and boots the engine inside ChronoDuo's
+process. A small native helper reads the live game state (party, map
+position, battle) and the Java side draws the companion screen.
+
+`NOTES.md` is the full research and design record: the memory layout, the
+battle UI work, the DS map decoder, and the on-device art rebuilds. The
+`tools/` directory holds the Python and Java verification scripts and their
+reports.
 
 ## License
 
-ChronoDuo is released under the [MIT License](LICENSE). See
-`THIRD_PARTY_NOTICES.md` for bundled third-party code.
+ChronoDuo is released under the [MIT License](LICENSE).
+`THIRD_PARTY_NOTICES.md` covers bundled third-party code: the vendored
+`org.cocos2dx.lib` Java classes from cocos2d-x 3.14.1 (MIT) and
+android-async-http (Apache 2.0).
 
-The vendored `org.cocos2dx.lib` Java classes are from cocos2d-x 3.14.1
-(MIT). No Square Enix assets or code are included: the app loads the
-official Chrono Trigger Android game you have installed, and the optional
-indoor maps are decoded on your device from your own Chrono Trigger DS ROM.
+Chrono Trigger is the property of Square Enix. No Square Enix assets or code
+are included. The app loads the official Android game you have installed,
+and the optional indoor maps are decoded on your device from your own DS ROM.
