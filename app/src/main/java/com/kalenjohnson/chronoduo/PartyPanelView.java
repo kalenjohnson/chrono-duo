@@ -289,12 +289,43 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         settingsHost = host;
     }
 
-    // Small "gear" chip, top-left corner, mirroring the eye toggle's
-    // top-right placement/hit-box style (see drawEyeToggle) -- shown in
-    // field/overworld modes (never battle; the eye toggle owns that corner
-    // there, and mid-battle isn't a sane time to open settings). Tapping it
-    // enters settingsMode.
+    // Settings "gear" chip, top-left corner: a small CT menu window (the
+    // game's own window texture via drawNinePatch, same chrome as the battle
+    // command buttons) holding a hand-drawn 17x17 pixel-art gear sprite,
+    // upscaled nearest-neighbor at an integer factor so it reads as game
+    // pixels rather than a vector icon. Shown in field/overworld modes and on
+    // the pre-load wordmark screen (never battle; the eye toggle owns that
+    // corner there, and mid-battle isn't a sane time to open settings).
+    // Tapping it enters settingsMode. See drawGearChip.
     private final RectF gearHitBox = new RectF();
+    private static final float GEAR_CHIP_SIZE = 96f;   // window chip side, px
+    private static final float GEAR_HIT_PAD = 10f;     // extra tap slop around the chip
+    // Gear sprite, '.' = transparent, 'B' = body. Shading (lit top-left
+    // edge, shaded bottom-right edge) and a 1px navy drop shadow are derived
+    // from this mask when the bitmap is first built -- see buildGearSprite.
+    private static final String[] GEAR_SPRITE = {
+            ".......BBB.......",
+            ".......BBB.......",
+            "..BB...BBB...BB..",
+            "..BBB..BBB..BBB..",
+            "...BBBBBBBBBBB...",
+            "....BBBBBBBBB....",
+            "....BBB...BBB....",
+            "BBBBBB.....BBBBBB",
+            "BBBBBB.....BBBBBB",
+            "BBBBBB.....BBBBBB",
+            "....BBB...BBB....",
+            "....BBBBBBBBB....",
+            "...BBBBBBBBBBB...",
+            "..BBB..BBB..BBB..",
+            "..BB...BBB...BB..",
+            ".......BBB.......",
+            ".......BBB.......",
+    };
+    private static final int GEAR_LIT = Color.rgb(255, 255, 255);
+    private static final int GEAR_BODY = Color.rgb(226, 230, 244);
+    private static final int GEAR_SHADE = Color.rgb(140, 150, 200);
+    private Bitmap gearSprite; // built lazily, 18x18 (17 + 1px drop shadow)
     private boolean settingsMode;
     // Settings is paginated (see SETTINGS_PAGES / drawSettingsScreen);
     // settingsPage is the 0-based page in view, kept across open/close so
@@ -616,6 +647,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // marker tile: same nearest-neighbor upscale as the map, but kept fully
     // opaque (unlike mapPaint) so it stays crisp on top of the sepia map
     private final Paint markerPaint = new Paint();
+    // nearest-neighbor, opaque: the settings gear sprite (see drawGearChip)
+    private final Paint spritePaint = new Paint();
     // Scratch paints for the area-map crossfade: copied from mapPaint/
     // markerPaint each frame (via Paint.set) and given a fade-specific
     // alpha, so the shared mapPaint/markerPaint alpha is never mutated
@@ -650,6 +683,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         mapPaint.setAlpha(225);
         markerPaint.setFilterBitmap(false);
         markerPaint.setDither(false);
+        spritePaint.setFilterBitmap(false);
+        spritePaint.setDither(false);
         SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         honorHiddenHp = !MODE_FULL.equals(prefs.getString(KEY_ENEMY_HP_MODE, MODE_HONOR));
         pixelGraphicsOn = GameState.getPixelGraphicsPref(context);
@@ -2296,45 +2331,96 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     }
 
     /**
-     * Small "gear" toggle glyph (ring + teeth + center dot, INK color) in the
-     * parchment's top-left corner -- same size/hit-box style as {@link
-     * #drawEyeToggle}'s top-right eye, drawn only outside battle (see {@link
-     * #onDraw}). Tapping within its hit box (see {@link #onTouchEvent})
-     * enters {@link #settingsMode}. Updates {@link #gearHitBox} every call so
-     * the hit-test always matches the glyph's current on-screen position.
+     * Settings gear chip in the parchment's top-left corner, inset just
+     * inside the aged-paper overlay's ink frame line (see {@link
+     * #drawParchmentOverlay}). Drawn only outside battle (see {@link
+     * #onDraw}); tapping it (see {@link #onTouchEvent}) enters {@link
+     * #settingsMode}.
      */
-    private void drawGearToggle(Canvas c, RectF parchment) {
-        // Drawn ~2.4x the eye glyph's size and inset well inside the ink
-        // frame: at the eye's size it read as a speck on the frame line.
-        float r = EYE_GLYPH_RADIUS * 2.4f;
-        drawGearToggle(c, parchment.left + r + 30f, parchment.top + r + 30f, r, INK);
+    private void drawGearChip(Canvas c, RectF parchment) {
+        drawGearChip(c, parchment.left + 24f, parchment.top + 24f);
     }
 
     /**
-     * Gear glyph centered on ({@code cx}, {@code cy}) with outer radius
-     * {@code r} in {@code color}; sets {@link #gearHitBox} around it. Shared
-     * by the parchment corner (above) and the pre-load wordmark screen
-     * ({@link #drawWordmark}, white on black).
+     * CT-style menu window chip ({@link #GEAR_CHIP_SIZE} square, top-left
+     * corner at ({@code left}, {@code top})) holding the pixel-art gear
+     * sprite, centered and upscaled by the largest integer factor that fits
+     * inside the window border. Uses the game's own window texture when
+     * loaded ({@link ChronoAssets#getWindowTex}), else the same navy
+     * double-border fallback as {@link #drawCommandButton}, so the chip
+     * matches the battle command buttons exactly. Sets {@link #gearHitBox}
+     * to the chip plus {@link #GEAR_HIT_PAD} slop. Shared by the parchment
+     * corner (above) and the pre-load wordmark screen ({@link #drawWordmark}).
      */
-    private void drawGearToggle(Canvas c, float cx, float cy, float r, int color) {
-        float half = Math.max(EYE_HIT_HALF, r * 1.6f);
-        gearHitBox.set(cx - half, cy - half, cx + half, cy + half);
+    private void drawGearChip(Canvas c, float left, float top) {
+        RectF box = new RectF(left, top, left + GEAR_CHIP_SIZE, top + GEAR_CHIP_SIZE);
+        gearHitBox.set(box);
+        gearHitBox.inset(-GEAR_HIT_PAD, -GEAR_HIT_PAD);
 
-        int inkA = Color.argb(230, Color.red(color), Color.green(color), Color.blue(color));
-        stroke.setStrokeWidth(3.5f);
-        stroke.setColor(inkA);
-        c.drawCircle(cx, cy, r * 0.7f, stroke);
-        for (int i = 0; i < 8; i++) {
-            double ang = Math.toRadians(i * 45);
-            float x0 = (float) (cx + Math.cos(ang) * r * 0.72f);
-            float y0 = (float) (cy + Math.sin(ang) * r * 0.72f);
-            float x1 = (float) (cx + Math.cos(ang) * r * 1.15f);
-            float y1 = (float) (cy + Math.sin(ang) * r * 1.15f);
-            c.drawLine(x0, y0, x1, y1, stroke);
+        Bitmap winTex = ChronoAssets.getWindowTex();
+        float destInset = GEAR_CHIP_SIZE * 0.16f;
+        if (winTex != null) {
+            drawNinePatch(c, winTex, ChronoAssets.getWindowTexInset(), box, destInset);
+        } else {
+            fill.setShader(null);
+            fill.setColor(BOX_BORDER_OUT);
+            c.drawRect(box, fill);
+            RectF inner = new RectF(box);
+            inner.inset(3, 3);
+            fill.setColor(BOX_BORDER_IN);
+            c.drawRect(inner, fill);
+            inner.inset(2, 2);
+            fill.setColor(BOX_BG);
+            c.drawRect(inner, fill);
         }
-        fill.setShader(null);
-        fill.setColor(inkA);
-        c.drawCircle(cx, cy, r * 0.3f, fill);
+
+        Bitmap sprite = gearSprite();
+        int cells = GEAR_SPRITE.length; // the 1px shadow column/row hangs off the sprite's own grid
+        int scale = Math.max(1, (int) Math.floor((GEAR_CHIP_SIZE - 2f * destInset - 4f) / cells));
+        // snap to whole device pixels so every sprite pixel lands on an exact
+        // scale x scale block -- a fractional origin would smear the edges
+        float sx = Math.round(box.centerX() - cells * scale / 2f);
+        float sy = Math.round(box.centerY() - cells * scale / 2f);
+        RectF dst = new RectF(sx, sy, sx + sprite.getWidth() * scale, sy + sprite.getHeight() * scale);
+        c.drawBitmap(sprite, null, dst, spritePaint);
+    }
+
+    /**
+     * Returns (building on first use) the gear sprite bitmap from {@link
+     * #GEAR_SPRITE}: body pixels in {@link #GEAR_BODY}, edge pixels whose
+     * top or left neighbour is empty lit to {@link #GEAR_LIT}, edge pixels
+     * whose bottom or right neighbour is empty shaded to {@link
+     * #GEAR_SHADE} (pixels that are both stay body), plus a 1px {@link
+     * #BOX_BG_DARK} drop shadow offset (+1, +1) -- hence the bitmap is one
+     * pixel larger than the mask in each direction.
+     */
+    private Bitmap gearSprite() {
+        if (gearSprite != null) return gearSprite;
+        int n = GEAR_SPRITE.length;
+        Bitmap bmp = Bitmap.createBitmap(n + 1, n + 1, Bitmap.Config.ARGB_8888);
+        for (int y = 0; y < n; y++) {
+            for (int x = 0; x < n; x++) {
+                if (gearOn(x, y)) bmp.setPixel(x + 1, y + 1, BOX_BG_DARK);
+            }
+        }
+        for (int y = 0; y < n; y++) {
+            for (int x = 0; x < n; x++) {
+                if (!gearOn(x, y)) continue;
+                boolean lit = !gearOn(x, y - 1) || !gearOn(x - 1, y);
+                boolean dark = !gearOn(x, y + 1) || !gearOn(x + 1, y);
+                int color = lit && !dark ? GEAR_LIT : (dark && !lit ? GEAR_SHADE : GEAR_BODY);
+                bmp.setPixel(x, y, color);
+            }
+        }
+        gearSprite = bmp;
+        return bmp;
+    }
+
+    /** True when ({@code x}, {@code y}) is a body pixel of {@link #GEAR_SPRITE}; out-of-range coordinates are empty. */
+    private static boolean gearOn(int x, int y) {
+        if (y < 0 || y >= GEAR_SPRITE.length) return false;
+        String row = GEAR_SPRITE[y];
+        return x >= 0 && x < row.length() && row.charAt(x) == 'B';
     }
 
     /** Counts {@code area_minimap_*.png} files under {@code <filesDir>/ds_maps} for the settings screen's status row -- see {@link #drawSettingsScreen}. */
@@ -2785,10 +2871,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         setText(h * 0.09f, Color.WHITE, true, Paint.Align.CENTER, true);
         applyTypeface(Typeface.create(Typeface.DEFAULT_BOLD, Typeface.BOLD));
         c.drawText("CHRONO DUO", w / 2f, h / 2f + h * 0.03f, text);
-        // Settings are reachable before a save is loaded: the same gear as
-        // the parchment corner, white, top-left of the black screen.
-        float r = EYE_GLYPH_RADIUS * 2.4f;
-        drawGearToggle(c, r + w * 0.05f, r + h * 0.06f, r, Color.WHITE);
+        // Settings are reachable before a save is loaded: the same gear chip
+        // as the parchment corner, top-left of the black screen.
+        drawGearChip(c, w * 0.05f, h * 0.06f);
     }
 
     /** Dispatches to whichever parchment content (battle vs map vs field-title) {@code s} calls for. */
@@ -3289,7 +3374,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             targetCount = 0;
             listVisibleCount = 0;
             listBackHitBox.setEmpty();
-            drawGearToggle(c, parchment);
+            drawGearChip(c, parchment);
         }
         // targeting mode has its own wall-clock timeout (see
         // isTargetingActive) that isn't tied to a snapshot change, so the
