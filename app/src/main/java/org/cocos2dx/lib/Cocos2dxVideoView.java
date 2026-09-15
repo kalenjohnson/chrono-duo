@@ -296,7 +296,12 @@ public class Cocos2dxVideoView extends SurfaceView implements MediaPlayerControl
             mCurrentBufferPercentage = 0;
             if (mIsAssetRouse) {
                 AssetFileDescriptor afd = mCocos2dxActivity.getAssets().openFd(mVideoFilePath);
-                mMediaPlayer.setDataSource(afd.getFileDescriptor(),afd.getStartOffset(),afd.getLength());
+                if (mVideoFilePath.endsWith(".dat")) {
+                    // Chrono Trigger's FMVs are XOR-obfuscated MP4s; decode on the fly.
+                    mMediaPlayer.setDataSource(new Cocos2dxObfuscatedDataSource(afd));
+                } else {
+                    mMediaPlayer.setDataSource(afd.getFileDescriptor(),afd.getStartOffset(),afd.getLength());
+                }
             } else {
                 mMediaPlayer.setDataSource(mCocos2dxActivity, mVideoUri);
             }

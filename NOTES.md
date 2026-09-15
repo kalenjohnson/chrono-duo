@@ -78,9 +78,16 @@ catalogued in ct_nx `source/jni_fake.c` — our vendored real classes cover it.
   `onWindowFocusChanged(true)`, so the game sits alive-but-black until a TAP
   (`input tap 960 540`) focuses it — injected key events don't.
 - KEYCODE_BACK at the title = the game's quit path (clean exit, no crash log).
-- The intro/attract FMV fails in our host ("Can't play this video" —
-  Cocos2dxVideoHelper/VideoView vs the game's .dat assets; on the fix list).
-  It's dismissible; the game continues.
+- ~~The intro/attract FMV fails in our host ("Can't play this video")~~ — FIXED
+  2026-09-15. The FMVs (`001.dat`..`008.dat`, `007-en.dat`; 5–32 MB, stored
+  uncompressed in `split_assetPack.apk`) are H.264/AAC MP4s XOR-obfuscated with
+  `out[i] = in[i] ^ (0xFF - (i & 0xFF))` (per ct_nx `movie_player.c`), so
+  MediaPlayer rejected them (`error (1, -2147483648)`). `Cocos2dxVideoView` now
+  feeds `.dat` assets through `Cocos2dxObfuscatedDataSource` (a `MediaDataSource`
+  doing positional reads + XOR on the fly; no disk copy, seekable).
+  Event codes: `VideoPlayer::onPlayEvent` is stock cocos2d-x (0..3 = playing/
+  paused/stopped/completed → listener; 1000 = quit-fullscreen from the BACK key).
+  ct_nx's "1000 = COMPLETED" comment is wrong for our purposes — stock Java is right.
 - A backgrounded lime3DS emulator can hold its own Presentation on display 4
   and fight ours for the panel.
 
@@ -99,7 +106,7 @@ catalogued in ct_nx `source/jni_fake.c` — our vendored real classes cover it.
   our own UI must never rely on activity assets (it doesn't — views are built
   programmatically).
 - FMV playback goes through `Cocos2dxVideoHelper`/`VideoView` reading
-  `001.dat`-style assets from the game AssetManager — verify when reached.
+  `001.dat`-style assets from the game AssetManager — see the FMV fix note above.
 - Saves land in **our** app's dirs (`getFilesDir`/`getExternalFilesDir`), not the
   official app's — existing saves won't carry over (official app's data is
   private). Cloud save in-game may help if it works.
