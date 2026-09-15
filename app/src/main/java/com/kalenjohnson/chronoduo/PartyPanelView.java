@@ -14,6 +14,7 @@ import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 
 import java.io.File;
 import java.util.HashMap;
@@ -51,9 +52,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // ChronoAssets.getFace() currently returns.
     private static final int FACE_TILE_W = 96;
     private static final int FACE_TILE_H = 88;
-    private static final int FACE_COLS = 4;
     private static final int FACE_SHEET_W = FACE_TILE_W * 4;
     private static final int FACE_SHEET_H = FACE_TILE_H * 2;
+    private static final int FACE_COLS = 4;
 
     private PartySnapshot snap = new PartySnapshot();
 
@@ -135,7 +136,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // the indoor/area-map panel, for lining up rendered area_minimap_%03d.png
     // files with live ids while building out the ds_maps/ set. Never shown
     // once that set is complete -- flip off then.
-    private static final boolean SHOW_MAP_ID = true; // debug aid: map id after the location name
+    private static final boolean SHOW_MAP_ID = false; // debug aid: map id after the location name
     // Dev calibration readout: appends the live field-tile position (one
     // decimal place) to the field-mode location title, so a player can
     // report on-screen positions to calibrate AreaMapCalib's per-map
@@ -351,6 +352,14 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // change independently of an import (a toggle rescans too).
     private boolean modsImporting;
     private String modsError;
+    // Neutral (non-error) one-line status, e.g. "Imported 2 mods (1
+    // enabled)" -- drawn in the normal body color with no prefix, unlike
+    // modsError's red "error: " styling. Mirrors saveImportMessage/
+    // saveImportError's message+flag split above. Cleared whenever a new
+    // import/get starts (see setModsStatus) so a stale success line can't
+    // linger under a "working..." row and then reappear after the next
+    // attempt fails.
+    private String modsMessage;
     private java.util.List<com.kalenjohnson.chronoduo.mods.ModManager.ModInfo> modsList =
             java.util.Collections.emptyList();
     // Curated catalog (see com.kalenjohnson.chronoduo.mods.ModCatalog), pushed
@@ -361,15 +370,17 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             java.util.Collections.emptyList();
     private final RectF modImportButtonHitBox = new RectF();
     // One row per catalog entry (in catalog order) plus any installed mod not
-    // in the catalog -- see buildModRows(). Capped at MAX_MOD_ROWS and a
-    // "+N more…" indicator if the page runs out of vertical space first (see
-    // drawSettingsScreen's Mods case); one hit box per drawn row, cleared/
-    // rebuilt every pass alongside the parallel per-row arrays below (only
-    // the first modRowCount entries of each are valid on a given frame). A
-    // row is either a not-yet-installed catalog entry (modRowCatalogId set,
-    // tapping it calls requestModGet) or an installed mod's On/Off toggle
-    // (modRowDirName set instead, tapping it calls onModToggled) -- never
-    // both.
+    // in the catalog -- see buildModRows(). Capped at MAX_MOD_ROWS; rows that
+    // don't fit the viewport are reachable by scrolling the list (see
+    // modScrollY below) rather than by a dead "+N more..." label. One hit
+    // box per drawn row, cleared/rebuilt every pass alongside the parallel
+    // per-row arrays below (only the first modRowCount entries of each are
+    // valid on a given frame; a row scrolled fully or partially out of the
+    // viewport gets an empty hit box even though its array slot is valid --
+    // see drawSettingsScreen's Mods case). A row is either a not-yet-
+    // installed catalog entry (modRowCatalogId set, tapping it calls
+    // requestModGet) or an installed mod's On/Off toggle (modRowDirName set
+    // instead, tapping it calls onModToggled) -- never both.
     private static final int MAX_MOD_ROWS = 10;
     private final RectF[] modRowHitBoxes = new RectF[MAX_MOD_ROWS];
     private final String[] modRowDirName = new String[MAX_MOD_ROWS];
@@ -380,9 +391,55 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         for (int i = 0; i < MAX_MOD_ROWS; i++) modRowHitBoxes[i] = new RectF();
     }
 
-    /** Pushes mod import progress/result to the settings screen; called from AppActivity on the main thread. Mirrors {@link #setSaveImportStatus}: {@code importing} true means a background import is in flight; false with a non-null {@code error} means the last attempt failed; false with null means idle/success (the mod list itself, via {@link #setModsList}, is what shows a successful import). */
-    public void setModsStatus(boolean importing, String error) {
+    // --- Mods list scrolling ------------------------------------------------
+    // The row list is the only part of the Mods page that scrolls (heading,
+    // Import button, status line and restart note stay fixed -- see
+    // drawSettingsScreen). modScrollY is the vertical offset in px, clamped
+    // every draw to [0, modContentHeight - modViewportHeight] since either
+    // can change frame to frame (catalog/list push, row count change) without
+    // any touch event to clamp it first. modListViewport/modContentHeight/
+    // modViewportHeight are recomputed every draw pass (page 3 only; left
+    // empty/zero on other pages so the touch handler below can't act on
+    // stale geometry from the last time Mods was shown) and read back by
+    // onTouchEvent for drag clamping and the chevron page-up/down amount.
+    private float modScrollY;
+    private final RectF modListViewport = new RectF();
+    private float modContentHeight;
+    private float modViewportHeight;
+    // Drag state for the list-scroll gesture -- see onTouchEvent. Armed on an
+    // ACTION_DOWN inside modListViewport; modDragging flips true only once
+    // the finger has moved past the touch slop, at which point the gesture
+    // is committed to scrolling (never a tap) for the rest of its life, even
+    // if the finger returns near the down point.
+    private boolean modListTouchActive;
+    private boolean modDragging;
+    private float modTouchDownX, modTouchDownY;
+    private float modScrollAtDown;
+    // Chevron hit boxes (page up/down by one viewport height) and the
+    // scrollbar thumb rect -- all recomputed every draw pass, non-empty only
+    // when the corresponding direction/overflow actually applies.
+    private final RectF modScrollUpHitBox = new RectF();
+    private final RectF modScrollDownHitBox = new RectF();
+    private final RectF modScrollbarThumb = new RectF();
+
+    /**
+     * Pushes mod import progress/result to the settings screen; called from
+     * AppActivity on the main thread. Mirrors {@link #setSaveImportStatus}'s
+     * message+error split: {@code importing} true means a background
+     * import/get is in flight (and clears any previous {@code message}, so a
+     * stale success line can't sit under "working..." and then resurface
+     * under a later failure); false with a non-null {@code error} means the
+     * last attempt failed (shown red, "error: " prefixed); false with a
+     * non-null {@code message} and null {@code error} means it succeeded and
+     * has something worth saying (e.g. "Imported 2 mods (1 enabled)" --
+     * shown in the normal body color, no prefix; the mod list itself, via
+     * {@link #setModsList}, already shows a plain single-mod success, so
+     * {@code message} is typically null for that common case); both null
+     * means idle with nothing to report.
+     */
+    public void setModsStatus(boolean importing, String message, String error) {
         this.modsImporting = importing;
+        this.modsMessage = importing ? null : message;
         this.modsError = error;
         invalidate();
     }
@@ -622,8 +679,75 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      */
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        if (event.getAction() != MotionEvent.ACTION_DOWN) return false;
+        int action = event.getActionMasked();
+        boolean modsPageActive = settingsMode
+                && Math.floorMod(settingsPage, SETTINGS_PAGES.length) == 3;
+
+        // Mods list drag-to-scroll: a small state machine ahead of the
+        // generic "DOWN-only" dispatch below since it needs MOVE and UP too.
+        // ACTION_DOWN inside the list viewport arms it (recording the start
+        // point/scroll offset) without yet deciding drag vs. tap. On MOVE,
+        // once the finger has passed the touch slop the gesture commits to
+        // dragging (modScrollY tracks the finger for the rest of the
+        // gesture, clamped to content bounds) and is never treated as a tap.
+        // On UP, a drag that never passed the slop falls through to the
+        // ordinary tap dispatch below using the UP event's own coordinates
+        // (down and up are close together for a real tap, so this is
+        // equivalent to dispatching on DOWN); an actual drag or a CANCEL
+        // just ends the gesture and consumes the event.
+        if (modsPageActive && action == MotionEvent.ACTION_DOWN
+                && !modListViewport.isEmpty() && modListViewport.contains(event.getX(), event.getY())) {
+            modListTouchActive = true;
+            modDragging = false;
+            modTouchDownX = event.getX();
+            modTouchDownY = event.getY();
+            modScrollAtDown = modScrollY;
+            return true;
+        }
+        if (modsPageActive && modListTouchActive && action == MotionEvent.ACTION_MOVE) {
+            float dx = event.getX() - modTouchDownX;
+            float dy = event.getY() - modTouchDownY;
+            if (!modDragging) {
+                int slop = ViewConfiguration.get(getContext()).getScaledTouchSlop();
+                if (Math.abs(dy) > slop || Math.abs(dx) > slop) modDragging = true;
+            }
+            if (modDragging) {
+                float maxScroll = Math.max(0f, modContentHeight - modViewportHeight);
+                modScrollY = Math.max(0f, Math.min(maxScroll, modScrollAtDown - dy));
+                invalidate();
+            }
+            return true;
+        }
+        if (modsPageActive && modListTouchActive
+                && (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL)) {
+            modListTouchActive = false;
+            boolean wasDragging = modDragging;
+            modDragging = false;
+            if (wasDragging || action == MotionEvent.ACTION_CANCEL) {
+                return true; // a real drag (or a cancelled gesture) is never a tap
+            }
+            // Not a drag: fall through to the ordinary tap dispatch below,
+            // using this UP event's coordinates.
+        } else if (action != MotionEvent.ACTION_DOWN) {
+            return false;
+        }
         if (settingsMode) {
+            if (!modsPageActive) {
+                // stale drag state from a page we've since left/re-entered
+                modListTouchActive = false;
+                modDragging = false;
+            }
+            if (!modScrollUpHitBox.isEmpty() && modScrollUpHitBox.contains(event.getX(), event.getY())) {
+                modScrollY = Math.max(0f, modScrollY - modViewportHeight);
+                invalidate();
+                return true;
+            }
+            if (!modScrollDownHitBox.isEmpty() && modScrollDownHitBox.contains(event.getX(), event.getY())) {
+                float maxScroll = Math.max(0f, modContentHeight - modViewportHeight);
+                modScrollY = Math.min(maxScroll, modScrollY + modViewportHeight);
+                invalidate();
+                return true;
+            }
             if (!importing && !importButtonHitBox.isEmpty()
                     && importButtonHitBox.contains(event.getX(), event.getY())) {
                 if (settingsHost != null) settingsHost.requestRomImport();
@@ -681,18 +805,21 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             }
             if (!settingsPrevHitBox.isEmpty()
                     && settingsPrevHitBox.contains(event.getX(), event.getY())) {
+                if (modsPageActive) modScrollY = 0f; // leaving the Mods page
                 settingsPage = (settingsPage + SETTINGS_PAGES.length - 1) % SETTINGS_PAGES.length;
                 invalidate();
                 return true;
             }
             if (!settingsNextHitBox.isEmpty()
                     && settingsNextHitBox.contains(event.getX(), event.getY())) {
+                if (modsPageActive) modScrollY = 0f; // leaving the Mods page
                 settingsPage = (settingsPage + 1) % SETTINGS_PAGES.length;
                 invalidate();
                 return true;
             }
             if (!settingsBackHitBox.isEmpty()
                     && settingsBackHitBox.contains(event.getX(), event.getY())) {
+                if (modsPageActive) modScrollY = 0f; // leaving the Mods page
                 settingsMode = false;
                 invalidate();
                 return true;
@@ -1011,6 +1138,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             // while settings happens to be open (e.g. an ambush), get out of
             // the way rather than block the battle UI on the bottom screen.
             settingsMode = false;
+            modScrollY = 0f;
         }
         boolean hadContent = !snap.members.isEmpty();
         ContentMode oldMode = modeOf(snap);
@@ -1205,11 +1333,46 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private void setText(float size, int color, boolean bold, Paint.Align align, boolean shadow) {
         text.setTextSize(size);
         text.setColor(color);
-        text.setTypeface(bold ? Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        applyTypeface(bold ? Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
                 : Typeface.MONOSPACE);
         text.setTextAlign(align);
         if (shadow) text.setShadowLayer(2.5f, 1.5f, 1.5f, Color.argb(200, 0, 0, 0));
         else text.clearShadowLayer();
+    }
+
+    /**
+     * Routes every glyph the panel draws through the active mod font (see
+     * {@link com.kalenjohnson.chronoduo.mods.ModManager#activeTypeface}) when
+     * one is loaded, falling back to {@code fallback} (the typeface a call
+     * site would otherwise have passed straight to {@link Paint#setTypeface})
+     * otherwise. Bold/serif/monospace distinctions are ignored for the mod
+     * font -- ChronoType is a single-weight, fixed-advance pixel font, so it
+     * suits the MONOSPACE-typeface call sites (aligned numbers) as well as
+     * the SERIF/DEFAULT_BOLD ones.
+     *
+     * <p>Must be called after {@link Paint#setTextSize} (via {@link
+     * #setText} or directly) since a bitmap-strike mod font snaps the
+     * already-set size to a multiple of its native ppem -- several call
+     * sites call {@code setText} then this, in that order, for exactly that
+     * reason.
+     */
+    private void applyTypeface(Typeface fallback) {
+        Typeface mod = com.kalenjohnson.chronoduo.mods.ModManager.activeTypeface();
+        if (mod != null) {
+            text.setTypeface(mod);
+            int ppem = com.kalenjohnson.chronoduo.mods.ModManager.activeTypefacePpem();
+            if (ppem > 0) {
+                float size = text.getTextSize();
+                float snapped = Math.max(ppem, Math.round(size / ppem) * ppem);
+                text.setTextSize(snapped);
+            }
+            text.setAntiAlias(false);
+            text.setSubpixelText(false);
+        } else {
+            text.setTypeface(fallback);
+            text.setAntiAlias(true);
+            text.setSubpixelText(true);
+        }
     }
 
     /** DS status box: real window texture (9-sliced) when loaded, else a hand-drawn navy double border; portrait, HP/MP rows on top either way. */
@@ -1330,7 +1493,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             float fs = maxFs;
             while (fs > minFs) {
                 text.setTextSize(fs);
-                text.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
+                applyTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
                 float wgt = Math.max(text.measureText(STATUS_WORST_HP), text.measureText(STATUS_WORST_MP));
                 if (wgt <= avail) break;
                 fs -= h * STATUS_FONT_STEP_FRAC;
@@ -1340,7 +1503,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             // we're out of fallback attempts (last attempt always accepted,
             // clamped to the floor above).
             text.setTextSize(fs);
-            text.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
+            applyTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
             float wgt = Math.max(text.measureText(STATUS_WORST_HP), text.measureText(STATUS_WORST_MP));
             if (wgt <= avail || attempt == 1) {
                 return new StatusFontFit(fs, ps);
@@ -1504,7 +1667,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private void drawBattleContent(Canvas c, RectF parchment, PartySnapshot s, boolean live) {
         int w = getWidth(), h = getHeight();
         setText(h * 0.045f, INK, true, Paint.Align.CENTER, false);
-        text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         c.drawText("Battle", parchment.centerX(), parchment.top + h * 0.085f, text);
 
         int n = s.enemies.size();
@@ -1920,7 +2083,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         if (msg == null || msg.isEmpty() || alpha <= 0f) return;
         int h = getHeight();
         setText(Math.min(band.height() * 0.34f, h * 0.06f), Color.WHITE, true, Paint.Align.CENTER, true);
-        text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         // Fade via a canvas layer so the shadow layer fades with the glyphs
         // (Paint alpha alone left a black shadow ghost during crossfades).
         float a = clamp01(alpha);
@@ -2062,10 +2225,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private void drawEnemyBar(Canvas c, PartySnapshot.Enemy e, int index, float l, float t, float w, float h, float frac) {
         boolean hidden = isHiddenInfo(e);
         setText(h * 0.62f, INK, true, Paint.Align.LEFT, false);
-        text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         c.drawText(enemyLabel(e, index), l, t, text);
         setText(h * 0.62f, INK, false, Paint.Align.RIGHT, false);
-        text.setTypeface(Typeface.MONOSPACE);
+        applyTypeface(Typeface.MONOSPACE);
         c.drawText(hidden ? "???" : (e.curHp + "/" + e.maxHp), l + w, t, text);
 
         float barTop = t + h * 0.28f;
@@ -2245,6 +2408,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         modImportButtonHitBox.setEmpty();
         for (int i = 0; i < MAX_MOD_ROWS; i++) modRowHitBoxes[i].setEmpty();
         modRowCount = 0;
+        modListViewport.setEmpty();
+        modScrollUpHitBox.setEmpty();
+        modScrollDownHitBox.setEmpty();
+        modScrollbarThumb.setEmpty();
+        modContentHeight = 0f;
+        modViewportHeight = 0f;
 
         int page = Math.floorMod(settingsPage, SETTINGS_PAGES.length);
         int inkDim = Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK));
@@ -2256,7 +2425,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         c.clipPath(tornPaper);
 
         setText(h * 0.055f, INK, true, Paint.Align.CENTER, false);
-        text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         c.drawText("Settings", parchment.centerX(), parchment.top + h * 0.09f, text);
         setText(h * 0.024f, inkDim, false, Paint.Align.CENTER, false);
         c.drawText(SETTINGS_PAGES[page] + "  ·  " + (page + 1) + " / " + SETTINGS_PAGES.length,
@@ -2336,58 +2505,132 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 float rowNotesExtra = h * 0.014f;
                 float toggleW = w * 0.15f;
                 float modsBtnH = h * 0.055f;
-                // Reserve room below the list for the status line (reserved
-                // whether or not it's actually shown right now, so the row
-                // count never reflows the instant an import/get starts or
-                // finishes), the Import-file button, the restart note, and
-                // the prev/Back/next nav row (drawn after this switch -- see
-                // navTop just below) -- anything that doesn't fit gets a
-                // "+N more…" line instead of clipping mid-row.
+                // The list viewport is a FIXED rect (listTop..maxY) regardless
+                // of row count, so the status line/Import button/restart note
+                // below it never move -- only the row list inside scrolls
+                // (see modScrollY). navTop/footerReserve size that fixed
+                // reserve exactly as before (status line, Import-file button,
+                // restart note, then the prev/Back/next nav row drawn after
+                // this switch).
+                float listTop = y;
                 float navTop = parchment.bottom - h * 0.09f;
                 float footerReserve = h * 0.03f /* status line */ + modsBtnH
                         + h * 0.02f /* gaps */ + h * 0.022f /* one-line restart note */;
                 float maxY = navTop - h * 0.02f - footerReserve;
+                float viewportH = Math.max(0f, maxY - listTop);
 
-                int shown = 0;
+                int rowCount = Math.min(rows.size(), MAX_MOD_ROWS);
+                float[] rowHeights = new float[rowCount];
+                float contentH = 0f;
+                for (int i = 0; i < rowCount; i++) {
+                    boolean hasNotes = rows.get(i).notes != null && !rows.get(i).notes.isEmpty();
+                    rowHeights[i] = rowBaseH + (hasNotes ? rowNotesExtra : 0f);
+                    contentH += rowHeights[i];
+                }
+                float maxScroll = Math.max(0f, contentH - viewportH);
+                // Clamp here (not only in onTouchEvent) since content height
+                // can change out from under a held offset with no touch event
+                // at all -- a catalog refresh, an import finishing, a toggle
+                // rescan -- see setModsList/setModCatalog.
+                modScrollY = Math.max(0f, Math.min(maxScroll, modScrollY));
+                modContentHeight = contentH;
+                modViewportHeight = viewportH;
+                modListViewport.set(parchment.left, listTop, parchment.right, maxY);
+
                 float rowTextMaxW = textW - toggleW - w * 0.02f;
-                for (; shown < rows.size() && shown < MAX_MOD_ROWS; shown++) {
-                    ModRow row = rows.get(shown);
+                c.save();
+                c.clipRect(modListViewport);
+                float rowY = listTop - modScrollY;
+                for (int i = 0; i < rowCount; i++) {
+                    float rowH = rowHeights[i];
+                    float rowTop = rowY;
+                    float rowBottom = rowY + rowH;
+                    rowY += rowH;
+                    if (rowBottom <= listTop || rowTop >= maxY) continue; // fully scrolled out
+                    ModRow row = rows.get(i);
                     boolean hasNotes = row.notes != null && !row.notes.isEmpty();
-                    float rowH = rowBaseH + (hasNotes ? rowNotesExtra : 0f);
-                    if (y + rowH > maxY) break;
 
                     setText(h * 0.020f, row.installed && !row.enabled ? inkDim : INK, true, Paint.Align.LEFT, false);
-                    text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
-                    c.drawText(ellipsize(row.title, rowTextMaxW), left, y + h * 0.018f, text);
+                    applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+                    c.drawText(ellipsize(row.title, rowTextMaxW), left, rowTop + h * 0.018f, text);
 
                     setText(h * 0.016f, inkDim, false, Paint.Align.LEFT, false);
-                    c.drawText(ellipsize(row.summary, rowTextMaxW), left, y + h * 0.033f, text);
+                    c.drawText(ellipsize(row.summary, rowTextMaxW), left, rowTop + h * 0.033f, text);
 
                     if (hasNotes) {
                         setText(h * 0.013f, inkDim, false, Paint.Align.LEFT, false);
-                        c.drawText(ellipsize(row.notes, rowTextMaxW), left, y + h * 0.045f, text);
+                        c.drawText(ellipsize(row.notes, rowTextMaxW), left, rowTop + h * 0.045f, text);
                     }
 
-                    RectF box = modRowHitBoxes[shown];
-                    float boxH = h * 0.028f;
-                    box.set(parchment.right - w * 0.03f - toggleW, y + h * 0.003f,
-                            parchment.right - w * 0.03f, y + h * 0.003f + boxH);
-                    modRowDirName[shown] = row.dirName;
-                    modRowCatalogId[shown] = row.catalogId;
-                    modRowEnabled[shown] = row.enabled;
                     if (row.suffix != null) {
+                        float boxH = h * 0.028f;
+                        float suffixBoxBottom = rowTop + h * 0.003f + boxH;
                         setText(h * 0.012f, inkDim, false, Paint.Align.CENTER, false);
-                        c.drawText(row.suffix, box.centerX(), box.bottom + h * 0.013f, text);
+                        c.drawText(row.suffix, parchment.right - w * 0.03f - toggleW / 2f,
+                                suffixBoxBottom + h * 0.013f, text);
                     }
-                    y += rowH;
+
+                    // The button texture is drawn here (inside the clip, on
+                    // top of the row text) so it scrolls and clips exactly
+                    // like the row it belongs to. It only gets a live hit
+                    // box when the row is FULLY inside the viewport, though
+                    // -- a partially-clipped row at the top/bottom edge is
+                    // visible but not tappable, so a drag that stops
+                    // mid-scroll can never fire a half-seen button -- and
+                    // never while modsImporting (busy scrim below, same as
+                    // drawSettingsButton's own dimming elsewhere on this
+                    // page).
+                    float boxH = h * 0.028f;
+                    RectF box = modRowHitBoxes[i];
+                    box.set(parchment.right - w * 0.03f - toggleW, rowTop + h * 0.003f,
+                            parchment.right - w * 0.03f, rowTop + h * 0.003f + boxH);
+                    String rowLabel = row.catalogId != null ? "Get" : (row.enabled ? "On" : "Off");
+                    drawCommandButton(c, box, rowLabel, winTex, false);
+                    if (modsImporting) {
+                        fill.setShader(null);
+                        fill.setColor(Color.argb(150, 0, 0, 0));
+                        c.drawRect(box, fill);
+                        box.setEmpty();
+                    } else if (rowTop < listTop || rowBottom > maxY) {
+                        box.setEmpty();
+                    }
+                    modRowDirName[i] = row.dirName;
+                    modRowCatalogId[i] = row.catalogId;
+                    modRowEnabled[i] = row.enabled;
                 }
-                modRowCount = shown;
-                if (shown < rows.size()) {
-                    setText(h * 0.016f, inkDim, false, Paint.Align.LEFT, false);
-                    c.drawText("+ " + (rows.size() - shown) + " more…", left, y + h * 0.016f, text);
-                    y += h * 0.024f;
+                c.restore();
+                modRowCount = rowCount;
+
+                // Scrollbar track (with page-up/page-down chevrons at each
+                // end) in the reserved margin right of the row toggles --
+                // only shown/tappable while the list actually overflows.
+                if (maxScroll > 0f) {
+                    float trackX0 = parchment.right - w * 0.022f;
+                    float trackX1 = parchment.right - w * 0.006f;
+                    float chevronH = h * 0.025f;
+                    modScrollUpHitBox.set(trackX0, listTop, trackX1, listTop + chevronH);
+                    modScrollDownHitBox.set(trackX0, maxY - chevronH, trackX1, maxY);
+                    setText(chevronH * 0.9f, modScrollY > 0f ? INK : inkDim, true, Paint.Align.CENTER, false);
+                    c.drawText("▲", modScrollUpHitBox.centerX(),
+                            modScrollUpHitBox.bottom - chevronH * 0.2f, text);
+                    setText(chevronH * 0.9f, modScrollY < maxScroll ? INK : inkDim, true, Paint.Align.CENTER, false);
+                    c.drawText("▼", modScrollDownHitBox.centerX(),
+                            modScrollDownHitBox.bottom - chevronH * 0.2f, text);
+
+                    float trackTop = listTop + chevronH + h * 0.006f;
+                    float trackBottom = maxY - chevronH - h * 0.006f;
+                    float trackH = Math.max(0f, trackBottom - trackTop);
+                    float thumbH = Math.max(trackH * 0.12f, trackH * (viewportH / contentH));
+                    float thumbY = trackTop + (trackH - thumbH) * (modScrollY / maxScroll);
+                    modScrollbarThumb.set(trackX0 + w * 0.002f, thumbY, trackX1 - w * 0.002f, thumbY + thumbH);
+                    fill.setShader(null);
+                    fill.setColor(inkDim);
+                    c.drawRoundRect(modScrollbarThumb, w * 0.005f, w * 0.005f, fill);
+                } else {
+                    modScrollY = 0f;
                 }
-                y += h * 0.008f;
+
+                y = maxY + h * 0.008f;
 
                 // Fixed advance (not drawSettingsBody's own return) regardless
                 // of whether anything is actually drawn here, so the button/
@@ -2399,6 +2642,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                     drawSettingsBody(c, "working...", left, y, textW, h, INK);
                 } else if (modsError != null) {
                     drawSettingsBody(c, "error: " + modsError, left, y, textW, h, Color.rgb(150, 30, 30));
+                } else if (modsMessage != null) {
+                    drawSettingsBody(c, modsMessage, left, y, textW, h, INK);
                 }
                 y += h * 0.03f;
 
@@ -2433,27 +2678,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             fogResetHitBox.set(btnA.centerX() - resetHalfW, btnA.bottom,
                     btnA.centerX() + resetHalfW, captionY + h * 0.02f);
         } else { // page == 3, Mods
+            // Per-row Get/On/Off buttons are drawn earlier, inside the row
+            // list's own clip/scroll pass above (see the Mods case in the
+            // switch), so they scroll and clip with their row instead of
+            // sitting on top of everything unclipped like this page's other
+            // buttons. Only the fixed Import-file button belongs here.
             drawSettingsButton(c, btnA, labelA, winTex, modsImporting, modImportButtonHitBox);
-            for (int i = 0; i < modRowCount; i++) {
-                RectF box = modRowHitBoxes[i];
-                if (box.isEmpty()) continue;
-                String label = modRowCatalogId[i] != null ? "Get" : (modRowEnabled[i] ? "On" : "Off");
-                drawCommandButton(c, box, label, winTex, false);
-                if (modsImporting) {
-                    // Mirror drawSettingsButton's busy dimming (scrim +
-                    // emptied hit box): no row action can double-fire, or
-                    // even visually look tappable, while an import/get/
-                    // toggle is in flight.
-                    fill.setShader(null);
-                    fill.setColor(Color.argb(150, 0, 0, 0));
-                    c.drawRect(box, fill);
-                    box.setEmpty();
-                }
-                // Otherwise the hit box is this same RectF instance --
-                // already correctly positioned by the text pass above, so no
-                // further set() is needed (unlike drawSettingsButton's
-                // single-button case).
-            }
         }
 
         // Bottom row: [prev] [Back] [next], arrows kept close to square.
@@ -2477,7 +2707,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     /** Settings section heading (monospace, INK) at {@code y}; returns the y for the body text that follows. */
     private float drawSettingsHeading(Canvas c, String s, float left, float y, int h) {
         setText(h * 0.03f, INK, false, Paint.Align.LEFT, false);
-        text.setTypeface(Typeface.MONOSPACE);
+        applyTypeface(Typeface.MONOSPACE);
         c.drawText(s, left, y, text);
         return y + h * 0.032f;
     }
@@ -2537,7 +2767,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         int w = getWidth(), h = getHeight();
         c.drawColor(Color.BLACK);
         setText(h * 0.09f, Color.WHITE, true, Paint.Align.CENTER, true);
-        text.setTypeface(Typeface.create(Typeface.DEFAULT_BOLD, Typeface.BOLD));
+        applyTypeface(Typeface.create(Typeface.DEFAULT_BOLD, Typeface.BOLD));
         c.drawText("CHRONO DUO", w / 2f, h / 2f + h * 0.03f, text);
         // Settings are reachable before a save is loaded: the same gear as
         // the parchment corner, white, top-left of the black screen.
@@ -2573,7 +2803,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         int w = getWidth(), h = getHeight();
         // small title above the map
         setText(h * 0.045f, INK, true, Paint.Align.CENTER, false);
-        text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         c.drawText(title, parchment.centerX(), parchment.top + h * 0.085f, text);
 
         float mx = parchment.centerX(), my = parchment.centerY() + h * 0.03f;
@@ -2682,7 +2912,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         areaMap = maskedAreaMapFor(s.fieldMapId, s.fieldX, s.fieldY, areaMap);
 
         setText(h * (areaMap != null ? 0.045f : 0.075f), INK, true, Paint.Align.CENTER, false);
-        text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         float ty = areaMap != null ? parchment.top + h * 0.085f : parchment.centerY() + h * 0.025f;
 
         String posSuffix = (SHOW_FIELD_POS && !Float.isNaN(s.fieldX) && !Float.isNaN(s.fieldY))
@@ -3075,7 +3305,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
         // gold + time inked into the parchment's bottom corners
         setText(h * 0.032f, INK, true, Paint.Align.LEFT, false);
-        text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         c.drawText(snap.gold + " G", parchment.left + w * 0.035f,
                 parchment.bottom - h * 0.035f, text);
         int s = snap.playSeconds;
