@@ -1356,6 +1356,11 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      * sites call {@code setText} then this, in that order, for exactly that
      * reason.
      */
+    // ChronoType's glyphs sit small in the em box compared to the serif it
+    // replaces, so a pre-snap size that fit the serif reads a step too small
+    // once swapped to the mod font -- scale up before snapping to compensate.
+    private static final float MOD_FONT_SIZE_BOOST = 1.25f;
+
     private void applyTypeface(Typeface fallback) {
         Typeface mod = com.kalenjohnson.chronoduo.mods.ModManager.activeTypeface();
         if (mod != null) {
@@ -1363,7 +1368,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             int ppem = com.kalenjohnson.chronoduo.mods.ModManager.activeTypefacePpem();
             if (ppem > 0) {
                 float size = text.getTextSize();
-                float snapped = Math.max(ppem, Math.round(size / ppem) * ppem);
+                int snapped = (int) Math.ceil(size * MOD_FONT_SIZE_BOOST / ppem) * ppem;
+                snapped = Math.max(ppem, snapped);
                 text.setTextSize(snapped);
             }
             text.setAntiAlias(false);
