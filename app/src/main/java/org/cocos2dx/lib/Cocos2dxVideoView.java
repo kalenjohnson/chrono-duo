@@ -258,6 +258,13 @@ public class Cocos2dxVideoView extends SurfaceView implements MediaPlayerControl
         }
     }
 
+    // True while the currently-loaded video came from a mod override
+    // (trySetModFmvDataSource succeeded) rather than the stock game asset.
+    // Mod FMVs (e.g. 4K upscales) can have a different aspect ratio than the
+    // rect the native engine requests, so fixSize() treats them specially --
+    // see fixSize()/applyModAspectRect() below.
+    private boolean mIsModFmv = false;
+
     private void openVideo() {
         if (mSurfaceHolder == null) {
             // not ready for playback just yet, will try again later
@@ -296,8 +303,10 @@ public class Cocos2dxVideoView extends SurfaceView implements MediaPlayerControl
             
             mDuration = -1;
             mCurrentBufferPercentage = 0;
+            mIsModFmv = false;
             if (mIsAssetRouse) {
-                if (!trySetModFmvDataSource(mVideoFilePath)) {
+                mIsModFmv = trySetModFmvDataSource(mVideoFilePath);
+                if (!mIsModFmv) {
                     Log.i(TAG, "FMV: " + mVideoFilePath + " <- asset");
                     AssetFileDescriptor afd = mCocos2dxActivity.getAssets().openFd(mVideoFilePath);
                     if (mVideoFilePath.endsWith(".dat")) {
@@ -427,7 +436,16 @@ public class Cocos2dxVideoView extends SurfaceView implements MediaPlayerControl
             mVisibleHeight = height;
         }
         else if (width != 0 && height != 0) {
-            if (mKeepRatio) {
+            if (mIsModFmv) {
+                // A mod FMV can have a different aspect ratio than the rect the
+                // native engine requested (e.g. a 16:9 4K upscale of a 4:3-ish
+                // original). Never let the surface crop it: pick a box that
+                // preserves the video's own aspect, expanding to the full GL
+                // surface when the video is wider than the requested rect
+                // (so a 16:9 remaster fills a 16:9 display) and otherwise
+                // fitting inside the requested rect like keepRatio.
+                applyModAspectRect(left, top, width, height);
+            } else if (mKeepRatio) {
                 if ( mVideoWidth * height  > width * mVideoHeight ) {
                     mVisibleWidth = width;
                     mVisibleHeight = width * mVideoHeight / mVideoWidth;
@@ -461,6 +479,63 @@ public class Cocos2dxVideoView extends SurfaceView implements MediaPlayerControl
         setLayoutParams(lParams);
     }
 
+    /**
+     * Computes {@code mVisible*} for a mod FMV so it is always shown
+     * letter/pillar-boxed with its own aspect preserved -- never cropped.
+     * If the video is wider than the rect the native engine requested, the
+     * box is expanded to the full GL surface / display bounds (so a 16:9
+     * remaster fills a widescreen display); otherwise the video is fit
+     * inside the requested rect, same as {@code mKeepRatio}.
+     */
+    private void applyModAspectRect(int left, int top, int width, int height) {
+        int boxLeft = left;
+        int boxTop = top;
+        int boxWidth = width;
+        int boxHeight = height;
+
+        boolean videoWiderThanRect = (long) mVideoWidth * height > (long) width * mVideoHeight;
+        if (videoWiderThanRect) {
+            int[] surface = getFullSurfaceBounds();
+            boxLeft = 0;
+            boxTop = 0;
+            boxWidth = surface[0];
+            boxHeight = surface[1];
+        }
+
+        if ( mVideoWidth * boxHeight > boxWidth * mVideoHeight ) {
+            mVisibleWidth = boxWidth;
+            mVisibleHeight = boxWidth * mVideoHeight / mVideoWidth;
+        } else if ( mVideoWidth * boxHeight < boxWidth * mVideoHeight ) {
+            mVisibleWidth = boxHeight * mVideoWidth / mVideoHeight;
+            mVisibleHeight = boxHeight;
+        } else {
+            mVisibleWidth = boxWidth;
+            mVisibleHeight = boxHeight;
+        }
+        mVisibleLeft = boxLeft + (boxWidth - mVisibleWidth) / 2;
+        mVisibleTop = boxTop + (boxHeight - mVisibleHeight) / 2;
+    }
+
+    /** Best-effort size of the GL surface / display this view is hosted on. */
+    private int[] getFullSurfaceBounds() {
+        Object parent = getParent();
+        if (parent instanceof android.view.View) {
+            android.view.View p = (android.view.View) parent;
+            int w = p.getWidth();
+            int h = p.getHeight();
+            if (w > 0 && h > 0) {
+                return new int[] { w, h };
+            }
+        }
+        if (mCocos2dxActivity != null) {
+            android.util.DisplayMetrics dm = mCocos2dxActivity.getResources().getDisplayMetrics();
+            if (dm.widthPixels > 0 && dm.heightPixels > 0) {
+                return new int[] { dm.widthPixels, dm.heightPixels };
+            }
+        }
+        return new int[] { mVideoWidth, mVideoHeight };
+    }
+
     protected 
     MediaPlayer.OnVideoSizeChangedListener mSizeChangedListener =
         new MediaPlayer.OnVideoSizeChangedListener() {
@@ -469,6 +544,13 @@ public class Cocos2dxVideoView extends SurfaceView implements MediaPlayerControl
                 mVideoHeight = mp.getVideoHeight();
                 if (mVideoWidth != 0 && mVideoHeight != 0) {
                     getHolder().setFixedSize(mVideoWidth, mVideoHeight);
+                    if (mIsModFmv) {
+                        // A mod FMV's real size may only be known once this
+                        // fires; re-run the aspect-preserving layout so the
+                        // surface buffer set just above doesn't stay mismatched
+                        // with the (possibly stale) mVisible* box and crop.
+                        fixSize();
+                    }
                 }
             }
     };
