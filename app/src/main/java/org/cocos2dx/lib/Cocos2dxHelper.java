@@ -146,7 +146,12 @@ public class Cocos2dxHelper {
             final ApplicationInfo applicationInfo = activity.getApplicationInfo();
             
             Cocos2dxHelper.sPackageName = applicationInfo.packageName;
-            Cocos2dxHelper.sFileDirectory = activity.getFilesDir().getAbsolutePath();
+            // ChronoDuo: the engine's writable path (FileUtils::getWritablePath ->
+            // DeviceInfo::getDocumentsPath) is where Chrono_sp_*_0.dat, meta.bin and
+            // common.bin live. Use the external files dir so saves are reachable over
+            // adb (import/export); AppActivity migrates older internal saves first.
+            java.io.File ext = activity.getExternalFilesDir(null);
+            Cocos2dxHelper.sFileDirectory = (ext != null ? ext : activity.getFilesDir()).getAbsolutePath();
             
             Cocos2dxHelper.nativeSetApkPath(Cocos2dxHelper.getAssetsPath());
     

@@ -72,10 +72,13 @@ Slot layout (offsets within the slot):
 - Plaintext = `payload[N] ‖ u16 checksum ‖ pad to 8 ‖ u32 LE N`. The pad bytes are
   uninitialised garbage. N = 7882 for every normal save; 7889 for the one save with a
   7-char-longer name; 447 for `meta.bin` (a JSON `{"slotInfos":[{"savedTime":…}×23]}`).
-- **Checksum: unknown.** Ruled out (via same-length XOR/difference tests that cancel any
-  seed): every CRC-16 polynomial/reflection/init/xorout, CRC-32 (either half), Adler,
-  byte/word/dword sums (signed or not, ones' complement), any `h=h*M+b` multiplicative hash.
-  Needs the save routine in `libchrono.so`. Also unknown whether the game even verifies it.
+- **There is no checksum.** `nsCrypt::Manager::encrypt` (libchrono.so @0x6e69b0) computes
+  `size = (len+11) & ~7`, copies the payload, fills `[len, size-4)` with `rand()%256`, stores
+  the u32 length, picks 8 random IV bytes and runs Blowfish-CBC. The "u16" is random padding
+  (which is why no CRC/sum/hash ever matched). Nothing is verified on load beyond the length.
+- **Payload byte 0 is a format version: the Android reader (`readSaveDataFromBuffer`
+  @0x5bf624) accepts only 1.** Steam files carry 3 with an otherwise identical layout; set
+  the byte to 1 and they load on Android (verified on the Thor, 2026-09-15).
 - `common.bin` (42 bytes) does not decrypt to anything structured with this key.
 
 ### 3.2 Payload — a serialized stream, not a fixed struct
@@ -164,13 +167,18 @@ Slot naming on Steam: slots 1–3, 5–6 → `save_00..02, 04, 05`; slot 4 → `
 quicksave → `save_03`. Android names `Chrono_sp_3_0.dat`, `_4_0`, `_5_0` were reported on
 GameFAQs — the index↔slot mapping still needs confirming on device.
 
-## 6. Open items (need `libchrono.so` or the device)
+## 6. Device results (Ayn Thor, 2026-09-15)
 
-1. Trailer u16 checksum algorithm (or proof that the loader ignores it).
-2. Confirm the Blowfish key in the Android lib equals the Steam one.
-3. Port item table → names for the import UI (idx mapping is linear per category, verified).
-4. Semantics of char +1A (9 999 999 sentinel) and +36.
-5. Android slot file naming / which `Chrono_sp_N_0.dat` is which menu slot, and how
-   `meta.bin` is used (`savedTime` "0" vs "1" vs epoch).
-6. Whether region A / 0x400 / 0x1E0C must agree with the flags for a template chapter, or
-   whether any save point is safe to resume at.
+Resolved with the library and a live test — the four pushed saves (three Steam chapters with
+byte 0 := 1, one converted SNES slot) all appear in the load menu and load:
+
+1. No checksum (§3.1). Key and IV magic are byte-identical in the Android lib.
+2. File names: `Chrono_sp_%d_0.dat` with %d = menu slot + 3 for slots 0..19, **slot 3 → 23**,
+   suspend slot 20 → 6 (`getSaveDataFileName` @0x5bf214). `meta.bin` = same container around
+   the slotInfos JSON; the game re-saves `savedTime` as the parsed integer.
+3. The engine's writable path is `FileUtils::getWritablePath()`; ChronoDuo now sets that to
+   `getExternalFilesDir(null)` (was the internal files dir) and migrates old saves, so
+   `/sdcard/Android/data/com.kalenjohnson.chronoduo/files/` is the save directory.
+
+Still open: item names for an import UI (port item table), semantics of char +1A / +36, and
+how far the template's scene state may diverge from the SNES flags before something breaks.

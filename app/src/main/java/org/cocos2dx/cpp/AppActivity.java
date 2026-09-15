@@ -107,6 +107,11 @@ public class AppActivity extends Cocos2dxActivity {
 
         Cocos2dxHelper.sAssetsPathOverride = runtime.getApkPath();
 
+        // Saves used to live in getFilesDir(); they now live in the external files
+        // dir (see Cocos2dxHelper.init). Move any existing ones across once, before
+        // the engine looks for them.
+        migrateSaves(getFilesDir(), getExternalFilesDir(null));
+
         super.onCreate(savedInstanceState);
 
         setAssetManager(this, runtime.getChronoAssets());
@@ -1239,5 +1244,38 @@ public class AppActivity extends Cocos2dxActivity {
                 + "installed on this device — ChronoDuo runs that copy's engine and assets, "
                 + "it ships none of its own.\n\nDetail: " + e);
         setContentView(tv);
+    }
+
+    /** One-time move of the game's save files from the old internal writable dir
+     *  to the external files dir. Existing files in the destination are never
+     *  overwritten. */
+    static void migrateSaves(File from, File to) {
+        if (from == null || to == null || from.equals(to)) return;
+        File[] files = from.listFiles();
+        if (files == null) return;
+        int moved = 0;
+        for (File f : files) {
+            if (!f.isFile()) continue;
+            String n = f.getName();
+            boolean isSave = n.startsWith("Chrono_sp_") || n.equals("meta.bin")
+                    || n.equals("common.bin") || n.equals("UserDefault.xml");
+            if (!isSave) continue;
+            File dst = new File(to, n);
+            if (dst.exists()) continue;
+            if (f.renameTo(dst)) { moved++; continue; }
+            try (java.io.FileInputStream in = new java.io.FileInputStream(f);
+                 java.io.FileOutputStream out = new java.io.FileOutputStream(dst)) {
+                byte[] buf = new byte[65536];
+                int r;
+                while ((r = in.read(buf)) > 0) out.write(buf, 0, r);
+                moved++;
+            } catch (java.io.IOException e) {
+                Log.w(TAG, "save migration failed for " + n, e);
+                dst.delete();
+                continue;
+            }
+            f.delete();
+        }
+        if (moved > 0) Log.i(TAG, "migrated " + moved + " save file(s) to " + to);
     }
 }

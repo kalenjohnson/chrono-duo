@@ -651,3 +651,27 @@ lib is not on disk any more, pull `split_config.arm64_v8a.apk` from the device n
 plugged in. Also to confirm on device: key, `Chrono_sp_N` slot numbering, whether the loader
 checks the checksum at all, the port's item table (`ctres.py` on `resources.bin`) for the
 key-item mapping, and the meaning of the char-record `+1A` field (`9 999 999` sentinel).
+
+**Device session 2026-09-15 (libchrono.so pulled from `split_config.arm64_v8a.apk`, symbols intact):**
+- **There is no checksum.** `nsCrypt::Manager::encrypt(buf, len, vec*)` @0x6e69b0: `size = (len+11) & ~7`,
+  memcpy payload, fill `[len, size-4)` with `rand()%256`, store u32 len at `size-4`, 8 random IV
+  bytes, Blowfish-CBC. The u16 we chased was random padding. Key/IV magic bytes present in the
+  Android lib (0x3c21a0 / 0x361b38) — same as Steam.
+- Save path: `nsSaveLoadUtils::saveGameData(slot)` → `cSfcWork::GetSaveData(FILE_NORMAl&)` →
+  `ctr::ResourceManager::writeSaveDataToBuffer` @0x5c085c (payload serializer, no calls, NEON
+  narrowing) → `writeSaveData` @0x5c0728 → encrypt → `writeData(name)`. Reader
+  `readSaveDataFromBuffer` @0x5bf624 **requires payload byte 0 == 1** (Steam files carry 3), then
+  region A = 512 bytes widened to u32 into `FILE_NORMAl[0..0x800)`, flags 0x201.. from FILE+0x800.
+- File names: `Chrono_sp_%d_0.dat` with %d = slot+3 for menu slots 0..19, slot 3 → 23, suspend
+  slot 20 → 6 (`getSaveDataFileName` @0x5bf214). `meta.bin` = encrypted JSON slotInfos (23),
+  `common.bin` = `FILE_COMMOn` (42 bytes, not the same container — not needed for import).
+  Saves live in `getExternalFilesDir(null)` = `/sdcard/Android/data/com.kalenjohnson.chronoduo/files/`.
+- First device test pushed: slot 1 = Steam ch15 payload with byte0=1, slot 2 = converted SNES
+  ctsave04/1 on template ch11, plus a generated meta.bin. **ALL FOUR LOAD AND PLAY.**
+- Gotcha that cost an hour: the engine's writable path is `FileUtils::getWritablePath()` =
+  `Cocos2dxHelper.sFileDirectory` = **internal** `getFilesDir()`, not the path given to
+  `setExternalStorageInfo`. Pushed files were invisible and the title's "Resume" was the game's
+  own suspend file. Fixed by pointing `sFileDirectory` at `getExternalFilesDir(null)` with a
+  one-time migration in `AppActivity.migrateSaves` (moves `Chrono_sp_*`, `meta.bin`,
+  `common.bin`, `UserDefault.xml`). Local builds are debug-signed → cannot install over the
+  CI build; this Thor was uninstalled/reinstalled (versionCode 99).
