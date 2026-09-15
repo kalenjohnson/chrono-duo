@@ -131,6 +131,19 @@ public final class PartySnapshot {
     public final List<CommandTarget> commandTargets = new ArrayList<>();
     public boolean menuOpen; // == !commandTargets.isEmpty()
 
+    // Live Auto Battle toggle (see GameState.nativeGetBattleAutoToggleIndex),
+    // filled from the same nativeGetBattleToggles() array/affine as
+    // CommandTarget above, but kept separate: it is not part of the
+    // Attack/Tech/Item row and must not affect commandTargets/menuOpen or
+    // controller navigation. autoBattleAvailable is true only when the
+    // native index resolved to a live, visible toggle entry this poll;
+    // autoBattleX/Y are then valid game-screen coordinates for
+    // BattleInput.tap. autoBattleOn mirrors the toggle's live
+    // _selectedIndex != 0 (BattleMenu::isAutoBattle()).
+    public boolean autoBattleAvailable;
+    public boolean autoBattleOn;
+    public float autoBattleX, autoBattleY;
+
     /**
      * One row of the live battle Tech/Item submenu (see
      * {@link GameState#nativeGetBattleList()}). {@code x}/{@code y} are
@@ -379,6 +392,28 @@ public final class PartySnapshot {
             }
             snap.menuOpen = snap.commandTargets.size() == CMD_MAX_TARGETS;
 
+            // Auto Battle toggle: same raw toggles array/affine as
+            // CommandTarget above, but resolved by native index (pointer
+            // match against BattleMenu+0x1e8), not by the band-filter/
+            // sort candidates use -- so it works independently of whether
+            // the Attack/Tech/Item row happens to be open this poll.
+            int autoIdx = GameState.nativeGetBattleAutoToggleIndex();
+            if (autoIdx >= 0 && toggles != null) {
+                int base = autoIdx * 5;
+                // Unlike CommandTarget above, no vis>=0.5f gate: the Auto
+                // Battle toggle is not part of the Attack/Tech/Item band
+                // (whose visibility tracks the command menu being open), so
+                // gating on it here would flicker the chip out every time
+                // the ATB isn't ready. "Valid" just means the native index
+                // resolved to a real collected toggle this scan.
+                if (base + 4 < toggles.length) {
+                    snap.autoBattleAvailable = true;
+                    snap.autoBattleOn = toggles[base + 4] != 0f;
+                    snap.autoBattleX = CMD_SX_A + CMD_SX_B * toggles[base];
+                    snap.autoBattleY = CMD_SY_A + CMD_SY_B * toggles[base + 1];
+                }
+            }
+
             // Live Tech/Item submenu list, when one of those is open --
             // format: [kind, count, then per row: id, usable(0/1), extra,
             // x, y] in the same worldspace as the command toggles above, so
@@ -495,6 +530,7 @@ public final class PartySnapshot {
                 || !feq(fieldX, o.fieldX) || !feq(fieldY, o.fieldY)) return false;
         if (inBattle != o.inBattle || enemies.size() != o.enemies.size()) return false;
         if (menuOpen != o.menuOpen || commandTargets.size() != o.commandTargets.size()) return false;
+        if (autoBattleAvailable != o.autoBattleAvailable || autoBattleOn != o.autoBattleOn) return false;
         if (listKind != o.listKind || listRows.size() != o.listRows.size()) return false;
         if (resultsActive != o.resultsActive || resultsStep != o.resultsStep
                 || resultsExp != o.resultsExp || resultsGold != o.resultsGold

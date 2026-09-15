@@ -724,6 +724,28 @@ inventory (`resources.bin` pulled from `split_assetPack.apk`, 9,494 entries,
   exported; `Scheduler::setTimeScale` would be the obvious lever (needs
   GL-thread call), untested.
 
+### Auto Battle on the second screen (2026-09-15)
+
+The port has the SNES "Auto Battle" (repeated Attack; also doubles the
+battle logic frame count -- see `Battle::update(float)` @0x649c04, which
+doubles n when `BattleMenu::isAutoBattle()`), bound to the menu button in
+battle. Its on-screen button is part of the top-screen battle UI we hide,
+so it was toggling invisibly. Now mirrored as the AUTO chip:
+
+- `Battle+0x320` = `SceneBattle*`, `SceneBattle+0x2180` = `BattleMenu*`,
+  `BattleMenu+0x1e8` = the Auto `cocos2d::MenuItemToggle*` (created by
+  `BattleMenu::autoButton` @0x5af4d4, last item pushed into the battle
+  Menu). `isAutoBattle()` @0x5ad0dc is `toggle->_selectedIndex != 0`
+  (+0x330); fallback when the pointer is null: byte at
+  `ChronoCanvas+0x1cce1`.
+- gamestate.c matches that pointer against the toggles the existing scan
+  collected (by pointer, not vector order) and exports the index; the
+  panel reads ON/OFF from the toggle's `_selectedIndex` and toggles by
+  injecting a tap at the real button's position, like Attack/Tech/Item.
+- Layout lesson: the enemy rows' `areaTop` is a text BASELINE, so a chip
+  in the top strip needs ~6.5% of view height clearance below it, not
+  1.5%.
+
 ### Mod loader shipped (2026-09-15, later)
 
 - Native: mods use their own full-archive-path keyed hash table (checked

@@ -2426,10 +2426,33 @@ static void *find_node_by_type(void *root, const char *pat, int max_depth) {
 #define TOGGLE_SELECTED_OFFSET       0x2F8
 #define TOGGLE_SELECTED_INDEX_OFFSET 0x330
 
+// Auto Battle toggle pointer chase (arm64, from disasm): Battle node
+// (g_battle_node) +0x320 -> SceneBattle*; SceneBattle +0x2180 -> BattleMenu*;
+// BattleMenu +0x1e8 -> the Auto Battle cocos2d::MenuItemToggle* (created by
+// BattleMenu::autoButton). BattleMenu::isAutoBattle() is literally
+// `toggle->_selectedIndex != 0` at TOGGLE_SELECTED_INDEX_OFFSET above.
+#define SCENEBATTLE_OFFSET      0x320
+#define SCENEBATTLE_BATTLEMENU_OFFSET 0x2180
+#define BATTLEMENU_AUTOTOGGLE_OFFSET  0x1e8
+
 #define MAX_BATTLE_TOGGLES 24
-typedef struct { float x, y; int visible; int selected; uint32_t selectedIndex; } BattleToggle;
+typedef struct { float x, y; int visible; int selected; uint32_t selectedIndex; void *node; } BattleToggle;
 static BattleToggle g_battle_toggles[MAX_BATTLE_TOGGLES];
 static int g_battle_toggle_count;
+
+// Index into g_battle_toggles of the Auto Battle MenuItemToggle (BattleMenu
+// +0x1e8, resolved fresh each scan in nativeUpdateBattleFlag below by
+// pointer match against the toggle nodes collect_toggles_rec just walked),
+// or -1 when not found / not in battle. Cached for
+// nativeGetBattleAutoToggleIndex (any-thread plain read).
+static int g_battle_auto_toggle_index = -1;
+// Rate-limit the "auto toggle index" log line to once per change (index,
+// visibility, or selectedIndex), like g_last_logged_selected above -- all
+// three, not just the index, so a visibility flicker independent of the
+// index (e.g. tied to the command menu opening/closing) shows up too.
+static int g_last_logged_auto_toggle_index = -2;
+static int g_last_logged_auto_toggle_vis = -2;
+static uint32_t g_last_logged_auto_toggle_selidx = 0xffffffffu;
 
 static void collect_toggles_rec(void *node, int depth, int max_depth, int ancestors_visible) {
     if (g_battle_toggle_count >= MAX_BATTLE_TOGGLES) return;
@@ -2451,6 +2474,7 @@ static void collect_toggles_rec(void *node, int depth, int max_depth, int ancest
             g_battle_toggles[g_battle_toggle_count].visible = this_visible ? 1 : 0;
             g_battle_toggles[g_battle_toggle_count].selected = selb ? 1 : 0;
             g_battle_toggles[g_battle_toggle_count].selectedIndex = selIdx;
+            g_battle_toggles[g_battle_toggle_count].node = node;
             g_battle_toggle_count++;
         }
         return; // toggles have no meaningful children to recurse into
@@ -2492,6 +2516,37 @@ static int g_last_logged_list_kind = -2;
 static int g_last_logged_list_count = -1;
 static void collect_battle_list(void *battle_node);
 
+// Resolves the Auto Battle MenuItemToggle via the safe_read chain documented
+// at BATTLEMENU_AUTOTOGGLE_OFFSET above, then finds which entry
+// collect_toggles_rec just collected into g_battle_toggles has a matching
+// `node` pointer -- identifying the auto toggle by POINTER, not by its
+// (unstable) position in the vector. Returns the index, or -1 if any link in
+// the chain is unreadable/implausible or no collected toggle matches.
+// GL thread only -- called from nativeUpdateBattleFlag right after
+// collect_toggles_rec, which fills g_battle_toggles/g_battle_toggle_count.
+static int resolve_battle_auto_toggle_index(void *battle_node) {
+    if (!battle_node) return -1;
+    uint8_t *sb = NULL;
+    if (!safe_read((uint8_t *)battle_node + SCENEBATTLE_OFFSET, &sb, sizeof(sb))
+            || !plausible_any(sb)) {
+        return -1;
+    }
+    uint8_t *bm = NULL;
+    if (!safe_read(sb + SCENEBATTLE_BATTLEMENU_OFFSET, &bm, sizeof(bm))
+            || !plausible_any(bm)) {
+        return -1;
+    }
+    void *autoToggle = NULL;
+    if (!safe_read(bm + BATTLEMENU_AUTOTOGGLE_OFFSET, &autoToggle, sizeof(autoToggle))
+            || !plausible_any(autoToggle)) {
+        return -1;
+    }
+    for (int i = 0; i < g_battle_toggle_count; i++) {
+        if (g_battle_toggles[i].node == autoToggle) return i;
+    }
+    return -1;
+}
+
 JNIEXPORT void JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeUpdateBattleFlag(JNIEnv *env, jclass cls) {
     void *scene = find_running_scene();
@@ -2523,12 +2578,31 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeUpdateBattleFlag(JNIEnv *env, jc
             LOGI("battle selection: toggle[%d] selected (was %d)", sel_idx, g_last_logged_selected);
             g_last_logged_selected = sel_idx;
         }
+        g_battle_auto_toggle_index = resolve_battle_auto_toggle_index(node);
+        int auto_vis = g_battle_auto_toggle_index >= 0
+                ? g_battle_toggles[g_battle_auto_toggle_index].visible : -1;
+        uint32_t auto_selidx = g_battle_auto_toggle_index >= 0
+                ? g_battle_toggles[g_battle_auto_toggle_index].selectedIndex : 0;
+        if (g_battle_auto_toggle_index != g_last_logged_auto_toggle_index
+                || auto_vis != g_last_logged_auto_toggle_vis
+                || auto_selidx != g_last_logged_auto_toggle_selidx) {
+            LOGI("battle auto toggle: index=%d vis=%d selIdx=%u (was index=%d vis=%d)",
+                 g_battle_auto_toggle_index, auto_vis, auto_selidx,
+                 g_last_logged_auto_toggle_index, g_last_logged_auto_toggle_vis);
+            g_last_logged_auto_toggle_index = g_battle_auto_toggle_index;
+            g_last_logged_auto_toggle_vis = auto_vis;
+            g_last_logged_auto_toggle_selidx = auto_selidx;
+        }
     } else {
         g_last_logged_selected = -1; // battle ended/not found -- reset so re-entry logs fresh
         g_battle_list_kind = -1;
         g_battle_list_count = 0;
         g_last_logged_list_kind = -2;
         g_last_logged_list_count = -1;
+        g_battle_auto_toggle_index = -1;
+        g_last_logged_auto_toggle_index = -2;
+        g_last_logged_auto_toggle_vis = -2;
+        g_last_logged_auto_toggle_selidx = 0xffffffffu;
     }
     if (g_in_battle != g_battle_was) {
         LOGI("battle %s", g_in_battle ? "started" : "ended");
@@ -2564,6 +2638,16 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleToggles(JNIEnv *env, jc
         (*env)->SetFloatArrayRegion(env, arr, 0, count * 5, buf);
     }
     return arr;
+}
+
+// Index into the nativeGetBattleToggles array of the Auto Battle toggle (see
+// resolve_battle_auto_toggle_index/g_battle_auto_toggle_index above), or -1
+// when not found / not in battle. Populated on the GL thread by
+// nativeUpdateBattleFlag; safe to call from any thread (plain read of the
+// cached int, like nativeGetBattleToggles above).
+JNIEXPORT jint JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleAutoToggleIndex(JNIEnv *env, jclass cls) {
+    return g_battle_auto_toggle_index;
 }
 
 // ---------------------------------------------------------------------------

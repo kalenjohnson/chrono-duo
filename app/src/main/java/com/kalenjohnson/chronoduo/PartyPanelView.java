@@ -165,6 +165,14 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private static final float EYE_GLYPH_RADIUS = 12f; // ~24px diameter
     private static final float EYE_HIT_HALF = 24f;     // ~48px hit box
 
+    // Hit box (screen px) for the battle-mode "AUTO" chip, updated each
+    // frame it's drawn; cleared (and therefore never touch-hit) whenever
+    // snap.autoBattleAvailable is false -- see drawAutoToggle / onTouchEvent.
+    private final RectF autoHitBox = new RectF();
+    // Tap injects BattleInput.tap at the live toggle's game-screen position
+    // (snap.autoBattleX/Y); the displayed ON/OFF state always comes from the
+    // next snapshot poll (snap.autoBattleOn), never guessed locally.
+
     // Battle command buttons (Attack/Tech/Item) -- on-panel hit rects (panel
     // px, not game-screen px) for the up to 3 currently visible command
     // targets in snap.commandTargets, same order. commandCount is how many
@@ -189,6 +197,11 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // button's rect within this cooldown of the last injection is ignored.
     private long lastInjectAt = -1L;
     private static final long INJECT_COOLDOWN_NANOS = 250_000_000L;
+    // Brief pressed-state visual feedback on the AUTO chip, mirroring
+    // pressedCommand/pressedAt above -- the actual ON/OFF label always comes
+    // from the next snap.autoBattleOn poll (see injectAutoBattleToggle).
+    private boolean pressedAuto;
+    private long pressedAutoAt = -1L;
 
     // Target-selection phase: after a successful command injection the game
     // enters cursor-based target selection (top-screen cursor, dpad cycles,
@@ -934,6 +947,11 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             toggleHiddenHpMode();
             return true;
         }
+        if (snap.inBattle && snap.autoBattleAvailable && !autoHitBox.isEmpty()
+                && autoHitBox.contains(event.getX(), event.getY())) {
+            injectAutoBattleToggle();
+            return true;
+        }
         if (snap.inBattle && snap.menuOpen && commandCount > 0) {
             for (int i = 0; i < commandCount; i++) {
                 if (commandHitBoxes[i].contains(event.getX(), event.getY())) {
@@ -1100,6 +1118,27 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         pendingMenuClose = true;
         pendingCloseIsCommand = true;
         pendingMenuCloseAt = now;
+        invalidate();
+    }
+
+    /**
+     * Injects a tap on the live Auto Battle toggle at its game-screen
+     * coordinates (snap.autoBattleX/Y), cooldown-guarded like {@link
+     * #injectCommand} (shares {@link #lastInjectAt}/{@link
+     * #INJECT_COOLDOWN_NANOS} -- one in-flight tap at a time across both).
+     * Unlike injectCommand, this never opens/closes the command menu or
+     * targeting; it only flips the toggle. The displayed ON/OFF state is
+     * never guessed here -- it comes from the next {@code snap.autoBattleOn}
+     * poll, exactly like every other live-state chip in this file.
+     */
+    private void injectAutoBattleToggle() {
+        if (!snap.inBattle || !snap.autoBattleAvailable) return;
+        long now = System.nanoTime();
+        if (lastInjectAt >= 0 && now - lastInjectAt < INJECT_COOLDOWN_NANOS) return;
+        lastInjectAt = now;
+        pressedAuto = true;
+        pressedAutoAt = now;
+        BattleInput.tap(snap.autoBattleX, snap.autoBattleY);
         invalidate();
     }
 
@@ -1795,6 +1834,16 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         int n = s.enemies.size();
         if (n == 0) return;
         float areaTop = parchment.top + h * 0.13f;
+        // The AUTO chip (see drawAutoToggle) is taller than the top strip
+        // the eye glyph lives in, so when it's showing push the enemy rows
+        // down to clear it. areaTop is the first row's text BASELINE (see
+        // drawEnemyBar: the name/HP labels are drawn at t and rise above
+        // it by roughly rowH*0.62, up to ~5% of the view height), so the
+        // clearance must cover that ascent plus a small gap, not just the
+        // row's nominal top.
+        if (s.autoBattleAvailable) {
+            areaTop = Math.max(areaTop, autoChipRect(parchment).bottom + h * 0.065f);
+        }
         // Leave room for the command-button band (see drawCommandButtons)
         // when it's showing, so a long enemy list compresses instead of
         // drawing through the buttons.
@@ -2399,6 +2448,55 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         fill.setShader(null);
         fill.setColor(inkA);
         c.drawCircle(cx, cy, EYE_GLYPH_RADIUS * 0.35f, fill);
+    }
+
+    /**
+     * "AUTO" chip toggling the game's own Auto Battle mode (repeated Attack
+     * + 2x battle speed) by tapping the real on-screen toggle's game-screen
+     * position -- see {@link #injectAutoBattleToggle}. Drawn only in battle
+     * and only while {@code snap.autoBattleAvailable} (see the {@link
+     * #onDraw} call site, which clears {@link #autoHitBox} otherwise).
+     * Reuses {@link #drawCommandButton}'s exact chrome so it matches the
+     * Attack/Tech/Item row, with {@code highlighted} doing double duty as
+     * the ON/OFF indicator: filled/tinted with a brighter border when Auto
+     * Battle is on, plain when off -- state comes straight from {@code
+     * snap.autoBattleOn} (the next poll), never guessed locally except for
+     * the brief {@link #pressedAuto} press flash. Placed in the same top
+     * strip as {@link #drawEyeToggle}'s glyph (must be called after it, so
+     * {@link #eyeHitBox} is already positioned this frame), immediately to
+     * its LEFT with a small gap -- not below it, which would run into the
+     * enemy HP rows that start at {@link #drawBattleContent}'s areaTop
+     * (parchment.top + ~13% of the view height); staying in the top strip
+     * keeps it clear of both that and the command-button band near the
+     * bottom of the parchment. Sized to a {@link #MOD_ROW_BUTTON_H_DP}-tall
+     * (>=48dp) touch target. Updates {@link #autoHitBox} every call so the
+     * hit-test always matches the chip's current on-screen position.
+     */
+    private void drawAutoToggle(Canvas c, RectF parchment) {
+        RectF box = autoChipRect(parchment);
+        autoHitBox.set(box);
+
+        boolean pressed = pressedAuto && pressedAutoAt >= 0
+                && System.nanoTime() - pressedAutoAt < PRESS_FEEDBACK_NANOS;
+        Bitmap winTex = ChronoAssets.getWindowTex();
+        drawCommandButton(c, box, "AUTO", winTex, pressed, snap.autoBattleOn);
+    }
+
+    /**
+     * The AUTO chip's rect for this parchment: {@link #MOD_ROW_BUTTON_H_DP}
+     * tall, 88dp wide, in the top strip immediately left of the eye glyph
+     * (derived from the same constants {@link #drawEyeToggle} uses, so it
+     * needs no draw-order dependency). Shared by {@link #drawAutoToggle}
+     * and {@link #drawBattleContent}, which pushes the enemy HP rows below
+     * it -- the chip is taller than the top strip the eye glyph fits in.
+     */
+    private RectF autoChipRect(RectF parchment) {
+        float chipH = dp(MOD_ROW_BUTTON_H_DP);
+        float chipW = dp(88f);
+        float eyeLeft = parchment.right - EYE_GLYPH_RADIUS - 14f - EYE_HIT_HALF;
+        float right = eyeLeft - dp(6f);
+        float top = parchment.top + 14f;
+        return new RectF(right - chipW, top, right, top + chipH);
     }
 
     /**
@@ -3506,6 +3604,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 && System.nanoTime() - pressedAt < PRESS_FEEDBACK_NANOS) {
             animating = true;
         }
+        if (pressedAuto && pressedAutoAt >= 0
+                && System.nanoTime() - pressedAutoAt < PRESS_FEEDBACK_NANOS) {
+            animating = true;
+        }
 
         // aged-paper vignette/speckles/frame ON TOP of the map so it reads
         // as ink on old parchment rather than a clean printed minimap
@@ -3527,6 +3629,11 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         if (snap.inBattle) {
             gearHitBox.setEmpty();
             drawEyeToggle(c, parchment);
+            if (snap.autoBattleAvailable) {
+                drawAutoToggle(c, parchment);
+            } else {
+                autoHitBox.setEmpty();
+            }
             if (resultsMode) {
                 drawResultsWindow(c, parchment);
                 commandCount = 0;
@@ -3551,6 +3658,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             }
         } else {
             eyeHitBox.setEmpty();
+            autoHitBox.setEmpty();
             commandCount = 0;
             targetCount = 0;
             listVisibleCount = 0;

@@ -240,6 +240,11 @@ public final class GameState {
     // toggle's raw _selectedIndex cast to float. Empty array when not in
     // battle. Any thread; uses the cached array populated on the GL thread.
     public static native float[] nativeGetBattleToggles();
+    // Index into nativeGetBattleToggles() of the Auto Battle MenuItemToggle
+    // (BattleMenu::autoButton), resolved fresh each nativeUpdateBattleFlag
+    // scan by pointer match, not vector position. -1 when not found / not in
+    // battle. Any thread; uses the cached int populated on the GL thread.
+    public static native int nativeGetBattleAutoToggleIndex();
     // Cached open battle list submenu (Tech or Item), populated by
     // nativeUpdateBattleFlag right after the toggle scan above -- same
     // thread/cadence. Returns null when no submenu is open. Otherwise a
