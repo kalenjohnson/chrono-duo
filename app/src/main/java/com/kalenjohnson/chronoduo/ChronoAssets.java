@@ -81,13 +81,20 @@ public final class ChronoAssets {
     private static final List<Listener> listeners = new ArrayList<>();
 
     /**
-     * Uniform corner/edge inset, in the window-texture bitmap's own pixels,
-     * used by PartyPanelView's manual 9-slice draw. Matches the beveled
-     * border thickness AppActivity crops Extension/menu_win.png down to
-     * (the panel's border resolves into flat fill texture by ~16px in from
-     * each edge, verified by sampling the source PNG).
+     * Default uniform corner/edge inset, in the window-texture bitmap's own
+     * pixels, used by PartyPanelView's manual 9-slice draw. Matches the
+     * beveled border thickness AppActivity crops Extension/menu_win.png down
+     * to at its ORIGINAL 512x512 sheet size (the panel's border resolves
+     * into flat fill texture by ~16px in from each edge, verified by
+     * sampling the source PNG). A mod that ships a differently-sized
+     * menu_win.png gets a proportionally scaled inset instead -- see
+     * {@link #setWindowTex(Bitmap, int)} and AppActivity's
+     * {@code cropWindowTexture}.
      */
-    public static final int WINDOW_TEX_INSET = 16;
+    public static final int WINDOW_TEX_INSET_DEFAULT = 16;
+
+    /** Current inset for {@link #getWindowTex()} -- see {@link #setWindowTex(Bitmap, int)}. */
+    private static int windowTexInset = WINDOW_TEX_INSET_DEFAULT;
 
     // App's external files dir, set once from AppActivity (mirrors the
     // pattern used to find the rendered world maps -- see AppActivity#renderWorldMaps),
@@ -360,7 +367,23 @@ public final class ChronoAssets {
 
     public static void setMinimapMark(Bitmap b) { minimapMark = b; notifyListeners(); }
     public static void setEpochMark(Bitmap b) { epochMark = b; notifyListeners(); }
-    public static void setWindowTex(Bitmap b) { windowTex = b; notifyListeners(); }
+
+    /** Returns the corner/edge inset (in {@link #getWindowTex()}'s own pixels) for the manual 9-slice draw -- see {@link #setWindowTex(Bitmap, int)}. */
+    public static int getWindowTexInset() { return windowTexInset; }
+
+    /**
+     * Stores the window-chrome bitmap and the inset (in that bitmap's own
+     * pixels) PartyPanelView's manual 9-slice draw should use for it --
+     * scaled by AppActivity's {@code cropWindowTexture} to match whatever
+     * size {@code Extension/menu_win.png} actually decoded at (a mod can
+     * ship a higher- or lower-resolution sheet than the shipped 512x512
+     * original).
+     */
+    public static void setWindowTex(Bitmap b, int inset) {
+        windowTex = b;
+        windowTexInset = inset > 0 ? inset : WINDOW_TEX_INSET_DEFAULT;
+        notifyListeners();
+    }
 
     /** Stores the monster name table (line index == monster id) and notifies listeners, so a battle panel already open when extraction finishes repaints with real names. */
     public static void setMonsterNames(String[] names) { monsterNames = names; notifyListeners(); }

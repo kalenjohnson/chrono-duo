@@ -44,7 +44,18 @@ public final class ChronoResources {
 
     private ChronoResources() {}
 
-    /** Extracts one named entry (e.g. "Extension/face.png") to a cache file, or returns the cached copy. */
+    /**
+     * Extracts one named entry (e.g. "Extension/face.png") to a cache file, or
+     * returns the cached copy. Deliberately ALWAYS the true unmodded archive
+     * entry -- {@link OrigArtCache}, {@link com.kalenjohnson.chronoduo.origart.OrigArtRebuilder},
+     * {@link com.kalenjohnson.chronoduo.origart.MapchipRebuilder} and {@link
+     * com.kalenjohnson.chronoduo.origart.WorldchipRebuilder} all rely on this
+     * returning the game's shipped bytes (they fingerprint/reconstruct
+     * against the original, and a mod-substituted size mismatch would make
+     * them silently skip entries). Callers that want the *effective* file a
+     * user mod may have replaced -- i.e. anything drawn on the companion
+     * second-screen UI -- must go through {@link #extractModAware} instead.
+     */
     public static synchronized File extract(Context ctx, AssetManager gameAssets, String entryName)
             throws IOException {
         File dir = cacheDir(ctx);
@@ -72,7 +83,8 @@ public final class ChronoResources {
     /**
      * Batch form for bootstrap-time extraction. Best-effort: entries that fail
      * (missing, archive unreadable, etc.) are logged and left out of the
-     * result rather than aborting the whole batch.
+     * result rather than aborting the whole batch. Always the unmodded
+     * original -- see {@link #extract}'s doc.
      */
     public static Map<String, File> extractAll(Context ctx, AssetManager gameAssets, String[] names) {
         Map<String, File> out = new HashMap<>();
@@ -81,6 +93,42 @@ public final class ChronoResources {
                 out.put(name, extract(ctx, gameAssets, name));
             } catch (IOException e) {
                 Log.w(TAG, "resources.bin extract failed for " + name, e);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Like {@link #extract}, but first asks {@link
+     * com.kalenjohnson.chronoduo.mods.ModManager#resolve} whether a currently
+     * enabled mod wins for {@code entryName}; if so, that mod's file is
+     * returned directly (never copied into the ctres cache, so disabling the
+     * mod and rescanning falls straight back to the archive/cache copy with
+     * no stale leftovers). Falls back to {@link #extract} when no mod claims
+     * the path or {@link com.kalenjohnson.chronoduo.mods.ModManager} hasn't
+     * been constructed yet.
+     *
+     * <p>Use this (never {@link #extract} directly) for anything the
+     * companion second-screen UI decodes and displays -- see {@code
+     * AppActivity#extractCompanionAssets}.
+     */
+    public static File extractModAware(Context ctx, AssetManager gameAssets, String entryName)
+            throws IOException {
+        File modFile = com.kalenjohnson.chronoduo.mods.ModManager.resolveStatic(entryName);
+        if (modFile != null) return modFile;
+        return extract(ctx, gameAssets, entryName);
+    }
+
+    /**
+     * Batch form of {@link #extractModAware}, mirroring {@link #extractAll}.
+     */
+    public static Map<String, File> extractAllModAware(Context ctx, AssetManager gameAssets, String[] names) {
+        Map<String, File> out = new HashMap<>();
+        for (String name : names) {
+            try {
+                out.put(name, extractModAware(ctx, gameAssets, name));
+            } catch (IOException e) {
+                Log.w(TAG, "resources.bin extract (mod-aware) failed for " + name, e);
             }
         }
         return out;

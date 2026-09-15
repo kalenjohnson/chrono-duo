@@ -42,11 +42,18 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // AppActivity at startup.
     public static boolean HIDE_SUBMENUS = true;
 
-    // face.png layout: 4x2 grid of 96x88 tiles, char-id order (Crono..Magus,
-    // Epoch); char ids 0..6 line up with PartySnapshot.DEFAULT_NAMES.
+    // face.png layout: 4x2 grid of 96x88 tiles (384x176 sheet), char-id order
+    // (Crono..Magus, Epoch); char ids 0..6 line up with
+    // PartySnapshot.DEFAULT_NAMES. A mod can ship a differently-sized
+    // face.png that keeps the same 4x2 layout (e.g. higher-res portraits),
+    // so faceTileRect scales these by (actual sheet size / original sheet
+    // size) rather than using them as literal pixels against whatever
+    // ChronoAssets.getFace() currently returns.
     private static final int FACE_TILE_W = 96;
     private static final int FACE_TILE_H = 88;
     private static final int FACE_COLS = 4;
+    private static final int FACE_SHEET_W = FACE_TILE_W * 4;
+    private static final int FACE_SHEET_H = FACE_TILE_H * 2;
 
     private PartySnapshot snap = new PartySnapshot();
 
@@ -1211,7 +1218,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         Bitmap winTex = ChronoAssets.getWindowTex();
         if (winTex != null) {
             float destInset = Math.min(w, h) * 0.09f;
-            drawNinePatch(c, winTex, ChronoAssets.WINDOW_TEX_INSET, box, destInset);
+            drawNinePatch(c, winTex, ChronoAssets.getWindowTexInset(), box, destInset);
             box.inset(5, 5); // match the hand-drawn path's interior padding so content layout is identical
         } else {
             fill.setShader(null);
@@ -1247,7 +1254,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         int charIdx = indexOfName(m.name);
         Bitmap face = ChronoAssets.getFace();
         if (face != null && charIdx >= 0) {
-            Rect src = faceTileRect(charIdx);
+            Rect src = faceTileRect(face, charIdx);
             c.drawBitmap(face, src, pin, portraitPaint);
         } else {
             fill.setColor(charIdx >= 0 ? PORTRAIT_COLORS[charIdx] : Color.DKGRAY);
@@ -1610,7 +1617,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private void drawCommandButton(Canvas c, RectF box, String label, Bitmap winTex, boolean pressed, boolean highlighted) {
         if (winTex != null) {
             float destInset = Math.min(box.width(), box.height()) * 0.16f;
-            drawNinePatch(c, winTex, ChronoAssets.WINDOW_TEX_INSET, box, destInset);
+            drawNinePatch(c, winTex, ChronoAssets.getWindowTexInset(), box, destInset);
         } else {
             fill.setShader(null);
             fill.setColor(BOX_BORDER_OUT);
@@ -1755,7 +1762,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         Bitmap winTex = ChronoAssets.getWindowTex();
         if (winTex != null) {
             float destInset = Math.min(band.width(), band.height()) * 0.08f;
-            drawNinePatch(c, winTex, ChronoAssets.WINDOW_TEX_INSET, band, destInset);
+            drawNinePatch(c, winTex, ChronoAssets.getWindowTexInset(), band, destInset);
         } else {
             fill.setShader(null);
             fill.setColor(BOX_BORDER_OUT);
@@ -1864,7 +1871,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         Bitmap winTex = ChronoAssets.getWindowTex();
         if (winTex != null) {
             float destInset = Math.min(band.width(), band.height()) * 0.08f;
-            drawNinePatch(c, winTex, ChronoAssets.WINDOW_TEX_INSET, band, destInset);
+            drawNinePatch(c, winTex, ChronoAssets.getWindowTexInset(), band, destInset);
         } else {
             fill.setShader(null);
             fill.setColor(BOX_BORDER_OUT);
@@ -3084,10 +3091,21 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         }
     }
 
-    private static Rect faceTileRect(int charIdx) {
+    /**
+     * The source rect for portrait {@code charIdx} within {@code face}
+     * (see {@link ChronoAssets#getFace()}), scaled by {@code face}'s actual
+     * size relative to the original 384x176 sheet -- see the {@link
+     * #FACE_TILE_W} field doc.
+     */
+    private static Rect faceTileRect(Bitmap face, int charIdx) {
         int col = charIdx % FACE_COLS, row = charIdx / FACE_COLS;
-        int x = col * FACE_TILE_W, y = row * FACE_TILE_H;
-        return new Rect(x, y, x + FACE_TILE_W, y + FACE_TILE_H);
+        float scaleX = face.getWidth() / (float) FACE_SHEET_W;
+        float scaleY = face.getHeight() / (float) FACE_SHEET_H;
+        int tileW = Math.round(FACE_TILE_W * scaleX);
+        int tileH = Math.round(FACE_TILE_H * scaleY);
+        int x = Math.round(col * FACE_TILE_W * scaleX);
+        int y = Math.round(row * FACE_TILE_H * scaleY);
+        return new Rect(x, y, x + tileW, y + tileH);
     }
 
     private static int indexOfName(String name) {

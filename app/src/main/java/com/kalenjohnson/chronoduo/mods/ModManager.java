@@ -18,6 +18,7 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -128,20 +129,96 @@ public final class ModManager {
      * (dotfiles/dot-directories skipped everywhere; {@code readme*} and
      * {@code *.txt} skipped only directly at the mod's root, since real
      * assets like {@code Localize/en/msg/tech.txt} live under subdirs and
+        // Same winning (archivePath -> diskPath) pairs as archivePaths/
+        // diskPaths above, keyed by the SAME normalized form gamestate.c's
+        // normalize_archive_path uses (strip one leading "./" then any
+        // leading "/"), for O(1) lookup by ChronoResources#extractModAware /
+        // resolve() below instead of a linear scan. Case-sensitive, matching
+        // the native side's strcmp.
+        public final Map<String, String> archiveToDiskPath;
      * must not be swept up by that rule). The archive path is the file's
      * path relative to the mod directory with {@code '/'} separators.
      *
      * <p>The first mod (in the walk order above) to claim a given archive
      * path wins; every later mod that names the same path has that file
+            Map<String, String> map = new java.util.HashMap<>(archivePaths.length * 2);
+            for (int i = 0; i < archivePaths.length; i++) {
+                map.put(normalizeArchivePath(archivePaths[i]), diskPaths[i]);
+            }
+            this.archiveToDiskPath = map;
      * counted as a conflict against IT (the loser), and that file is
      * excluded from the returned registration arrays -- the winning mod's
      * claim is unaffected.
+    /**
+     * Strips a single leading "./" and then any number of leading "/" from an
+     * archive path, exactly mirroring gamestate.c's {@code
+     * normalize_archive_path} -- must be applied identically here and on the
+     * native side or a mod entry silently misses. Case is left untouched:
+     * the native side compares with {@code strcmp}.
+     */
+    public static String normalizeArchivePath(String p) {
+        if (p == null) return "";
+        int i = 0;
+        if (p.startsWith("./")) i = 2;
+        while (i < p.length() && p.charAt(i) == '/') i++;
+        return p.substring(i);
+    }
+
+    // Set at the end of the constructor; read by the static resolveStatic()
+    // helper ChronoResources#extractModAware calls. Volatile: constructed on
+    // the main thread at boot, read from whatever thread runs companion asset
+    // extraction. Null until AppActivity constructs its ModManager -- callers
+    // must treat that as "no mods" (fall back to the archive), never as an
+    // error; see ChronoResources#extractModAware.
+    private static volatile ModManager instance;
+
      *
      * <p>Pure and Android-free: touches only {@code java.io}, so it can run
      * on a plain JVM.
      */
     public static ScanResult collect(File modsRoot) {
         List<File> modDirs = new ArrayList<>();
+        instance = this;
+    }
+
+    /**
+     * Resolves {@code archivePath} (e.g. {@code "Extension/face.png"}) to the
+     * on-disk file of the mod currently winning that path, or {@code null} if
+     * no enabled mod claims it or no scan has run yet. Backed by the same
+     * winner map {@link #scan()}/{@link #collect} builds -- reflects
+     * whatever the most recent scan registered natively, kept in memory here
+     * so this doesn't need to re-walk the mods directory per lookup.
+     */
+    public File resolve(String archivePath) {
+        return resolveFromResult(lastResult, archivePath);
+    }
+
+    /**
+     * Pure helper backing {@link #resolve(String)} -- split out so the
+     * winner-precedence/normalization/disabled-exclusion behavior can be
+     * exercised on a plain JVM against a {@link ScanResult} from {@link
+     * #collect}, without going through {@link #scan()} (which touches
+     * {@link com.kalenjohnson.chronoduo.GameState}, and so requires the
+     * native library). {@code result} may be {@code null} (no scan yet),
+     * which resolves everything to {@code null}.
+     */
+    public static File resolveFromResult(ScanResult result, String archivePath) {
+        if (result == null) return null;
+        String disk = result.archiveToDiskPath.get(normalizeArchivePath(archivePath));
+        return disk != null ? new File(disk) : null;
+    }
+
+    /**
+     * Static convenience for call sites (like {@link
+     * com.kalenjohnson.chronoduo.ChronoResources#extractModAware}) with no
+     * direct reference to the app's single {@link ModManager}. Safe to call
+     * before the instance exists (constructed once from AppActivity) -- an
+     * uninitialized loader is treated as "no mods", returning {@code null} so
+     * the caller falls back to the archive.
+     */
+    public static File resolveStatic(String archivePath) {
+        ModManager m = instance;
+        return m != null ? m.resolve(archivePath) : null;
         File[] children = modsRoot.isDirectory() ? modsRoot.listFiles() : null;
         if (children != null) {
             for (File f : children) {

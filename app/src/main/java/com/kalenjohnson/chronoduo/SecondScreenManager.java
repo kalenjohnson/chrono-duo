@@ -53,6 +53,25 @@ public final class SecondScreenManager {
     // below and the class doc's recovery notes.
     private PartyPanelView.SettingsHost settingsHost;
 
+    /**
+     * Notified with the panel every time {@link #show} builds a fresh
+     * {@link SecondScreenPresentation} -- i.e. whenever the panel's own
+     * state (whatever AppActivity previously pushed via its {@code setX}
+     * methods, like the mods list/catalog) has just been reset to its
+     * construction-time defaults. AppActivity uses this to re-push
+     * currently-known state so a Presentation torn down and recreated by the
+     * system (sleep/wake being the common case -- see the class doc) comes
+     * back showing the same thing rather than blank/idle. See {@link
+     * #setPanelListener}.
+     */
+    public interface PanelListener {
+        void onPanelAttached(PartyPanelView panel);
+    }
+
+    // Mirrors settingsHost above: set once from AppActivity, invoked for
+    // every panel this manager creates (not just the first).
+    private PanelListener panelListener;
+
     private final DisplayManager.DisplayListener listener = new DisplayManager.DisplayListener() {
         @Override public void onDisplayAdded(int displayId) { update(); }
         @Override public void onDisplayRemoved(int displayId) { update(); }
@@ -109,6 +128,19 @@ public final class SecondScreenManager {
         settingsHost = host;
         PartyPanelView panel = getPanel();
         if (panel != null) panel.setSettingsHost(host);
+    }
+
+    /**
+     * Sets (or clears, with null) the listener notified whenever a fresh
+     * panel is created -- see {@link PanelListener}. Does NOT fire
+     * immediately for an already-showing panel (unlike {@link
+     * #setSettingsHost}): this is called once from {@code AppActivity#onCreate}
+     * before the first panel ever exists (the first {@link #show} happens
+     * later, from {@link #onResume}), so there is nothing to catch up on at
+     * registration time.
+     */
+    public void setPanelListener(PanelListener listener) {
+        panelListener = listener;
     }
 
     public void onDestroy() {
@@ -186,9 +218,10 @@ public final class SecondScreenManager {
         try {
             p.show();
             presentation = p;
-            if (settingsHost != null) {
-                PartyPanelView panel = p.getPanel();
-                if (panel != null) panel.setSettingsHost(settingsHost);
+            PartyPanelView panel = p.getPanel();
+            if (panel != null) {
+                if (settingsHost != null) panel.setSettingsHost(settingsHost);
+                if (panelListener != null) panelListener.onPanelAttached(panel);
             }
             Log.i(TAG, "presentation shown on display " + display.getDisplayId());
         } catch (WindowManager.InvalidDisplayException | SecurityException e) {

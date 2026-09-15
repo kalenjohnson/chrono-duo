@@ -194,6 +194,20 @@ public class AppActivity extends Cocos2dxActivity {
                 AppActivity.this.requestModGet(id);
             }
         });
+        // A Presentation the system tears down and recreates behind our
+        // back (sleep/wake being the common trigger -- see
+        // SecondScreenManager's class doc) gets a brand-new PartyPanelView,
+        // which starts from field defaults: the Mods page's installed-mod
+        // list and catalog (pushed only at scan/catalog-load time, never
+        // re-pushed) would silently go blank until the next mod action.
+        // Re-push them here. The other push-once state (DS-ROM import,
+        // save-import, and original-art rebuild progress) is intentionally
+        // NOT replayed: each already treats a freshly-defaulted idle state
+        // as correct by design (see PartyPanelView#setImportStatus/
+        // #setOrigArtStatus's doc -- idle falls back to counting files
+        // already on disk; #setSaveImportStatus's idle is just "no message
+        // yet", which is already true of a fresh panel).
+        secondScreen.setPanelListener(this::onSecondScreenPanelAttached);
         controllerInput.ensureConnected();
         // Physical hat-axis d-pad left/right (see GameControllerInput.
         // handleMotionEvent) offers to the panel's command-row navigation
@@ -221,7 +235,6 @@ public class AppActivity extends Cocos2dxActivity {
                 return panel != null && panel.onControllerConfirm();
             }
         });
-        extractCompanionAssets();
         renderWorldMaps();
         // Original-sprite replacements ride on the pixel-graphics preference.
         if (com.kalenjohnson.chronoduo.GameState.getPixelGraphicsPref(this)) scanOrigArtReplacements();
@@ -232,6 +245,13 @@ public class AppActivity extends Cocos2dxActivity {
         // first getData() sees the mod table. Walking a few thousand files
         // takes tens of ms. Later rescans (import/toggle) go through the
         // background-thread scanMods().
+        //
+        // This MUST run before extractCompanionAssets() below: ModManager's
+        // constructor publishes the static holder ChronoResources#
+        // extractModAware reads (via ModManager#resolveStatic), and scan()
+        // populates the winner map that backs it -- extracting the
+        // companion-UI art first would race that (or simply miss it) and the
+        // second screen would show unmodded art until the next import/toggle.
         modManager = new com.kalenjohnson.chronoduo.mods.ModManager(ext != null ? ext : getFilesDir());
         try {
             modManager.scan();
@@ -239,6 +259,7 @@ public class AppActivity extends Cocos2dxActivity {
             Log.e(TAG, "boot mod scan failed", t);
         }
         updateModsStatus(false, null);
+        extractCompanionAssets();
         loadModCatalog();
         // A .ctp opened from outside (browser download, file manager, "Open
         // with" on a shared file) before the app was running arrives as the
@@ -548,13 +569,17 @@ public class AppActivity extends Cocos2dxActivity {
                         "Game/common/TechnicMpTable.dat",
                         "Game/common/TechnicBaseDataTable.dat",
                 };
+                // Mod-aware: a mod that replaces any of these paths (portraits,
+                // window chrome, marker tiles, name/message tables, ...) wins
+                // here, unlike renderWorldMaps()'s extractAll -- see
+                // ChronoResources#extractModAware and #extract's doc.
                 java.util.Map<String, File> files =
-                        com.kalenjohnson.chronoduo.ChronoResources.extractAll(appCtx, gameAssets, names);
+                        com.kalenjohnson.chronoduo.ChronoResources.extractAllModAware(appCtx, gameAssets, names);
 
                 final android.graphics.Bitmap face = decodeBitmap(files.get("Extension/face.png"));
                 final android.graphics.Bitmap mark = cropMarkerTile(files.get("Game/common/minimap_mark.png"));
                 final android.graphics.Bitmap epochMark = cropEpochTile(files.get("Game/common/minimap_mark.png"));
-                final android.graphics.Bitmap windowTex = cropWindowTexture(files.get("Extension/menu_win.png"));
+                final WindowTexResult windowTex = cropWindowTexture(files.get("Extension/menu_win.png"));
                 final String[] monsterNames = readNameTable(files.get("Localize/en/msg/monster.txt"));
                 final String[] techNames = readNameTable(files.get("Localize/en/msg/tech.txt"));
                 final String[] itemNames = readNameTable(files.get("Localize/en/msg/item.txt"));
@@ -570,7 +595,7 @@ public class AppActivity extends Cocos2dxActivity {
                     if (face != null) com.kalenjohnson.chronoduo.ChronoAssets.setFace(face);
                     if (mark != null) com.kalenjohnson.chronoduo.ChronoAssets.setMinimapMark(mark);
                     if (epochMark != null) com.kalenjohnson.chronoduo.ChronoAssets.setEpochMark(epochMark);
-                    if (windowTex != null) com.kalenjohnson.chronoduo.ChronoAssets.setWindowTex(windowTex);
+                    if (windowTex != null) com.kalenjohnson.chronoduo.ChronoAssets.setWindowTex(windowTex.bitmap, windowTex.inset);
                     if (monsterNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setMonsterNames(monsterNames);
                     if (techNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setTechNames(techNames);
                     if (itemNames != null) com.kalenjohnson.chronoduo.ChronoAssets.setItemNames(itemNames);
@@ -711,7 +736,24 @@ public class AppActivity extends Cocos2dxActivity {
         new Thread(() -> {
             mm.scan();
             updateModsStatus(false, null);
+            refreshCompanionAssetsForModChange();
         }, "ChronoModScan").start();
+    }
+
+    /**
+     * Re-runs {@link #extractCompanionAssets()} after any mod scan that
+     * follows the boot scan (import, enable/disable toggle, catalog "Get") --
+     * see {@link com.kalenjohnson.chronoduo.ChronoResources#extractModAware}.
+     * The boot scan itself doesn't need this: it runs before
+     * {@link #extractCompanionAssets()}'s first call in {@link #onCreate},
+     * so that first decode already sees whatever mods were enabled at
+     * launch. {@link com.kalenjohnson.chronoduo.ChronoAssets}'s setters all
+     * call their listeners, so PartyPanelView repaints as soon as the
+     * re-decoded bitmaps land -- no separate cache-invalidation step is
+     * needed on the panel side.
+     */
+    private void refreshCompanionAssetsForModChange() {
+        extractCompanionAssets();
     }
 
     /** Launches the SAF document picker so the user can pick a mod archive (.ctp/.zip). Mirrors {@link #launchSavePicker()}. */
@@ -789,6 +831,7 @@ public class AppActivity extends Cocos2dxActivity {
             if (e.id.equals(id)) return e;
         }
         return null;
+            refreshCompanionAssetsForModChange();
     }
 
     /**
@@ -1005,16 +1048,39 @@ public class AppActivity extends Cocos2dxActivity {
     // directly (bitmap origin becomes the panel's own top-left).
     private static final int WIN_TEX_L = 198, WIN_TEX_T = 134, WIN_TEX_R = 500, WIN_TEX_B = 304;
 
-    private static android.graphics.Bitmap cropWindowTexture(File f) {
+    /** {@link #cropWindowTexture}'s result: the cropped 9-slice source plus the corner/edge inset scaled to match (see {@link com.kalenjohnson.chronoduo.ChronoAssets#WINDOW_TEX_INSET_DEFAULT}). */
+    private static final class WindowTexResult {
+        final android.graphics.Bitmap bitmap;
+        final int inset;
+        WindowTexResult(android.graphics.Bitmap bitmap, int inset) {
+            this.bitmap = bitmap;
+            this.inset = inset;
+        }
+    }
+
+    private static WindowTexResult cropWindowTexture(File f) {
         android.graphics.Bitmap sheet = decodeBitmap(f);
         if (sheet == null) return null;
-        if (sheet.getWidth() < WIN_TEX_R || sheet.getHeight() < WIN_TEX_B) {
+        float scaleX = sheet.getWidth() / (float) WIN_TEX_SHEET_W;
+        float scaleY = sheet.getHeight() / (float) WIN_TEX_SHEET_H;
+        int l = Math.round(WIN_TEX_L * scaleX);
+        int t = Math.round(WIN_TEX_T * scaleY);
+        int r = Math.min(Math.round(WIN_TEX_R * scaleX), sheet.getWidth());
+        int b = Math.min(Math.round(WIN_TEX_B * scaleY), sheet.getHeight());
+        if (r <= l || b <= t) {
             Log.w(TAG, "menu_win.png smaller than expected, skipping window texture crop");
             return null;
         }
         try {
-            return android.graphics.Bitmap.createBitmap(sheet, WIN_TEX_L, WIN_TEX_T,
-                    WIN_TEX_R - WIN_TEX_L, WIN_TEX_B - WIN_TEX_T);
+            android.graphics.Bitmap cropped = android.graphics.Bitmap.createBitmap(sheet, l, t, r - l, b - t);
+            // Same beveled-border thickness as the un-scaled original (16px
+            // of a 302x170 crop), scaled by the same factor as the crop
+            // itself so a higher-res mod's border reads at the same relative
+            // thickness instead of looking thin (or, upscaled the other way,
+            // blown out).
+            int inset = Math.max(1, Math.round(
+                    com.kalenjohnson.chronoduo.ChronoAssets.WINDOW_TEX_INSET_DEFAULT * ((scaleX + scaleY) / 2f)));
+            return new WindowTexResult(cropped, inset);
         } catch (Exception e) {
             Log.w(TAG, "window texture crop failed", e);
             return null;
@@ -1032,12 +1098,16 @@ public class AppActivity extends Cocos2dxActivity {
     private static android.graphics.Bitmap cropMarkerTile(File f) {
         android.graphics.Bitmap sheet = decodeBitmap(f);
         if (sheet == null) return null;
-        if (sheet.getWidth() < 32 || sheet.getHeight() < 16) {
+        float scaleX = sheet.getWidth() / (float) MARK_SHEET_W;
+        float scaleY = sheet.getHeight() / (float) MARK_SHEET_H;
+        int x = Math.round(16 * scaleX), y = Math.round(0 * scaleY);
+        int w = Math.round(16 * scaleX), h = Math.round(16 * scaleY);
+        if (sheet.getWidth() < x + w || sheet.getHeight() < y + h) {
             Log.w(TAG, "minimap_mark.png smaller than expected, skipping marker tile crop");
             return null;
         }
         try {
-            return android.graphics.Bitmap.createBitmap(sheet, 16, 0, 16, 16);
+            return android.graphics.Bitmap.createBitmap(sheet, x, y, w, h);
         } catch (Exception e) {
             Log.w(TAG, "marker tile crop failed", e);
             return null;
@@ -1051,12 +1121,16 @@ public class AppActivity extends Cocos2dxActivity {
     private static android.graphics.Bitmap cropEpochTile(File f) {
         android.graphics.Bitmap sheet = decodeBitmap(f);
         if (sheet == null) return null;
-        if (sheet.getWidth() < 48 || sheet.getHeight() < 16) {
+        float scaleX = sheet.getWidth() / (float) MARK_SHEET_W;
+        float scaleY = sheet.getHeight() / (float) MARK_SHEET_H;
+        int x = Math.round(32 * scaleX), y = Math.round(0 * scaleY);
+        int w = Math.round(16 * scaleX), h = Math.round(16 * scaleY);
+        if (sheet.getWidth() < x + w || sheet.getHeight() < y + h) {
             Log.w(TAG, "minimap_mark.png smaller than expected, skipping Epoch tile crop");
             return null;
         }
         try {
-            return android.graphics.Bitmap.createBitmap(sheet, 32, 0, 16, 16);
+            return android.graphics.Bitmap.createBitmap(sheet, x, y, w, h);
         } catch (Exception e) {
             Log.w(TAG, "Epoch tile crop failed", e);
             return null;
@@ -1074,6 +1148,15 @@ public class AppActivity extends Cocos2dxActivity {
             Log.w(TAG, "battle snapshot copy failed: " + src + " -> " + dst, e);
         }
     }
+    //
+    // All of the crop rects below (this one and minimap_mark.png's tiles)
+    // are pixel coordinates measured against the ORIGINAL sheet size. A mod
+    // can ship a differently-sized replacement (e.g. a higher-res face.png
+    // or menu_win.png) that keeps the same relative layout, so every rect is
+    // scaled by (actual sheet size / original sheet size) before use rather
+    // than applied as literal pixels -- see PartyPanelView#faceTileRect for
+    // the same treatment of the portrait grid.
+    private static final int WIN_TEX_SHEET_W = 512, WIN_TEX_SHEET_H = 512;
 
     private static android.graphics.Bitmap decodeBitmap(File f) {
         if (f == null) return null;
@@ -1100,6 +1183,8 @@ public class AppActivity extends Cocos2dxActivity {
             Log.w(TAG, "failed to read name table: " + f, e);
             return null;
         }
+    private static final int MARK_SHEET_W = 48, MARK_SHEET_H = 16;
+
     }
 
     /**
