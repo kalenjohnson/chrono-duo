@@ -1237,7 +1237,10 @@ public class AppActivity extends Cocos2dxActivity {
      * {@code pick_template}).
      */
     private List<com.kalenjohnson.chronoduo.saveimport.SaveConverter.TemplateCandidate> loadSaveTemplates() throws java.io.IOException {
-        String[] names = getAssets().list("save_templates");
+        // getAssets() is overridden to serve the GAME's APK (see above); the
+        // templates live in our own APK, so go through the unoverridden path.
+        AssetManager ownAssets = super.getAssets();
+        String[] names = ownAssets.list("save_templates");
         if (names == null || names.length == 0) {
             throw new java.io.IOException("no save templates bundled with the app");
         }
@@ -1245,7 +1248,7 @@ public class AppActivity extends Cocos2dxActivity {
         List<com.kalenjohnson.chronoduo.saveimport.SaveConverter.TemplateCandidate> out = new ArrayList<>();
         for (String name : names) {
             if (!name.endsWith(".bin")) continue;
-            try (java.io.InputStream in = getAssets().open("save_templates/" + name)) {
+            try (java.io.InputStream in = ownAssets.open("save_templates/" + name)) {
                 byte[] data = com.kalenjohnson.chronoduo.saveimport.SaveImporter.readAll(in);
                 byte[] payload = com.kalenjohnson.chronoduo.saveimport.CtContainer.decrypt(data);
                 out.add(new com.kalenjohnson.chronoduo.saveimport.SaveConverter.TemplateCandidate(name, payload));
@@ -1263,6 +1266,12 @@ public class AppActivity extends Cocos2dxActivity {
         new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
             PartyPanelView panel = secondScreen != null ? secondScreen.getPanel() : null;
             if (panel != null) panel.setSaveImportStatus(importing, message, error);
+            // The settings screen may already have closed by the time the picker
+            // returns, so the final result also goes up as a toast on the game screen.
+            if (!importing && message != null) {
+                android.widget.Toast.makeText(this, (error ? "Save import failed: " : "") + message,
+                        android.widget.Toast.LENGTH_LONG).show();
+            }
         });
     }
 
