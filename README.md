@@ -7,7 +7,9 @@
 A dual-screen host for **Chrono Trigger (Upgrade Ver.)** on dual-screen Android
 handhelds such as the Ayn Thor. The real game runs full-widescreen on the top
 screen while the bottom screen becomes a DS-style companion display: a live
-world map, party status, and the whole battle command menu.
+world map, party status, and the whole battle command menu. On top of that
+ChronoDuo adds the things the mobile port never had: a mod manager, SNES and
+DS save import, fast-forward, true widescreen, and original pixel art.
 
 ChronoDuo ships **no game code or assets**. It loads the official Chrono
 Trigger Android app you already own, inside its own process, and drives the
@@ -37,6 +39,10 @@ second screen through Android's standard `Presentation` API.
 3. Launch **ChronoDuo** instead of Chrono Trigger. The game boots on the top
    screen and the companion display appears on the bottom.
 
+ChronoDuo keeps its own saves, separate from the Google Play game's. Update
+by installing over the old APK; uninstalling removes settings, mods, and
+saves.
+
 ## What the bottom screen does
 
 - **Overworld map** in a sepia, torn-parchment style with a live position
@@ -47,24 +53,53 @@ second screen through Android's standard `Presentation` API.
   live HP and MP.
 - **Battle mirroring**: the Attack/Tech/Item menu and the Tech and Item
   lists move to the bottom screen, driven by the d-pad, so the top screen
-  stays HUD-free. Enemy HP bars honor the game's hidden-info design by
-  default, with an eye toggle to reveal them.
-- **Indoor area maps** with a live marker once you import your DS ROM.
-- **Original pixel art**: a settings toggle rebuilds the unfiltered SNES-style
-  character sprites, field chip sheets, and overworld tiles from the 1x art
-  the game itself ships.
+  stays HUD-free. An **AUTO** chip toggles the game's Auto Battle mode.
+  Enemy HP bars honor the game's hidden-info design by default, with an eye
+  toggle to reveal them.
+- **Indoor area maps** with a live marker once you import your DS ROM, with
+  a DS-style **fog of war** that reveals dungeon rooms as you explore them.
 
 <p align="center">
   <img src="docs/screenshots/battle.webp" width="420" alt="Battle with the Attack, Tech and Item menu mirrored to the bottom screen">
   <img src="docs/screenshots/forest.webp" width="420" alt="Guardia Forest with the DS area map on the bottom screen">
 </p>
 
+## Game features
+
+- **True widescreen**: the mobile port crops 64 rows off the SNES frame.
+  This shows the full 224 rows plus the extra width of a 16:9 screen.
+- **Fast-forward**: hold or toggle R2 to run the game at 2x, 3x, or 5x.
+- **Original pixel art**: rebuilds the unfiltered SNES-style sprites, field
+  chips, and overworld tiles from the 1x art the game itself ships, with
+  nearest-neighbour filtering.
+- **Save import**: load a SNES (`.srm`) or DS (`.sav`, `.dst`, `.duc`,
+  `.dsv`) save into a save slot.
+
+## Mods
+
+ChronoDuo has a built-in mod manager. Mods are applied as a file overlay on
+top of the game's own assets; the Google Play install is never modified.
+
+- **Curated catalog** under Settings > Mods: Pixel Demaster, SNES Overworld
+  Sprites Restoration, SNES Wood Menu, Orchestral Wonders, FMV's Remastered,
+  and more. Tap **Get** to open the mod's Nexus Mods page on the bottom
+  screen and download it straight into ChronoDuo.
+- **Import anything else** from a file, or open a `.ctp` with ChronoDuo.
+  Loose files, `.ctp`, `.zip`, `.7z`, and RAR4 are supported.
+- **Multi-part mods** such as Pixel Demaster show up as one row with option
+  pickers for each of their choices.
+- **Whole-archive mods** such as full music repacks install as an overlay of
+  just the changed files.
+- **Cutscene and font mods** work: replacement FMVs and custom in-game fonts.
+- Mods live under `Android/data/com.kalenjohnson.chronoduo/files/mods/` and
+  can be dropped there by hand. If two mods change the same file, the one
+  that sorts first alphabetically wins.
+
 ### Settings
 
-Tap the gear in the top-left corner of the bottom screen (outside battle) to
-open settings. There you can import a DS ROM through the system file picker,
-build the original pixel-art sheets, and see how many world maps have been
-rendered.
+Tap the gear in the top-left corner of the bottom screen (outside battle),
+or use the d-pad. Tabs: Imports (DS ROM, saves), Graphics (pixel art,
+widescreen), Maps (fog of war), Speed, and Mods.
 
 ## Build from source
 
@@ -85,29 +120,30 @@ Adjust it, or override on the command line:
 ### Releases
 
 GitHub Actions builds every push. Pushes to `main` refresh the rolling
-**Latest build** pre-release; a `v*` tag creates a versioned release. See
-`NOTES.md` for signing setup.
+**Latest build** pre-release; a `v*` tag creates a versioned release whose
+notes come from `docs/releases/v<version>.md`. See `NOTES.md` for signing
+setup.
 
 ## How it works
 
 At startup ChronoDuo locates the game install, extracts its `libchrono.so`
 and `libc++_shared.so` into private storage, points the engine's asset
 loading at the game's own APK, and boots the engine inside ChronoDuo's
-process. A small native helper reads the live game state (party, map
-position, battle) and the Java side draws the companion screen.
+process. A small native helper reads the live game state and hooks the
+engine for widescreen, fast-forward, mods, and HUD hiding; the Java side
+draws the companion screen.
 
-`NOTES.md` is the full research and design record: the memory layout, the
-battle UI work, the DS map decoder, and the on-device art rebuilds. The
-`tools/` directory holds the Python and Java verification scripts and their
-reports.
+`NOTES.md` is the full research and design record. The `tools/` directory
+holds the verification scripts and their reports.
 
 ## License
 
 ChronoDuo is released under the [MIT License](LICENSE).
 `THIRD_PARTY_NOTICES.md` covers bundled third-party code: the vendored
-`org.cocos2dx.lib` Java classes from cocos2d-x 3.14.1 (MIT) and
-android-async-http (Apache 2.0).
+`org.cocos2dx.lib` Java classes from cocos2d-x 3.14.1 (MIT) and the
+libraries pulled in for networking and mod archive extraction.
 
 Chrono Trigger is the property of Square Enix. No Square Enix assets or code
 are included. The app loads the official Android game you have installed,
-and the optional indoor maps are decoded on your device from your own DS ROM.
+the optional indoor maps are decoded on your device from your own DS ROM,
+and mods are files you download or add yourself.

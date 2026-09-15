@@ -36,6 +36,27 @@ same terms:
 Fetched by Gradle (`com.loopj.android:android-async-http`), required only
 because the game engine looks up `Cocos2dxDownloader` at startup.
 
+## Apache Commons Compress 1.28.0 (Apache License 2.0)
+
+Fetched by Gradle (`org.apache.commons:commons-compress`). Used by the mod
+loader to read `.zip` and `.7z` mod archives.
+
+## XZ for Java 1.10 (0BSD)
+
+Fetched by Gradle (`org.tukaani:xz`). LZMA/XZ decompression for `.7z`
+archives, pulled in alongside Commons Compress.
+
+## junrar 8.1.1 (UnRAR license)
+
+Fetched by Gradle (`com.github.junrar:junrar`). Used by the mod loader to
+extract RAR4 mod archives. The UnRAR license permits extraction only; this
+project never creates RAR archives.
+
+## SLF4J API 2.0.19 (MIT)
+
+Fetched by Gradle (`org.slf4j:slf4j-api`), required by junrar as its logging
+facade. No binding is shipped, so it is a no-op logger.
+
 ## Not included
 
 Chrono Trigger, its Android application, native library, and assets are the
