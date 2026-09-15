@@ -269,6 +269,15 @@ public final class ModManager {
 
     private final File root;
     private volatile ScanResult lastResult;
+    // Cached alongside lastResult by scan() so the Android-facing groups()
+    // instance method (called from AppActivity's main thread on every panel
+    // attach/status push -- see that class's onSecondScreenPanelAttached/
+    // updateModsStatus) never re-reads every mod dir's .group file itself;
+    // set together with lastResult so the two are never out of sync with
+    // each other (a group list built from a different scan than the mod
+    // list it's paired with could otherwise resolve a dir that isn't in
+    // that mod list -- see ModCatalog#findInstalledDirName's doc).
+    private volatile GroupResult lastGroups;
 
     /** {@code externalFilesDir} is the app's external files directory (see AppActivity's {@code getExternalFilesDir(null)}); the mod root is {@code <externalFilesDir>/mods}. */
     public ModManager(File externalFilesDir) {
@@ -567,6 +576,7 @@ public final class ModManager {
     public int scan() {
         ScanResult result = collect(root);
         lastResult = result;
+        lastGroups = groups(root, result);
         int registered = com.kalenjohnson.chronoduo.GameState.nativeRegisterModSubstitutions(
                 result.archivePaths, result.diskPaths);
         int conflicts = 0;
@@ -1516,25 +1526,31 @@ public final class ModManager {
     /**
      * Imports a mod obtained through the curated catalog (see {@code
      * com.kalenjohnson.chronoduo.mods.ModCatalog} and {@code
-     * AppActivity#downloadAndImportMod}/{@code #handleViewIntent}): unpacks
-     * {@code in} under this instance's mod root using the exact directory
-     * name {@code id} (a catalog slug -- see {@link #importArchiveNamed}),
-     * writes a {@code .source} provenance file recording {@code sourceUrl}
-     * into EVERY mod directory this produces (best-effort; a failure to
-     * write it doesn't fail the import -- {@code scan()}'s dotfile skip at
-     * the mod root already ignores it either way; a multi-archive download
-     * -- see {@link #extractZip} -- can produce more than one), then
-     * rescans.
+     * AppActivity#downloadAndImportMod}/{@code #handleViewIntent}): first
+     * removes any existing mod directory that represents the SAME catalog
+     * download under a DIFFERENT name (see {@link #removeConflictingMods} --
+     * a manual import from before the catalog existed, or a previous
+     * catalog id/fileHint), so a re-Get replaces rather than duplicates it;
+     * then unpacks {@code in} under this instance's mod root using the exact
+     * directory name {@code id} (a catalog slug -- see {@link
+     * #importArchiveNamed}), writes a {@code .source} provenance file
+     * recording {@code sourceUrl} into EVERY mod directory this produces
+     * (best-effort; a failure to write it doesn't fail the import -- {@code
+     * scan()}'s dotfile skip at the mod root already ignores it either way;
+     * a multi-archive download -- see {@link #extractZip} -- can produce
+     * more than one), then rescans.
      *
      * @return the import result (mod directories created)
      */
-    public ImportResult importCatalogMod(InputStream in, String id, String sourceUrl) throws IOException {
-        return importCatalogMod(in, id, sourceUrl, null);
+    public ImportResult importCatalogMod(InputStream in, String id, String fileHint, String sourceUrl)
+            throws IOException {
+        return importCatalogMod(in, id, fileHint, sourceUrl, null);
     }
 
-    /** Like {@link #importCatalogMod(InputStream, String, String)}, reporting extraction progress -- see {@link ProgressCallback}. */
-    public ImportResult importCatalogMod(InputStream in, String id, String sourceUrl, ProgressCallback progress)
-            throws IOException {
+    /** Like {@link #importCatalogMod(InputStream, String, String, String)}, reporting extraction progress -- see {@link ProgressCallback}. */
+    public ImportResult importCatalogMod(InputStream in, String id, String fileHint, String sourceUrl,
+                                          ProgressCallback progress) throws IOException {
+        removeConflictingMods(root, id, fileHint);
         ImportResult result = importArchiveNamed(in, root, id, progress);
         writeSourceMarkers(result, sourceUrl);
         scan();
@@ -1543,19 +1559,63 @@ public final class ModManager {
 
     /**
      * File-based counterpart of {@link #importCatalogMod(InputStream,
-     * String, String)}, for a caller that already has the archive on disk
-     * (see {@link #importArchiveFileNamed}'s doc -- {@code
+     * String, String, String)}, for a caller that already has the archive on
+     * disk (see {@link #importArchiveFileNamed}'s doc -- {@code
      * AppActivity#downloadAndImportMod}'s download temp file is exactly
      * this case, and this is the entry point that lets it report byte-
      * accurate extraction progress for a multi-GB 7z/zip/RAR mod instead of
      * spooling through {@link InputStream}).
      */
-    public ImportResult importCatalogMod(File archiveFile, String id, String sourceUrl, ProgressCallback progress)
-            throws IOException {
+    public ImportResult importCatalogMod(File archiveFile, String id, String fileHint, String sourceUrl,
+                                          ProgressCallback progress) throws IOException {
+        removeConflictingMods(root, id, fileHint);
         ImportResult result = importArchiveFileNamed(archiveFile, root, id, progress);
         writeSourceMarkers(result, sourceUrl);
         scan();
         return result;
+    }
+
+    /**
+     * Deletes every existing mod directory directly under {@code modsRoot}
+     * that represents the SAME catalog download as {@code (id, fileHint)}
+     * is about to (re)install, so {@link #importCatalogMod} replaces rather
+     * than duplicates an install that previously landed under a different
+     * name -- e.g. a manual "Import file..." of "PixelDemaster - Main File"
+     * (etc.) done before the catalog existed, followed by a catalog Get of
+     * {@code pixel-demaster} that would otherwise ALSO install as
+     * "pixel-demaster - Main File" side by side with the old one. A
+     * directory matches if its own name starts with {@code id + " - "}
+     * (case-insensitive -- the shared prefix {@link #subModName} gives
+     * every sub-mod of a download imported under this id), or if its {@code
+     * .group} marker (see {@link #writeGroup}/{@link #readGroupMarker})
+     * equals {@code id} (case-insensitive) or, when {@code fileHint} is
+     * non-null/non-empty, contains it (case-insensitive) -- covering a
+     * download whose {@code .group} is the OLD raw display name (e.g.
+     * "PixelDemaster") rather than today's catalog id. Never matches a
+     * plain unrelated mod. Best-effort/pure {@code java.io}; a dir that
+     * fails to delete is simply left behind (same as {@link
+     * #deleteRecursive}'s contract) rather than failing the whole import.
+     */
+    static void removeConflictingMods(File modsRoot, String id, String fileHint) {
+        File[] children = modsRoot.listFiles();
+        if (children == null) return;
+        String idLower = id.toLowerCase(Locale.ROOT);
+        String prefix = idLower + " - ";
+        String hintLower = fileHint != null && !fileHint.isEmpty()
+                ? fileHint.toLowerCase(Locale.ROOT) : null;
+        for (File dir : children) {
+            if (!dir.isDirectory()) continue;
+            String nameLower = dir.getName().toLowerCase(Locale.ROOT);
+            boolean matches = nameLower.startsWith(prefix);
+            if (!matches) {
+                String group = readGroupMarker(dir);
+                if (group != null) {
+                    String groupLower = group.toLowerCase(Locale.ROOT);
+                    matches = groupLower.equals(idLower) || (hintLower != null && groupLower.contains(hintLower));
+                }
+            }
+            if (matches) deleteRecursive(dir);
+        }
     }
 
     private void writeSourceMarkers(ImportResult result, String sourceUrl) {
@@ -1584,13 +1644,8 @@ public final class ModManager {
 
     // --- enable/disable ---------------------------------------------------------
 
-    /**
-     * Enables or disables the mod named {@code name} by deleting/creating a
-     * {@code .disabled} marker file in its directory, then rescans. A no-op
-     * (still rescans) if the mod directory doesn't exist.
-     */
-    public void setEnabled(String name, boolean enabled) {
-        File modDir = new File(root, name);
+    /** Deletes/creates {@code <modDir>/.disabled} -- the shared marker-flip primitive behind {@link #setEnabled} and {@link #applySelectOption}. Best-effort: a failure to create the marker is logged, not thrown. */
+    private static void setMarker(File modDir, boolean enabled) {
         File marker = new File(modDir, DISABLED_MARKER);
         if (enabled) {
             marker.delete();
@@ -1598,9 +1653,246 @@ public final class ModManager {
             try {
                 if (!marker.exists()) marker.createNewFile();
             } catch (IOException e) {
-                Log.w(TAG, "mods: could not disable " + name, e);
+                Log.w(TAG, "mods: could not update marker for " + modDir, e);
             }
         }
+    }
+
+    /**
+     * Applies "mod toggled" semantics for {@code name} within {@code gr}:
+     * flips its own {@code .disabled} marker to {@code enabled}, and, if
+     * (and only if) {@code name} is the <b>main</b> mod of a {@link
+     * ModGroup} (see {@link #groups}) being turned OFF, disables every one
+     * of that group's option choices too -- a "None" install shouldn't
+     * leave a Font/UI/etc. sub-mod loaded behind the user's back. Turning
+     * the main mod back ON only re-enables itself; the user's previous
+     * option choices, if any, are left exactly as they were (per the
+     * class's multi-mod-split doc, a fresh import already starts every
+     * option disabled, so "back on with nothing chosen" is already the
+     * default). A plain mod (no group) or an option sub-dir gets no
+     * cascade either way. Pure {@code java.io} -- does not rescan; see
+     * {@link #setEnabled} for the Android-facing instance method that does.
+     */
+    public static void applyMainToggle(File modsRoot, GroupResult gr, String name, boolean enabled) {
+        setMarker(new File(modsRoot, name), enabled);
+        if (enabled) return;
+        for (ModGroup g : gr.groups) {
+            if (name.equals(g.mainDir)) {
+                for (OptionGroup og : g.options) {
+                    for (Choice ch : og.choices) {
+                        setMarker(new File(modsRoot, ch.dir), false);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Enables or disables the mod named {@code name} by deleting/creating a
+     * {@code .disabled} marker file in its directory, then rescans -- see
+     * {@link #applyMainToggle} for the group-cascade semantics applied
+     * first. A no-op (still rescans) if the mod directory doesn't exist.
+     */
+    public void setEnabled(String name, boolean enabled) {
+        applyMainToggle(root, groups(), name, enabled);
+        scan();
+    }
+
+    // --- multi-.ctp download grouping (see the class doc's multi-archive- --
+    // --- download paragraph on extractZip, and each sub-mod's .group file) -
+
+    /** Reads {@code <modDir>/.group} (the download name written by {@link #writeGroup}), trimmed; {@code null} if the mod isn't part of a multi-archive download (no such file). */
+    private static String readGroupMarker(File modDir) {
+        File f = new File(modDir, ".group");
+        if (!f.isFile()) return null;
+        try {
+            return new String(readAllBytes(f), java.nio.charset.StandardCharsets.UTF_8).trim();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** One selectable variant of an {@link OptionGroup}: {@code dir} is the mod directory backing it, {@code label} is the folder-name segment shown to the user, {@code enabled} mirrors that directory's current {@code .disabled} marker. */
+    public static final class Choice {
+        public final String dir;
+        public final String label;
+        public final boolean enabled;
+
+        public Choice(String dir, String label, boolean enabled) {
+            this.dir = dir;
+            this.label = label;
+            this.enabled = enabled;
+        }
+    }
+
+    /** A single-choice set of mutually-exclusive sub-mods within a {@link ModGroup} (e.g. "Font", "Interface - UI - Black UI") -- see {@link #groups}'s doc for how {@code title}/{@code choices} are derived from folder names. */
+    public static final class OptionGroup {
+        public final String title;
+        public final List<Choice> choices;
+
+        public OptionGroup(String title, List<Choice> choices) {
+            this.title = title;
+            this.choices = Collections.unmodifiableList(new ArrayList<>(choices));
+        }
+
+        /** The directory name of whichever choice is currently enabled, or {@code null} if none is (a valid state -- see {@link #setEnabled}'s doc). At most one choice should ever be enabled at a time; if more than one somehow is (e.g. hand-edited files), the first (folder-alphabetical) one wins. */
+        public String selected() {
+            for (Choice c : choices) if (c.enabled) return c.dir;
+            return null;
+        }
+    }
+
+    /**
+     * One multi-.ctp Nexus download (e.g. "Chrono Trigger Pixel Demaster"),
+     * as split into sub-mod directories by {@link #extractZip} and grouped
+     * back together by {@link #groups}. {@code mainDir} is the sub-mod with
+     * no further option hierarchy (folder name is just {@code "<prefix> -
+     * Main File"}, or equivalently the whole group in the fallback case) --
+     * {@code null} if the download had no such single-segment sub-mod.
+     * {@code options}, sorted by {@link OptionGroup#title}, is every other
+     * sub-mod grouped by its option hierarchy (see {@link #groups}'s doc).
+     */
+    public static final class ModGroup {
+        public final String downloadName;
+        public final String mainDir;      // may be null
+        public final boolean mainEnabled; // meaningless if mainDir == null
+        public final List<OptionGroup> options;
+
+        public ModGroup(String downloadName, String mainDir, boolean mainEnabled, List<OptionGroup> options) {
+            this.downloadName = downloadName;
+            this.mainDir = mainDir;
+            this.mainEnabled = mainEnabled;
+            this.options = Collections.unmodifiableList(new ArrayList<>(options));
+        }
+    }
+
+    /** Result of {@link #groups}: every multi-.ctp download found, plus every mod ({@link ModInfo}) that isn't part of one (no {@code .group} marker) -- e.g. every single-archive mod. */
+    public static final class GroupResult {
+        public final List<ModGroup> groups;
+        public final List<ModInfo> ungrouped;
+
+        public GroupResult(List<ModGroup> groups, List<ModInfo> ungrouped) {
+            this.groups = groups;
+            this.ungrouped = ungrouped;
+        }
+    }
+
+    /**
+     * Groups {@code result.mods} by their {@code .group} marker (see {@link
+     * #writeGroup}) into {@link ModGroup}s, each split back into its main
+     * mod plus option groups. Pure {@code java.io} (only reads {@code
+     * .group} files under {@code modsRoot}) -- JVM-testable.
+     *
+     * <p>Per sub-mod: the shared name prefix is the segment before the
+     * first {@code " - "} in its directory name (e.g. {@code "PixelDemaster"}
+     * in {@code "PixelDemaster - Font - SNES Font"}); if every sub-mod of a
+     * group shares the same prefix, it's stripped before splitting the rest
+     * of the name on {@code " - "} into segments -- otherwise (some sub-mod
+     * has no such prefix, or the group's sub-mods disagree) the fallback is
+     * to split the WHOLE name on {@code " - "} instead, still grouped
+     * correctly by the {@code .group} marker alone. A single resulting
+     * segment names the group's main mod; more than one names an option:
+     * every segment but the last, joined with {@code " - "}, is the {@link
+     * OptionGroup#title} (e.g. {@code "Interface - Button Prompts Textures"},
+     * {@code "Interface - UI - Black UI"}), and the last segment is the
+     * {@link Choice#label}. Sub-mods sharing an option title become choices
+     * of the same {@link OptionGroup}; the resulting option groups are
+     * sorted by title (this also keeps same-shaped colour-variant groups
+     * like "Interface - UI - Black UI" / "... - Blue UI" as separate groups,
+     * simply ordered alphabetically, rather than trying to merge them).
+     */
+    public static GroupResult groups(File modsRoot, ScanResult result) {
+        java.util.LinkedHashMap<String, List<ModInfo>> byGroup = new java.util.LinkedHashMap<>();
+        List<ModInfo> ungrouped = new ArrayList<>();
+        for (ModInfo m : result.mods) {
+            String group = readGroupMarker(new File(modsRoot, m.name));
+            if (group == null) {
+                ungrouped.add(m);
+            } else {
+                byGroup.computeIfAbsent(group, k -> new ArrayList<>()).add(m);
+            }
+        }
+        List<ModGroup> out = new ArrayList<>();
+        for (Map.Entry<String, List<ModInfo>> e : byGroup.entrySet()) {
+            out.add(buildGroup(e.getKey(), e.getValue()));
+        }
+        return new GroupResult(out, ungrouped);
+    }
+
+    /** Instance convenience for {@link #groups(File, ScanResult)} -- returns the result cached by the most recent {@link #scan()} (computed there alongside {@link #lastResult}, so the two are always paired) or, if none has run yet, a fresh one-off computation. */
+    public GroupResult groups() {
+        GroupResult g = lastGroups;
+        if (g != null) return g;
+        ScanResult r = lastResult;
+        return groups(root, r != null ? r : collect(root));
+    }
+
+    /** See {@link #groups(File, ScanResult)}'s doc -- builds one {@link ModGroup} from every {@link ModInfo} sharing one {@code .group} value. */
+    private static ModGroup buildGroup(String downloadName, List<ModInfo> mods) {
+        String prefix = null;
+        boolean allShare = true;
+        for (ModInfo m : mods) {
+            int idx = m.name.indexOf(" - ");
+            String p = idx >= 0 ? m.name.substring(0, idx) : null;
+            if (p == null) { allShare = false; break; }
+            if (prefix == null) prefix = p;
+            else if (!prefix.equals(p)) { allShare = false; break; }
+        }
+
+        String mainDir = null;
+        boolean mainEnabled = false;
+        java.util.LinkedHashMap<String, List<Choice>> optionMap = new java.util.LinkedHashMap<>();
+        for (ModInfo m : mods) {
+            String remainder = (allShare && m.name.startsWith(prefix + " - "))
+                    ? m.name.substring(prefix.length() + 3)
+                    : m.name;
+            String[] segs = remainder.split(" - ");
+            if (segs.length <= 1) {
+                mainDir = m.name;
+                mainEnabled = m.enabled;
+            } else {
+                String title = String.join(" - ", Arrays.copyOf(segs, segs.length - 1));
+                optionMap.computeIfAbsent(title, k -> new ArrayList<>())
+                        .add(new Choice(m.name, segs[segs.length - 1], m.enabled));
+            }
+        }
+        List<OptionGroup> options = new ArrayList<>();
+        for (Map.Entry<String, List<Choice>> e : optionMap.entrySet()) {
+            options.add(new OptionGroup(e.getKey(), e.getValue()));
+        }
+        options.sort(Comparator.comparing(o -> o.title, String.CASE_INSENSITIVE_ORDER));
+        return new ModGroup(downloadName, mainDir, mainEnabled, options);
+    }
+
+    /**
+     * Applies a single-choice selection within one {@link ModGroup}'s
+     * {@link OptionGroup}: enables {@code chosenDirOrNull} (if non-null) and
+     * disables every one of that option group's other choices -- radio-
+     * button semantics, reusing {@link #setEnabled}'s marker-file mechanism.
+     * {@code chosenDirOrNull == null} means "select none": every choice in
+     * the option group ends up disabled. A no-op if no group named {@code
+     * groupDownloadName} (or no option group titled {@code optionTitle}
+     * within it) is found in {@code gr}. Pure {@code java.io} -- does not
+     * rescan; callers exercising this on a plain JVM don't need to (see
+     * {@link #selectOption} for the Android-facing instance method that
+     * does).
+     */
+    public static void applySelectOption(File modsRoot, GroupResult gr, String groupDownloadName,
+                                          String optionTitle, String chosenDirOrNull) {
+        for (ModGroup g : gr.groups) {
+            if (!g.downloadName.equals(groupDownloadName)) continue;
+            for (OptionGroup og : g.options) {
+                if (!og.title.equals(optionTitle)) continue;
+                for (Choice ch : og.choices) {
+                    setMarker(new File(modsRoot, ch.dir), ch.dir.equals(chosenDirOrNull));
+                }
+            }
+        }
+    }
+
+    /** Android-facing {@link #applySelectOption}: resolves the current {@link #groups()} over this instance's root, applies the selection, then rescans (see {@link #scan}). */
+    public void selectOption(String groupDownloadName, String optionTitle, String chosenDirOrNull) {
+        applySelectOption(root, groups(), groupDownloadName, optionTitle, chosenDirOrNull);
         scan();
     }
 }

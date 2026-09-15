@@ -1,92 +1,95 @@
-[
-  {
-    "id": "snes-overworld-sprites",
-    "name": "SNES Overworld Sprites Restoration",
-    "author": null,
-    "summary": "Original SNES overworld walking sprites",
-    "page": "https://www.nexusmods.com/chronotrigger/mods/9",
-    "download": null,
-    "fileHint": "SNESOverworld",
-    "notes": null
-  },
-  {
-    "id": "pixel-demaster",
-    "name": "Chrono Trigger Pixel Demaster",
-    "author": null,
-    "summary": "SNES-style UI, icons, sprites, and the ChronoType SNES font",
-    "page": "https://www.nexusmods.com/chronotrigger/mods/8",
-    "download": null,
-    "fileHint": "Pixel Demaster",
-    "notes": "Installs as many sub-mods: enable Main plus the Font, UI colour, icon, and button-prompt variants you want. Text button prompt (.xdelta) patches are Steam-only and ignored."
-  },
-  {
-    "id": "snes-wood-menu",
-    "name": "SNES Wood Menu",
-    "author": null,
-    "summary": "Wooden SNES-style menu windows",
-    "page": "https://www.nexusmods.com/chronotrigger/mods/26",
-    "download": null,
-    "fileHint": "Wood",
-    "notes": null
-  },
-  {
-    "id": "consistent-magus",
-    "name": "Consistent Magus Sprite",
-    "author": null,
-    "summary": "Red-cloak Magus matching his portrait",
-    "page": "https://www.nexusmods.com/chronotrigger/mods/5",
-    "download": null,
-    "fileHint": null,
-    "notes": null
-  },
-  {
-    "id": "transparent-portraits-icons",
-    "name": "Transparent Portraits and Improved Icons",
-    "author": null,
-    "summary": "Cleaner portraits and menu icons",
-    "page": "https://www.nexusmods.com/chronotrigger/mods/12",
-    "download": null,
-    "fileHint": null,
-    "notes": null
-  },
-  {
-    "id": "portraits-redone",
-    "name": "Character Portraits Redone",
-    "author": null,
-    "summary": "Redrawn character portraits",
-    "page": "https://www.nexusmods.com/chronotrigger/mods/10",
-    "download": null,
-    "fileHint": null,
-    "notes": null
-  },
-  {
-    "id": "rework",
-    "name": "-ReWork-",
-    "author": null,
-    "summary": "Reworked title, menus, shop UI and font",
-    "page": "https://www.nexusmods.com/chronotrigger/mods/43",
-    "download": null,
-    "fileHint": null,
-    "notes": "Built for the PC CTExt loader; UI parts may not apply on Android"
-  },
-  {
-    "id": "orchestral-wonders",
-    "name": "Chrono Trigger - Orchestral Wonders",
-    "author": null,
-    "summary": "Orchestral re-recordings of the soundtrack",
-    "page": "https://www.nexusmods.com/chronotrigger/mods/23",
-    "download": null,
-    "fileHint": "Orchestral",
-    "notes": "Large download; audio is Sound/BGM/*.sab -- untested whether the game reads BGM through the hooked path"
-  },
-  {
-    "id": "fmv-remastered",
-    "name": "Chrono Trigger FMV's Remastered",
-    "author": null,
-    "summary": "4K AI-upscaled anime cutscenes",
-    "page": "https://www.nexusmods.com/chronotrigger/mods/28",
-    "download": null,
-    "fileHint": "FMV",
-    "notes": "Very large; FMVs are loose APK assets (001-008.dat), not archive entries -- needs a Java-side override in the video path and FMV display in ChronoDuo is still an open issue"
-  }
-]
+{
+  "version": 2,
+  "entries": [
+    {
+      "id": "snes-overworld-sprites",
+      "name": "SNES Overworld Sprites Restoration",
+      "author": null,
+      "summary": "Original SNES overworld walking sprites",
+      "page": "https://www.nexusmods.com/chronotrigger/mods/9",
+      "download": null,
+      "fileHint": "SNESOverworld",
+      "notes": null
+    },
+    {
+      "id": "pixel-demaster",
+      "name": "Chrono Trigger Pixel Demaster",
+      "author": null,
+      "summary": "SNES-style UI, icons, sprites, and the ChronoType SNES font",
+      "page": "https://www.nexusmods.com/chronotrigger/mods/8",
+      "download": null,
+      "fileHint": "Demaster",
+      "notes": "Enable Main plus any Font, icon, UI or button variants."
+    },
+    {
+      "id": "snes-wood-menu",
+      "name": "SNES Wood Menu",
+      "author": null,
+      "summary": "Wooden SNES-style menu windows",
+      "page": "https://www.nexusmods.com/chronotrigger/mods/26",
+      "download": null,
+      "fileHint": "Wood",
+      "notes": null
+    },
+    {
+      "id": "consistent-magus",
+      "name": "Consistent Magus Sprite",
+      "author": null,
+      "summary": "Red-cloak Magus matching his portrait",
+      "page": "https://www.nexusmods.com/chronotrigger/mods/5",
+      "download": null,
+      "fileHint": null,
+      "notes": null
+    },
+    {
+      "id": "transparent-portraits-icons",
+      "name": "Transparent Portraits and Improved Icons",
+      "author": null,
+      "summary": "Cleaner portraits and menu icons",
+      "page": "https://www.nexusmods.com/chronotrigger/mods/12",
+      "download": null,
+      "fileHint": null,
+      "notes": null
+    },
+    {
+      "id": "portraits-redone",
+      "name": "Character Portraits Redone",
+      "author": null,
+      "summary": "Redrawn character portraits",
+      "page": "https://www.nexusmods.com/chronotrigger/mods/10",
+      "download": null,
+      "fileHint": null,
+      "notes": null
+    },
+    {
+      "id": "rework",
+      "name": "-ReWork-",
+      "author": null,
+      "summary": "Reworked title, menus, shop UI and font",
+      "page": "https://www.nexusmods.com/chronotrigger/mods/43",
+      "download": null,
+      "fileHint": null,
+      "notes": "Made for the PC CTExt loader; some UI parts may not apply"
+    },
+    {
+      "id": "orchestral-wonders",
+      "name": "Chrono Trigger - Orchestral Wonders",
+      "author": null,
+      "summary": "Orchestral re-recordings of the soundtrack",
+      "page": "https://www.nexusmods.com/chronotrigger/mods/23",
+      "download": null,
+      "fileHint": "Orchestral",
+      "notes": "Large download"
+    },
+    {
+      "id": "fmv-remastered",
+      "name": "Chrono Trigger FMV's Remastered",
+      "author": null,
+      "summary": "4K AI-upscaled anime cutscenes",
+      "page": "https://www.nexusmods.com/chronotrigger/mods/28",
+      "download": null,
+      "fileHint": "FMV",
+      "notes": "Very large download (~1 GB)"
+    }
+  ]
+}

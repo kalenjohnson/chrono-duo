@@ -194,6 +194,9 @@ public class AppActivity extends Cocos2dxActivity {
             @Override public void requestModGet(String id) {
                 AppActivity.this.requestModGet(id);
             }
+            @Override public void onModOptionSelected(String group, String optionTitle, String dirOrNull) {
+                setModOption(group, optionTitle, dirOrNull);
+            }
         });
         // A Presentation the system tears down and recreates behind our
         // back (sleep/wake being the common trigger -- see
@@ -790,20 +793,51 @@ public class AppActivity extends Cocos2dxActivity {
 
     /**
      * Imports {@code uri} (a user-picked mod archive from {@link
-     * #launchModPicker()}) via {@link
+     * #launchModPicker()}) on a background thread, then pushes the
+     * resulting mod list/status to the panel. Mirrors {@link
+     * #importSaveFromUri}.
+     *
+     * <p>Like {@link #handleViewIntent}, if the picked file's display name
+     * matches a catalog entry's {@code fileHint} it's imported under that
+     * entry's id via {@link
+     * com.kalenjohnson.chronoduo.mods.ModManager#importCatalogMod} instead
+     * of the plain sanitized-display-name {@link
      * com.kalenjohnson.chronoduo.mods.ModManager#importArchive(android.net.Uri, android.content.ContentResolver)}
-     * on a background thread, then pushes the resulting mod list/status to
-     * the panel. Mirrors {@link #importSaveFromUri}.
+     * path -- so manually importing (or re-importing) a mod the catalog
+     * already knows about lands exactly where a catalog "Get" would have
+     * put it (dedup'd against any earlier import of the same download under
+     * a different name -- see {@code ModManager#removeConflictingMods})
+     * rather than showing as a second, uncatalogued "Imported mod" row.
      */
     private void importModFromUri(android.net.Uri uri) {
         if (modManager == null) return;
         updateModsStatus(true, null);
         final com.kalenjohnson.chronoduo.mods.ModManager mm = modManager;
+        String displayName = com.kalenjohnson.chronoduo.mods.ModManager.queryDisplayName(getContentResolver(), uri);
+        com.kalenjohnson.chronoduo.mods.ModCatalog.Entry match = null;
+        if (displayName != null) {
+            String lower = displayName.toLowerCase(java.util.Locale.ROOT);
+            for (com.kalenjohnson.chronoduo.mods.ModCatalog.Entry e : modCatalog) {
+                if (e.fileHint != null && lower.contains(e.fileHint.toLowerCase(java.util.Locale.ROOT))) {
+                    match = e;
+                    break;
+                }
+            }
+        }
+        final com.kalenjohnson.chronoduo.mods.ModCatalog.Entry finalMatch = match;
         new Thread(() -> {
             try {
                 com.kalenjohnson.chronoduo.mods.ModManager.setGameArchiveSource(gameArchiveSourceFactory());
-                com.kalenjohnson.chronoduo.mods.ModManager.ImportResult result = mm.importArchive(uri,
-                        getContentResolver(), this::updateModsProgress);
+                com.kalenjohnson.chronoduo.mods.ModManager.ImportResult result;
+                if (finalMatch != null) {
+                    try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
+                        if (in == null) throw new java.io.IOException("could not open " + uri);
+                        result = mm.importCatalogMod(in, finalMatch.id, finalMatch.fileHint, "local:" + uri,
+                                this::updateModsProgress);
+                    }
+                } else {
+                    result = mm.importArchive(uri, getContentResolver(), this::updateModsProgress);
+                }
                 logImportResult(result);
                 updateModsStatus(false, describeImportResult(result), null);
                 refreshCompanionAssetsForModChange();
@@ -854,6 +888,17 @@ public class AppActivity extends Cocos2dxActivity {
             updateModsStatus(false, null);
             refreshCompanionAssetsForModChange();
         }, "ChronoModToggle").start();
+    }
+
+    /** Applies a single-choice option selection within a multi-.ctp download's option group via {@link com.kalenjohnson.chronoduo.mods.ModManager#selectOption} on a background thread, then pushes the result. Called from the settings screen's Mods page option-row cycle button (see {@link PartyPanelView.SettingsHost#onModOptionSelected}). */
+    private void setModOption(String group, String optionTitle, String dirOrNull) {
+        if (modManager == null) return;
+        final com.kalenjohnson.chronoduo.mods.ModManager mm = modManager;
+        new Thread(() -> {
+            mm.selectOption(group, optionTitle, dirOrNull);
+            updateModsStatus(false, null);
+            refreshCompanionAssetsForModChange();
+        }, "ChronoModOption").start();
     }
 
     /** Same as the 3-arg overload with no success message -- the common idle/importing/error case. */
@@ -927,10 +972,13 @@ public class AppActivity extends Cocos2dxActivity {
     private void updateModsStatus(boolean importing, String message, String error) {
         final java.util.List<com.kalenjohnson.chronoduo.mods.ModManager.ModInfo> mods =
                 modManager != null ? modManager.lastMods() : java.util.Collections.emptyList();
+        final java.util.List<com.kalenjohnson.chronoduo.mods.ModManager.ModGroup> groups =
+                modManager != null ? modManager.groups().groups : java.util.Collections.emptyList();
         new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
             PartyPanelView panel = secondScreen != null ? secondScreen.getPanel() : null;
             if (panel == null) return;
             panel.setModsList(mods);
+            panel.setModGroups(groups);
             panel.setModsStatus(importing, message, error);
         });
     }
@@ -953,6 +1001,7 @@ public class AppActivity extends Cocos2dxActivity {
     private void onSecondScreenPanelAttached(PartyPanelView panel) {
         panel.setModCatalog(modCatalog);
         panel.setModsList(modManager != null ? modManager.lastMods() : java.util.Collections.emptyList());
+        panel.setModGroups(modManager != null ? modManager.groups().groups : java.util.Collections.emptyList());
         panel.setModsStatus(false, null, null);
     }
 
@@ -1090,7 +1139,8 @@ public class AppActivity extends Cocos2dxActivity {
                     }
                     com.kalenjohnson.chronoduo.mods.ModManager.setGameArchiveSource(gameArchiveSourceFactory());
                     com.kalenjohnson.chronoduo.mods.ModManager.ImportResult result = mm.importCatalogMod(
-                            tmp, entry.id, entry.page != null ? entry.page : url, this::updateModsProgress);
+                            tmp, entry.id, entry.fileHint, entry.page != null ? entry.page : url,
+                            this::updateModsProgress);
                     // extractZip already picks the right default-enabled
                     // sub-mod(s) fresh on every import (see its class doc) --
                     // no need to force-enable entry.id, which for a
@@ -1171,7 +1221,8 @@ public class AppActivity extends Cocos2dxActivity {
                 if (finalMatch != null) {
                     try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
                         if (in == null) throw new java.io.IOException("could not open " + uri);
-                        result = mm.importCatalogMod(in, finalMatch.id, "local:" + uri, this::updateModsProgress);
+                        result = mm.importCatalogMod(in, finalMatch.id, finalMatch.fileHint, "local:" + uri,
+                                this::updateModsProgress);
                     }
                     // See downloadAndImportMod's matching comment: extractZip
                     // already establishes the right enabled state per import.
