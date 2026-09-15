@@ -159,6 +159,9 @@ def snes_to_ct(slot: snes_srm.SnesSlot, template: ctsave.CtSave) -> ctsave.CtSav
     out.gold = slot.gold
     out.play_time_seconds = slot.play_time_seconds
 
+    # Payload byte 0 is the format version: the Android loader accepts only 1
+    # (the Steam templates carry 3) -- REPORT.md #3.1.
+    out.region_a[0] = 1
     return out
 
 
@@ -234,6 +237,9 @@ def ds_to_ct(slot: "ds_sav.DsSlot", template: ctsave.CtSave) -> ctsave.CtSave:
     out.location_name_id = slot.location_name_id
     out.era_mask = slot.era_mask
 
+    # Payload byte 0 is the format version: the Android loader accepts only 1
+    # (the Steam templates carry 3) -- REPORT.md #3.1.
+    out.region_a[0] = 1
     return out
 
 

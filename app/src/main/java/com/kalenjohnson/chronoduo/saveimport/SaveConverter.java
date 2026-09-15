@@ -210,6 +210,9 @@ public final class SaveConverter {
         out.gold = slot.gold;
         out.playTimeSeconds = slot.playTimeSeconds;
 
+        // Payload byte 0 is the format version: the Android loader accepts only 1
+        // (the Steam templates carry 3) -- REPORT.md #3.1.
+        out.regionA[0] = 1;
         return out;
     }
 
@@ -281,6 +284,9 @@ public final class SaveConverter {
         out.locationNameId = slot.locationNameId;
         out.eraMask = slot.eraMask;
 
+        // Payload byte 0 is the format version: the Android loader accepts only 1
+        // (the Steam templates carry 3) -- REPORT.md #3.1.
+        out.regionA[0] = 1;
         return out;
     }
 
