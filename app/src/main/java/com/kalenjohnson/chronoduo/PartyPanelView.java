@@ -282,6 +282,14 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // enters settingsMode.
     private final RectF gearHitBox = new RectF();
     private boolean settingsMode;
+    // Settings is paginated (see SETTINGS_PAGES / drawSettingsScreen);
+    // settingsPage is the 0-based page in view, kept across open/close so
+    // reopening lands where the user left off. The prev/next hit boxes are
+    // set only while drawSettingsScreen draws the corresponding arrow.
+    private static final String[] SETTINGS_PAGES = {"Imports", "Graphics", "Maps"};
+    private int settingsPage;
+    private final RectF settingsPrevHitBox = new RectF();
+    private final RectF settingsNextHitBox = new RectF();
 
     // Import status, pushed from AppActivity via setImportStatus as the
     // background ROM import (see SettingsHost) progresses. importError is
@@ -513,6 +521,18 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 if (settingsHost != null) settingsHost.requestOrigArtBuild();
                 return true;
             }
+            if (!settingsPrevHitBox.isEmpty()
+                    && settingsPrevHitBox.contains(event.getX(), event.getY())) {
+                settingsPage = (settingsPage + SETTINGS_PAGES.length - 1) % SETTINGS_PAGES.length;
+                invalidate();
+                return true;
+            }
+            if (!settingsNextHitBox.isEmpty()
+                    && settingsNextHitBox.contains(event.getX(), event.getY())) {
+                settingsPage = (settingsPage + 1) % SETTINGS_PAGES.length;
+                invalidate();
+                return true;
+            }
             if (!settingsBackHitBox.isEmpty()
                     && settingsBackHitBox.contains(event.getX(), event.getY())) {
                 settingsMode = false;
@@ -521,6 +541,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             }
             return true; // swallow every touch while the settings modal is up
         }
+        // The gear is also drawn on the pre-load wordmark screen (no party
+        // yet, so inBattle is necessarily false there) -- imports and art
+        // builds don't need a loaded game, so settings must be reachable
+        // from the title screen.
         if (!snap.inBattle && !gearHitBox.isEmpty()
                 && gearHitBox.contains(event.getX(), event.getY())) {
             settingsMode = true;
@@ -1946,12 +1970,20 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // Drawn ~2.4x the eye glyph's size and inset well inside the ink
         // frame: at the eye's size it read as a speck on the frame line.
         float r = EYE_GLYPH_RADIUS * 2.4f;
-        float cx = parchment.left + r + 30f;
-        float cy = parchment.top + r + 30f;
+        drawGearToggle(c, parchment.left + r + 30f, parchment.top + r + 30f, r, INK);
+    }
+
+    /**
+     * Gear glyph centered on ({@code cx}, {@code cy}) with outer radius
+     * {@code r} in {@code color}; sets {@link #gearHitBox} around it. Shared
+     * by the parchment corner (above) and the pre-load wordmark screen
+     * ({@link #drawWordmark}, white on black).
+     */
+    private void drawGearToggle(Canvas c, float cx, float cy, float r, int color) {
         float half = Math.max(EYE_HIT_HALF, r * 1.6f);
         gearHitBox.set(cx - half, cy - half, cx + half, cy + half);
 
-        int inkA = Color.argb(230, Color.red(INK), Color.green(INK), Color.blue(INK));
+        int inkA = Color.argb(230, Color.red(color), Color.green(color), Color.blue(color));
         stroke.setStrokeWidth(3.5f);
         stroke.setColor(inkA);
         c.drawCircle(cx, cy, r * 0.7f, stroke);
@@ -2030,13 +2062,15 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     }
 
     /**
-     * The settings screen: same parchment chrome as the normal panel (title,
-     * "DS maps: <status>" row + import button, "Pixel graphics: On/Off"
-     * button, "Original art: <status>" row + "Build original art"
-     * button -- disabled, no hit box, while {@link #origArtBuilding} -- and a
-     * "Back" button that returns to the normal panel). Drawn instead of
-     * {@link #drawContent}/the status boxes/gold-time corners whenever
-     * {@link #settingsMode} is true -- see {@link #onDraw}.
+     * The settings screen: same parchment chrome as the normal panel, split
+     * into the pages named by {@link #SETTINGS_PAGES} -- Imports (DS ROM
+     * maps, SNES/DS saves), Graphics (pixel graphics, original art) and Maps
+     * (dungeon fog, world map status) -- with prev/next arrows flanking a
+     * "Back" button along the bottom. Buttons mid-operation (importing /
+     * building) are dimmed and get no hit box. Every settings hit box is
+     * cleared up front so a control on another page can never catch a tap.
+     * Drawn instead of everything else whenever {@link #settingsMode} is
+     * true -- see {@link #onDraw} -- including before any party exists.
      */
     private void drawSettingsScreen(Canvas c) {
         int w = getWidth(), h = getHeight();
@@ -2044,146 +2078,188 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         RectF parchment = new RectF(pad * 3, h * 0.2f, w - pad * 3, h - pad * 2.2f);
         drawParchmentBase(c, parchment);
 
+        importButtonHitBox.setEmpty();
+        saveImportButtonHitBox.setEmpty();
+        pixelGraphicsHitBox.setEmpty();
+        fogToggleHitBox.setEmpty();
+        fogResetHitBox.setEmpty();
+        origArtButtonHitBox.setEmpty();
+
+        int page = Math.floorMod(settingsPage, SETTINGS_PAGES.length);
+        int inkDim = Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK));
+        float left = parchment.left + w * 0.06f;
+        float textW = parchment.width() - w * 0.12f;
+        Bitmap winTex = ChronoAssets.getWindowTex();
+
         c.save();
         c.clipPath(tornPaper);
 
         setText(h * 0.055f, INK, true, Paint.Align.CENTER, false);
         text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
         c.drawText("Settings", parchment.centerX(), parchment.top + h * 0.09f, text);
+        setText(h * 0.024f, inkDim, false, Paint.Align.CENTER, false);
+        c.drawText(SETTINGS_PAGES[page] + "  ·  " + (page + 1) + " / " + SETTINGS_PAGES.length,
+                parchment.centerX(), parchment.top + h * 0.125f, text);
 
-        setText(h * 0.032f, INK, false, Paint.Align.LEFT, false);
-        text.setTypeface(Typeface.MONOSPACE);
-        c.drawText("DS maps: " + importStatusText(), parchment.left + w * 0.06f,
-                parchment.top + h * 0.155f, text);
+        // Buttons are drawn after the clip is released (they sit on top of
+        // the parchment overlay); the text pass below only records where
+        // each one goes.
+        RectF btnA = null, btnB = null;
+        String labelA = null, labelB = null;
+        float y = parchment.top + h * 0.19f;
+        float btnW = parchment.width() * 0.6f;
+        float btnH = h * 0.07f;
 
-        setText(h * 0.022f, Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK)),
-                false, Paint.Align.LEFT, false);
-        c.drawText("Room maps are available if you can provide the",
-                parchment.left + w * 0.06f, parchment.top + h * 0.185f, text);
-        c.drawText("Chrono Trigger DS ROM (.nds or .zip).",
-                parchment.left + w * 0.06f, parchment.top + h * 0.212f, text);
+        switch (page) {
+            case 0: { // Imports
+                y = drawSettingsHeading(c, "DS maps: " + importStatusText(), left, y, h);
+                y = drawSettingsBody(c, "Room maps are available if you can provide the "
+                        + "Chrono Trigger DS ROM (.nds or .zip).", left, y, textW, h, inkDim);
+                btnA = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
+                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                labelA = "Import DS ROM...";
+                y = btnA.bottom + h * 0.06f;
 
-        setText(h * 0.02f, Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK)),
-                false, Paint.Align.LEFT, false);
-        text.setTypeface(Typeface.MONOSPACE);
-        c.drawText("SNES/DS save: " + saveImportStatusText(), parchment.left + w * 0.06f,
-                parchment.top + h * 0.233f, text);
+                y = drawSettingsHeading(c, "SNES/DS save:", left, y, h);
+                y = drawSettingsBody(c, saveImportStatusText(), left, y, textW, h, INK);
+                y = drawSettingsBody(c, "Copies a save from a SNES (.srm) or DS (.sav/.dst/"
+                        + ".duc/.dsv) file into one of this game's save slots.",
+                        left, y, textW, h, inkDim);
+                btnB = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
+                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                labelB = "Import SNES/DS save...";
+                break;
+            }
+            case 1: { // Graphics
+                y = drawSettingsHeading(c, "Pixel graphics", left, y, h);
+                y = drawSettingsBody(c, "Nearest-neighbour texture filtering for crisp, "
+                        + "unsmoothed sprites. Full effect after a game restart.",
+                        left, y, textW, h, inkDim);
+                btnA = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
+                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                labelA = "Pixel graphics: " + (pixelGraphicsOn ? "On" : "Off");
+                y = btnA.bottom + h * 0.06f;
 
-        setText(h * 0.032f, INK, false, Paint.Align.LEFT, false);
-        text.setTypeface(Typeface.MONOSPACE);
-        c.drawText("Original art: " + origArtStatusText(), parchment.left + w * 0.06f,
-                parchment.top + h * 0.462f, text);
+                y = drawSettingsHeading(c, "Original art: " + origArtStatusText(), left, y, h);
+                y = drawSettingsBody(c, "Rebuilds character sprites and field chips from the "
+                        + "game's own 1x art. Only applies when Pixel graphics is On.",
+                        left, y, textW, h, inkDim);
+                btnB = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
+                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                labelB = "Build original art";
+                break;
+            }
+            default: { // Maps
+                y = drawSettingsHeading(c, "Dungeon fog", left, y, h);
+                y = drawSettingsBody(c, "Dungeon minimaps are revealed as you explore them, "
+                        + "like on the DS. Towns and houses are always fully shown.",
+                        left, y, textW, h, inkDim);
+                btnA = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
+                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                // An import made before the fog flag was exported has no fog
+                // data: say so on the button instead of silently never fogging.
+                labelA = fogOn && countDsMaps() > 0 && !AreaMapCalib.hasFogData()
+                        ? "Dungeon fog: re-import ROM" : "Dungeon fog: " + (fogOn ? "On" : "Off");
+                y = btnA.bottom + h * 0.075f;
 
-        setText(h * 0.022f, Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK)),
-                false, Paint.Align.LEFT, false);
-        c.drawText("Rebuilds character sprites and field chips from the",
-                parchment.left + w * 0.06f, parchment.top + h * 0.488f, text);
-        c.drawText("game's own 1x art. Only applies when Pixel graphics is On.",
-                parchment.left + w * 0.06f, parchment.top + h * 0.514f, text);
-
-        setText(h * 0.022f, Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK)),
-                false, Paint.Align.LEFT, false);
-        text.setTypeface(Typeface.MONOSPACE);
-        c.drawText(worldMapStatusText(), parchment.left + w * 0.06f, parchment.top + h * 0.63f, text);
+                y = drawSettingsHeading(c, worldMapStatusText(), left, y, h);
+                drawSettingsBody(c, "Overworld maps are rendered from the game's own data "
+                        + "the first time it runs.", left, y, textW, h, inkDim);
+                break;
+            }
+        }
 
         c.restore();
         drawParchmentOverlay(c, parchment);
 
-        Bitmap winTex = ChronoAssets.getWindowTex();
-
-        // "Import DS ROM..." and "Import SNES/DS save..." share one row as two
-        // half-width buttons (same split-row shape as the pixel/fog toggle
-        // row below), rather than each taking a full 0.6-parchment-width
-        // slot -- keeps every row below at its original vertical position.
-        float btnRowW = parchment.width() * 0.92f;
-        float btnGap = parchment.width() * 0.02f;
-        float btnW = (btnRowW - btnGap) / 2f;
-        float btnH = h * 0.075f;
-        float btnTop = parchment.top + h * 0.245f;
-        float btnLeft = parchment.centerX() - btnRowW / 2f;
-        RectF importBtn = new RectF(btnLeft, btnTop, btnLeft + btnW, btnTop + btnH);
-        drawCommandButton(c, importBtn, "Import DS ROM...", winTex, false);
-        if (importing) {
-            fill.setShader(null);
-            fill.setColor(Color.argb(150, 0, 0, 0));
-            c.drawRect(importBtn, fill);
-            importButtonHitBox.setEmpty();
+        if (page == 0) {
+            drawSettingsButton(c, btnA, labelA, winTex, importing, importButtonHitBox);
+            drawSettingsButton(c, btnB, labelB, winTex, savingImport, saveImportButtonHitBox);
+        } else if (page == 1) {
+            drawSettingsButton(c, btnA, labelA, winTex, false, pixelGraphicsHitBox);
+            drawSettingsButton(c, btnB, labelB, winTex, origArtBuilding, origArtButtonHitBox);
         } else {
-            importButtonHitBox.set(importBtn);
+            drawSettingsButton(c, btnA, labelA, winTex, false, fogToggleHitBox);
+            // Small text-style "Reset explored maps" action under the fog
+            // toggle (its hit box is padded well beyond the glyphs).
+            float captionY = btnA.bottom + h * 0.03f;
+            setText(h * 0.02f, INK, true, Paint.Align.CENTER, false);
+            String resetLabel = "Reset explored maps";
+            c.drawText(resetLabel, btnA.centerX(), captionY, text);
+            float resetHalfW = text.measureText(resetLabel) / 2f + w * 0.01f;
+            fogResetHitBox.set(btnA.centerX() - resetHalfW, btnA.bottom,
+                    btnA.centerX() + resetHalfW, captionY + h * 0.02f);
         }
 
-        RectF saveImportBtn = new RectF(importBtn.right + btnGap, btnTop,
-                importBtn.right + btnGap + btnW, btnTop + btnH);
-        drawCommandButton(c, saveImportBtn, "Import SNES/DS save...", winTex, false);
-        if (savingImport) {
-            fill.setShader(null);
-            fill.setColor(Color.argb(150, 0, 0, 0));
-            c.drawRect(saveImportBtn, fill);
-            saveImportButtonHitBox.setEmpty();
-        } else {
-            saveImportButtonHitBox.set(saveImportBtn);
-        }
-
-        // Pixel graphics and Dungeon fog share one row as two half-width
-        // toggles (the 0.6-parchment-width column the other buttons use,
-        // split with a small gap) so the rows below keep their positions.
-        // Slightly shorter than the other buttons so the longest label
-        // ("Pixel graphics: Off") still fits its half at the 0.42*height
-        // label size drawCommandButton uses.
-        float toggleRowW = parchment.width() * 0.6f;
-        float toggleGap = parchment.width() * 0.02f;
-        float toggleW = (toggleRowW - toggleGap) / 2f;
-        float toggleH = h * 0.055f;
-        float toggleTop = parchment.top + h * 0.35f;
-        float toggleLeft = parchment.centerX() - toggleRowW / 2f;
-        RectF pixelBtn = new RectF(toggleLeft, toggleTop, toggleLeft + toggleW, toggleTop + toggleH);
-        drawCommandButton(c, pixelBtn, "Pixel graphics: " + (pixelGraphicsOn ? "On" : "Off"), winTex, false);
-        pixelGraphicsHitBox.set(pixelBtn);
-
-        RectF fogBtn = new RectF(pixelBtn.right + toggleGap, toggleTop,
-                pixelBtn.right + toggleGap + toggleW, toggleTop + toggleH);
-        // An import made before the fog flag was exported has no fog data:
-        // say so on the button instead of silently never fogging.
-        String fogLabel = fogOn && countDsMaps() > 0 && !AreaMapCalib.hasFogData()
-                ? "Dungeon fog: re-import ROM" : "Dungeon fog: " + (fogOn ? "On" : "Off");
-        drawCommandButton(c, fogBtn, fogLabel, winTex, false);
-        fogToggleHitBox.set(fogBtn);
-
-        // One caption line under each toggle: the restart note under Pixel
-        // graphics, and a small text-style "Reset explored maps" action
-        // under Dungeon fog (its hit box is padded well beyond the glyphs).
-        float captionY = pixelBtn.bottom + h * 0.024f;
-        setText(h * 0.018f, Color.argb(190, Color.red(INK), Color.green(INK), Color.blue(INK)),
-                false, Paint.Align.CENTER, false);
-        c.drawText("Full effect after game restart", pixelBtn.centerX(), captionY, text);
-
-        setText(h * 0.018f, INK, true, Paint.Align.CENTER, false);
-        String resetLabel = "Reset explored maps";
-        c.drawText(resetLabel, fogBtn.centerX(), captionY, text);
-        float resetHalfW = text.measureText(resetLabel) / 2f + w * 0.01f;
-        fogResetHitBox.set(fogBtn.centerX() - resetHalfW, fogBtn.bottom,
-                fogBtn.centerX() + resetHalfW, captionY + h * 0.02f);
-
-        float origArtBtnW = parchment.width() * 0.6f;
-        float origArtBtnH = h * 0.065f;
-        RectF origArtBtn = new RectF(parchment.centerX() - origArtBtnW / 2f, parchment.top + h * 0.545f,
-                parchment.centerX() + origArtBtnW / 2f, parchment.top + h * 0.545f + origArtBtnH);
-        drawCommandButton(c, origArtBtn, "Build original art", winTex, false);
-        if (origArtBuilding) {
-            fill.setShader(null);
-            fill.setColor(Color.argb(150, 0, 0, 0));
-            c.drawRect(origArtBtn, fill);
-            origArtButtonHitBox.setEmpty();
-        } else {
-            origArtButtonHitBox.set(origArtBtn);
-        }
-
-        float backW = parchment.width() * 0.4f;
-        float backH = h * 0.065f;
-        RectF backBtn = new RectF(parchment.centerX() - backW / 2f, parchment.bottom - h * 0.09f,
-                parchment.centerX() + backW / 2f, parchment.bottom - h * 0.09f + backH);
+        // Bottom row: [prev] [Back] [next], arrows kept close to square.
+        float navH = h * 0.065f;
+        float navTop = parchment.bottom - h * 0.09f;
+        float backW = parchment.width() * 0.34f;
+        float arrowW = navH * 1.3f;
+        float navGap = parchment.width() * 0.02f;
+        RectF backBtn = new RectF(parchment.centerX() - backW / 2f, navTop,
+                parchment.centerX() + backW / 2f, navTop + navH);
+        RectF prevBtn = new RectF(backBtn.left - navGap - arrowW, navTop, backBtn.left - navGap, navTop + navH);
+        RectF nextBtn = new RectF(backBtn.right + navGap, navTop, backBtn.right + navGap + arrowW, navTop + navH);
+        drawCommandButton(c, prevBtn, TARGET_LABELS[0], winTex, false);
         drawCommandButton(c, backBtn, "Back", winTex, false);
+        drawCommandButton(c, nextBtn, TARGET_LABELS[2], winTex, false);
+        settingsPrevHitBox.set(prevBtn);
         settingsBackHitBox.set(backBtn);
+        settingsNextHitBox.set(nextBtn);
+    }
+
+    /** Settings section heading (monospace, INK) at {@code y}; returns the y for the body text that follows. */
+    private float drawSettingsHeading(Canvas c, String s, float left, float y, int h) {
+        setText(h * 0.03f, INK, false, Paint.Align.LEFT, false);
+        text.setTypeface(Typeface.MONOSPACE);
+        c.drawText(s, left, y, text);
+        return y + h * 0.032f;
+    }
+
+    /**
+     * Settings body text, word-wrapped to {@code maxW} at a small size in
+     * {@code color}, starting with a baseline at {@code y}; returns the y
+     * just below the last line plus a small gap.
+     */
+    private float drawSettingsBody(Canvas c, String s, float left, float y, float maxW, int h, int color) {
+        setText(h * 0.022f, color, false, Paint.Align.LEFT, false);
+        float lineH = h * 0.027f;
+        StringBuilder line = new StringBuilder();
+        for (String word : s.split(" ")) {
+            String candidate = line.length() == 0 ? word : line + " " + word;
+            if (line.length() > 0 && text.measureText(candidate) > maxW) {
+                c.drawText(line.toString(), left, y, text);
+                y += lineH;
+                line.setLength(0);
+                line.append(word);
+            } else {
+                line.setLength(0);
+                line.append(candidate);
+            }
+        }
+        if (line.length() > 0) {
+            c.drawText(line.toString(), left, y, text);
+            y += lineH;
+        }
+        return y + h * 0.012f;
+    }
+
+    /**
+     * A settings action button: {@link #drawCommandButton} chrome, dimmed
+     * with an empty hit box while {@code busy} (so a tap can't double-fire
+     * an in-flight import/build), otherwise {@code hitBox} is set to it.
+     */
+    private void drawSettingsButton(Canvas c, RectF box, String label, Bitmap winTex, boolean busy, RectF hitBox) {
+        drawCommandButton(c, box, label, winTex, false);
+        if (busy) {
+            fill.setShader(null);
+            fill.setColor(Color.argb(150, 0, 0, 0));
+            c.drawRect(box, fill);
+            hitBox.setEmpty();
+        } else {
+            hitBox.set(box);
+        }
     }
 
     /**
@@ -2198,6 +2274,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         setText(h * 0.09f, Color.WHITE, true, Paint.Align.CENTER, true);
         text.setTypeface(Typeface.create(Typeface.DEFAULT_BOLD, Typeface.BOLD));
         c.drawText("CHRONO DUO", w / 2f, h / 2f + h * 0.03f, text);
+        // Settings are reachable before a save is loaded: the same gear as
+        // the parchment corner, white, top-left of the black screen.
+        float r = EYE_GLYPH_RADIUS * 2.4f;
+        drawGearToggle(c, r + w * 0.05f, r + h * 0.06f, r, Color.WHITE);
     }
 
     /** Dispatches to whichever parchment content (battle vs map vs field-title) {@code s} calls for. */
@@ -2586,12 +2666,14 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
     @Override
     protected void onDraw(Canvas c) {
-        if (snap.members.isEmpty()) {
-            drawWordmark(c);
-            return;
-        }
+        // Settings first: it draws its own parchment and needs no party, so
+        // it works from the pre-load wordmark screen as well.
         if (settingsMode) {
             drawSettingsScreen(c);
+            return;
+        }
+        if (snap.members.isEmpty()) {
+            drawWordmark(c);
             return;
         }
 
