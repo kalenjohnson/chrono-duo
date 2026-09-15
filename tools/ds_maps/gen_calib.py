@@ -26,6 +26,12 @@ code path from the file-id-keyed version is gone). Each entry:
     {
       "file": <minimap file id, int>,   # the "%03d" component of the
                                          # rendered PNG's name
+      "fog": true,                      # OMITTED when false. Fog-of-war
+                                         # gate (Table1 +6): dungeon map
+                                         # reveals as explored. Present
+                                         # here only for single-floor
+                                         # rooms -- multi-floor rooms
+                                         # carry it per-floor instead.
       "sx": .., "sy": .., "ox": .., "oy": ..,   # present for every
                                          # single-floor room (including
                                          # the "no crop rect" case, which
@@ -40,6 +46,9 @@ code path from the file-id-keyed version is gone). Each entry:
           "file": <int>,                # each floor variant can have a
                                          # genuinely different minimap
                                          # file id -- see Table 2 below
+          "fog": true,                  # OMITTED when false. Per-floor
+                                         # fog-of-war gate (Table1 +6 /
+                                         # Table2 +0xA -- see DATA SOURCES)
           "suffix": <int>,              # 0 = filename has no _N suffix
           "rect_tiles": [x0,y0,x1,y1],
           "sx": .., "sy": .., "ox": .., "oy": ..
@@ -119,8 +128,11 @@ DATA SOURCES (read directly from the ROM at generation time)
                -- Table 2 carries the real per-floor file id instead.
       +4 (u8)  floor-variant start index into Table 2
       +5 (u8)  floor-variant count (0 = single floor, no _1/_2 suffix)
-      +6 (u16) background-tile streaming budget (NOT a scale -- ruled
-               out by cross-reference to the VRAM-upload progress loop)
+      +6 (u16) fog-of-war gate: 0 = map shown in full, nonzero = dungeon
+               whose map reveals as explored (999 = per floor, Table 2
+               +0xA). The "VRAM-upload progress loop" that reads it is
+               the progressive reveal, not a streaming budget. See
+               NOTES.md "Dungeon fog-of-war flag".
 
   Table 2 -- per floor-variant, 12 bytes/entry, overlay 16 @ 0x0219e8c4,
              indexed by Table1.floorStartIndex + local floor index:
@@ -286,6 +298,7 @@ def main():
         map_file_id = ov_rd16(a + 2)
         floor_off = ov_rd8(a + 4)
         floor_cnt = ov_rd8(a + 5)
+        t1_fog = ov_rd16(a + 6)
         key = str(room_id)
 
         if floor_cnt == 0:
@@ -307,6 +320,8 @@ def main():
                 x0, y0, x1, y1 = b0, b1, b2, b3
                 sx, sy, ox, oy = rect_to_calib(x0, y0, x1, y1)
             entry = {"file": map_file_id}
+            if t1_fog != 0:
+                entry["fog"] = True
             entry.update(transform_dict(x0, y0, x1, y1, sx, sy, ox, oy))
             result[key] = entry
         else:
@@ -318,8 +333,17 @@ def main():
                 x0, y0, x1, y1 = raw[0], raw[1], raw[2], raw[3]
                 floor_file_id = struct.unpack_from("<H", raw, 6)[0]
                 suffix = struct.unpack_from("<H", raw, 8)[0]
+                t2_fog = struct.unpack_from("<H", raw, 0xA)[0]
                 sx, sy, ox, oy = rect_to_calib(x0, y0, x1, y1)
                 fentry = {"file": floor_file_id, "suffix": suffix}
+                if t1_fog == 0:
+                    floor_fog = False
+                elif t1_fog == 999:
+                    floor_fog = t2_fog != 0
+                else:
+                    floor_fog = True
+                if floor_fog:
+                    fentry["fog"] = True
                 fentry.update(transform_dict(x0, y0, x1, y1, sx, sy, ox, oy))
                 floors.append(fentry)
 

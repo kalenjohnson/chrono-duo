@@ -145,7 +145,9 @@ public final class DsMapImporter {
     }
 
     // Field order matches Python's json.dump(..., sort_keys=True): alphabetical.
-    // "file" < "floors" < "ox" < "oy" < "rect_tiles" < "sx" < "sy".
+    // "file" < "floors" < "fog" < "ox" < "oy" < "rect_tiles" < "suffix" < "sx" < "sy".
+    // "fog" is omitted entirely when false, so non-fog rooms stay byte-identical
+    // to the pre-fog output.
     private static void appendEntryFields(StringBuilder sb, String indent, RoomTable.CalibEntry e) {
         List<String> fields = new ArrayList<>();
         fields.add(indent + "\"file\": " + e.file);
@@ -158,6 +160,7 @@ public final class DsMapImporter {
                 fb.append(indent).append("  {\n");
                 List<String> ff = new ArrayList<>();
                 ff.add(indent + "    \"file\": " + fe.file);
+                if (fe.fog) ff.add(indent + "    \"fog\": true");
                 ff.add(indent + "    \"ox\": " + jsonNumber(fe.ox));
                 ff.add(indent + "    \"oy\": " + jsonNumber(fe.oy));
                 ff.add(indent + "    \"rect_tiles\": " + rectTilesJson(fe.x0, fe.y0, fe.x1, fe.y1));
@@ -176,6 +179,7 @@ public final class DsMapImporter {
             fb.append(indent).append("]");
             fields.add(indent + fb);
         } else {
+            if (e.fog) fields.add(indent + "\"fog\": true");
             fields.add(indent + "\"ox\": " + jsonNumber(e.ox));
             fields.add(indent + "\"oy\": " + jsonNumber(e.oy));
             fields.add(indent + "\"rect_tiles\": " + rectTilesJson(e.x0, e.y0, e.x1, e.y1));

@@ -275,10 +275,19 @@ public class JavaImportCheck {
                 if (asuf == null || bsuf == null || ((Number) asuf).longValue() != ((Number) bsuf).longValue()) {
                     return false;
                 }
+                if (!fogMatches(fa, fb)) return false;
             }
             return true;
         }
+        if (!fogMatches(a, b)) return false;
         return transformMatches(a, b, eps);
+    }
+
+    /** "fog" is omitted when false, so absence and an explicit false both mean unfogged. */
+    private static boolean fogMatches(Map<String, Object> a, Map<String, Object> b) {
+        boolean af = Boolean.TRUE.equals(a.get("fog"));
+        boolean bf = Boolean.TRUE.equals(b.get("fog"));
+        return af == bf;
     }
 
     private static boolean transformMatches(Map<String, Object> a, Map<String, Object> b, double eps) {

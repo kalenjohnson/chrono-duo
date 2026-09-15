@@ -302,6 +302,16 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private boolean pixelGraphicsOn;
     private final RectF pixelGraphicsHitBox = new RectF();
 
+    // Dungeon fog-of-war toggle row (see FogOfWar) -- same persistence/hit-
+    // test shape as pixelGraphicsOn above, different key, default On (the DS
+    // reveals dungeon minimaps as you walk; towns/houses are unaffected --
+    // see AreaMapCalib.isFogged). "Reset explored maps" wipes all saved
+    // reveal state via FogOfWar.clearAll().
+    private static final String KEY_FOG_ON = "fog_on";
+    private boolean fogOn;
+    private final RectF fogToggleHitBox = new RectF();
+    private final RectF fogResetHitBox = new RectF();
+
     /**
      * Pushes live DS-ROM-import progress/result to the settings screen (see
      * {@link #drawSettingsScreen}); called from AppActivity on the main
@@ -408,6 +418,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         honorHiddenHp = !MODE_FULL.equals(prefs.getString(KEY_ENEMY_HP_MODE, MODE_HONOR));
         pixelGraphicsOn = GameState.getPixelGraphicsPref(context);
+        fogOn = prefs.getBoolean(KEY_FOG_ON, true);
+        FogOfWar.init(context.getFilesDir());
     }
 
     /** Toggles and persists the enemy hidden-HP display setting; called from the eye-glyph tap handler in {@link #onTouchEvent}. */
@@ -444,6 +456,20 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 pixelGraphicsOn = !pixelGraphicsOn;
                 GameState.setPixelGraphicsPref(getContext(), pixelGraphicsOn);
                 if (settingsHost != null) settingsHost.onPixelGraphicsChanged(pixelGraphicsOn);
+                invalidate();
+                return true;
+            }
+            if (!fogToggleHitBox.isEmpty()
+                    && fogToggleHitBox.contains(event.getX(), event.getY())) {
+                fogOn = !fogOn;
+                getContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                        .putBoolean(KEY_FOG_ON, fogOn).apply();
+                invalidate();
+                return true;
+            }
+            if (!fogResetHitBox.isEmpty()
+                    && fogResetHitBox.contains(event.getX(), event.getY())) {
+                FogOfWar.clearAll();
                 invalidate();
                 return true;
             }
@@ -779,7 +805,11 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             // changing (or vice versa). An ordinary position update or a
             // re-read with the same id leaves fieldMapId untouched, so it
             // never lands here.
-            prevAreaMapBitmap = ChronoAssets.getAreaMap(snap.fieldMapId, snap.fieldX, snap.fieldY);
+            // Snapshot the MASKED bitmap (not the raw one) so a fogged room
+            // doesn't suddenly "pop" fully visible for the duration of the
+            // outgoing side's fade -- see maskedAreaMapFor.
+            Bitmap prevRawAreaMap = ChronoAssets.getAreaMap(snap.fieldMapId, snap.fieldX, snap.fieldY);
+            prevAreaMapBitmap = maskedAreaMapFor(snap.fieldMapId, snap.fieldX, snap.fieldY, prevRawAreaMap);
             prevAreaMapId = snap.fieldMapId;
             areaMapFadeStart = System.nanoTime();
         }
@@ -928,6 +958,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         pendingMenuCloseAt = -1L;
         listSel = 0;
         settingsMode = false;
+        FogOfWar.flush();
         ChronoAssets.removeListener(this);
         super.onDetachedFromWindow();
     }
@@ -2007,17 +2038,45 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             importButtonHitBox.set(importBtn);
         }
 
-        float pixelBtnW = parchment.width() * 0.6f;
-        float pixelBtnH = h * 0.065f;
-        RectF pixelBtn = new RectF(parchment.centerX() - pixelBtnW / 2f, parchment.top + h * 0.35f,
-                parchment.centerX() + pixelBtnW / 2f, parchment.top + h * 0.35f + pixelBtnH);
+        // Pixel graphics and Dungeon fog share one row as two half-width
+        // toggles (the 0.6-parchment-width column the other buttons use,
+        // split with a small gap) so the rows below keep their positions.
+        // Slightly shorter than the other buttons so the longest label
+        // ("Pixel graphics: Off") still fits its half at the 0.42*height
+        // label size drawCommandButton uses.
+        float toggleRowW = parchment.width() * 0.6f;
+        float toggleGap = parchment.width() * 0.02f;
+        float toggleW = (toggleRowW - toggleGap) / 2f;
+        float toggleH = h * 0.055f;
+        float toggleTop = parchment.top + h * 0.35f;
+        float toggleLeft = parchment.centerX() - toggleRowW / 2f;
+        RectF pixelBtn = new RectF(toggleLeft, toggleTop, toggleLeft + toggleW, toggleTop + toggleH);
         drawCommandButton(c, pixelBtn, "Pixel graphics: " + (pixelGraphicsOn ? "On" : "Off"), winTex, false);
         pixelGraphicsHitBox.set(pixelBtn);
 
+        RectF fogBtn = new RectF(pixelBtn.right + toggleGap, toggleTop,
+                pixelBtn.right + toggleGap + toggleW, toggleTop + toggleH);
+        // An import made before the fog flag was exported has no fog data:
+        // say so on the button instead of silently never fogging.
+        String fogLabel = fogOn && countDsMaps() > 0 && !AreaMapCalib.hasFogData()
+                ? "Dungeon fog: re-import ROM" : "Dungeon fog: " + (fogOn ? "On" : "Off");
+        drawCommandButton(c, fogBtn, fogLabel, winTex, false);
+        fogToggleHitBox.set(fogBtn);
+
+        // One caption line under each toggle: the restart note under Pixel
+        // graphics, and a small text-style "Reset explored maps" action
+        // under Dungeon fog (its hit box is padded well beyond the glyphs).
+        float captionY = pixelBtn.bottom + h * 0.024f;
         setText(h * 0.018f, Color.argb(190, Color.red(INK), Color.green(INK), Color.blue(INK)),
                 false, Paint.Align.CENTER, false);
-        c.drawText("Takes full effect after restarting the game",
-                parchment.centerX(), pixelBtn.bottom + h * 0.024f, text);
+        c.drawText("Full effect after game restart", pixelBtn.centerX(), captionY, text);
+
+        setText(h * 0.018f, INK, true, Paint.Align.CENTER, false);
+        String resetLabel = "Reset explored maps";
+        c.drawText(resetLabel, fogBtn.centerX(), captionY, text);
+        float resetHalfW = text.measureText(resetLabel) / 2f + w * 0.01f;
+        fogResetHitBox.set(fogBtn.centerX() - resetHalfW, fogBtn.bottom,
+                fogBtn.centerX() + resetHalfW, captionY + h * 0.02f);
 
         float origArtBtnW = parchment.width() * 0.6f;
         float origArtBtnH = h * 0.065f;
@@ -2180,6 +2239,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private void drawFieldContent(Canvas c, RectF parchment, PartySnapshot s, String title, boolean live) {
         int w = getWidth(), h = getHeight();
         Bitmap areaMap = ChronoAssets.getAreaMap(s.fieldMapId, s.fieldX, s.fieldY);
+        // Advance dungeon fog-of-war reveal (only for the live snapshot --
+        // never the fading-out side of a mode crossfade), then swap in the
+        // masked bitmap for drawing below. Both no-ops (raw areaMap
+        // unchanged) when the room isn't fogged or the pref is off.
+        if (live) updateFogOfWar(s);
+        areaMap = maskedAreaMapFor(s.fieldMapId, s.fieldX, s.fieldY, areaMap);
 
         setText(h * (areaMap != null ? 0.045f : 0.075f), INK, true, Paint.Align.CENTER, false);
         text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
@@ -2305,6 +2370,42 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // Scratch buffer for AreaMapCalib.toMapPixel's out param -- reused to
     // avoid an allocation every draw.
     private final float[] areaMapCalibOut = new float[2];
+
+    /**
+     * Advances {@link FogOfWar} reveal for {@code s}'s current room/floor:
+     * a no-op unless the fog pref is on, {@link AreaMapCalib#isFogged} says
+     * this room is a fogged dungeon at the live tile position, and {@link
+     * AreaMapCalib#toMapPixel} resolves that position (both NaN-safe --
+     * an invalid/unknown leader position simply reveals nothing). Cheap per
+     * frame: {@link FogOfWar#reveal} only allocates (a small byte[] clone
+     * handed to its background writer) on the frame a cell newly reveals,
+     * never every frame.
+     */
+    private void updateFogOfWar(PartySnapshot s) {
+        if (!fogOn || s.fieldMapId < 0) return;
+        if (!AreaMapCalib.isFogged(s.fieldMapId, s.fieldX, s.fieldY)) return;
+        if (!AreaMapCalib.toMapPixel(s.fieldMapId, s.fieldX, s.fieldY, areaMapCalibOut)) return;
+        int suffix = AreaMapCalib.suffixFor(s.fieldMapId, s.fieldX, s.fieldY);
+        FogOfWar.reveal(FogOfWar.keyFor(s.fieldMapId, suffix), areaMapCalibOut[0], areaMapCalibOut[1],
+                FogOfWar.DEFAULT_REVEAL_RADIUS_PX);
+    }
+
+    /**
+     * Returns {@code raw} unchanged unless the fog pref is on, {@code raw}
+     * is non-null, and {@link AreaMapCalib#isFogged} says {@code roomId} is
+     * a fogged dungeon at ({@code tileX}, {@code tileY}) -- in which case
+     * returns {@link FogOfWar#applyMask}'s masked copy instead (cached per
+     * room/floor; regenerated only when the mask changes or {@code raw} is
+     * a different bitmap instance, never every frame). Towns/houses and
+     * every draw with the pref off render {@code raw} exactly as before.
+     */
+    private Bitmap maskedAreaMapFor(int roomId, float tileX, float tileY, Bitmap raw) {
+        if (raw == null || !fogOn || roomId < 0) return raw;
+        if (!AreaMapCalib.isFogged(roomId, tileX, tileY)) return raw;
+        int suffix = AreaMapCalib.suffixFor(roomId, tileX, tileY);
+        Bitmap masked = FogOfWar.applyMask(FogOfWar.keyFor(roomId, suffix), raw);
+        return masked != null ? masked : raw;
+    }
 
     /** Looks up s's field position via AreaMapCalib and draws the marker (with {@code markPaint}'s alpha) if it maps to a point inside the drawn area map. */
     private void drawFieldPosMarkerIfCalibrated(Canvas c, PartySnapshot s, int h, Paint markPaint) {

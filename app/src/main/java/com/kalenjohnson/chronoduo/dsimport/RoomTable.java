@@ -20,7 +20,18 @@ import java.util.Map;
  *          the real per-floor file id there instead.
  *   +4 (u8)  cumulative start index into Table 2 for this room's floors
  *   +5 (u8)  floor-variant count (0 = single floor, no _1/_2 suffix)
- *   +6 (u16) background-tile streaming budget (NOT a scale)
+ *   +6 (u16) FOG-OF-WAR flag/size: 0 = the minimap is shown in full
+ *          (towns, houses, hubs, cutscene rooms); nonzero = explorable
+ *          dungeon whose map reveals as the player walks it. 999 is a
+ *          sentinel meaning "per floor, see Table 2 +0xA". Verified
+ *          2026-09-15 against all 669 names: nonzero is exactly the
+ *          dungeon set (Guardia Forest, Prison, Heckran, Denadoro,
+ *          Magus's Castle, Labs, Factory, Sewers, Death Peak, Reptite
+ *          Lair, Tyrano Lair, Black Omen, Blackbird, Mt. Woe, Ocean
+ *          Palace, DS-only Lost Sanctum/Vortex...); zero for every town,
+ *          house, Zeal Palace, End of Time, Arris/Keeper's Dome hubs.
+ *          The magnitude (30..344) is NOT yet understood (not the NSC
+ *          tile count, which is ~468 everywhere) -- treat as a bool.
  *
  * Table 2 -- per floor-variant, 12 bytes/entry, overlay 16 @ 0x0219e8c4:
  *   +0..+3 (4xu8) tile rect X0,Y0,X1,Y1 (unverified for this table, by
@@ -32,6 +43,10 @@ import java.util.Map;
  *   +8 (u16) filename suffix ("_N"; 0 = no suffix -- confirmed against
  *          room 28, whose floors all read suffix 0 and render as a
  *          single unsuffixed area_minimap_028.png)
+ *   +0xA (u16) per-floor fog-of-war value (same meaning as Table1 +6);
+ *          only honoured when Table1 +6 == 999. Room 90 (Prison Catwalks
+ *          ending variant) carries nonzero floor values under a Table1
+ *          zero and is NOT fogged, so Table1 +6 is the gate.
  *
  * Table 3 -- per room, 20 bytes/entry, ARM9 main code @ 0x02059e04:
  *   +0x10 (u32 LE, read as 4 bytes b0..b3) tile rect X0,Y0,X1,Y1, used for
@@ -55,6 +70,7 @@ public final class RoomTable {
         public int suffix;
         public double sx, sy, ox, oy;
         public int x0, y0, x1, y1;
+        public boolean fog;
     }
 
     public static final class CalibEntry {
@@ -66,6 +82,10 @@ public final class RoomTable {
         public double sx, sy, ox, oy;
         public int x0, y0, x1, y1;
         public List<FloorEntry> floors; // null for single-floor rooms
+        // Fog-of-war flag; meaningful only for single-floor rooms (floors
+        // == null) -- multi-floor rooms carry fog per-floor on FloorEntry
+        // instead. See Table1 +6 / Table2 +0xA in the class doc.
+        public boolean fog;
     }
 
     private static int u8(byte[] data, int base, int addr) {
@@ -118,6 +138,7 @@ public final class RoomTable {
                 int mapFileId = u16(overlay16Data, overlay16Base, a + 2);
                 int floorOff = u8(overlay16Data, overlay16Base, a + 4);
                 int floorCnt = u8(overlay16Data, overlay16Base, a + 5);
+                int t1Fog = u16(overlay16Data, overlay16Base, a + 6);
                 String key = Integer.toString(roomId);
 
                 CalibEntry e = new CalibEntry();
@@ -143,8 +164,14 @@ public final class RoomTable {
                     }
                     e.file = mapFileId;
                     e.hasTransform = true;
+                    e.fog = t1Fog != 0;
                     result.put(key, e);
                 } else {
+                    // Multi-floor fog rule (see class doc Table1 +6 / Table2
+                    // +0xA): t1Fog==0 -> every floor unfogged; t1Fog==999 ->
+                    // per-floor value at Table2 +0xA gates each floor;
+                    // any other nonzero (not observed in the ROM) -> every
+                    // floor fogged, defensively.
                     List<FloorEntry> floors = new ArrayList<>(floorCnt);
                     for (int local = 0; local < floorCnt; local++) {
                         int t2 = T2_BASE + (floorOff + local) * 12;
@@ -154,6 +181,7 @@ public final class RoomTable {
                         int y1 = u8(overlay16Data, overlay16Base, t2 + 3);
                         int floorFileId = u16(overlay16Data, overlay16Base, t2 + 6);
                         int suffix = u16(overlay16Data, overlay16Base, t2 + 8);
+                        int t2Fog = u16(overlay16Data, overlay16Base, t2 + 0xA);
 
                         FloorEntry fe = new FloorEntry();
                         fe.x0 = x0; fe.y0 = y0; fe.x1 = x1; fe.y1 = y1;
@@ -161,6 +189,13 @@ public final class RoomTable {
                         fe.sx = c.sx; fe.sy = c.sy; fe.ox = c.ox; fe.oy = c.oy;
                         fe.file = floorFileId;
                         fe.suffix = suffix;
+                        if (t1Fog == 0) {
+                            fe.fog = false;
+                        } else if (t1Fog == 999) {
+                            fe.fog = t2Fog != 0;
+                        } else {
+                            fe.fog = true;
+                        }
                         floors.add(fe);
                     }
 

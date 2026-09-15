@@ -576,3 +576,40 @@ refuses to install one build over another. One-time setup (fish-safe):
     gh secret set KEY_PASSWORD
 
 Back up the `.jks`; if it is lost, future builds cannot install over existing ones.
+
+**Dungeon fog-of-war flag (2026-09-15).** The DS reveals dungeon minimaps as you walk them
+but shows towns/houses in full. The per-room gate is the u16 at **Table 1 +6** (overlay 16
+@ 0x0219efb4, 8 B/room), previously mislabeled a "streaming budget": 0 = full map, nonzero =
+explorable dungeon, 999 = sentinel "per floor" with the real per-floor value at **Table 2
++0xA** (12 B/floor). Table 1 gates: room 90 (Prison Catwalks ending) has zero in T1 and
+nonzero floor values and is not fogged. Verified against the full SNES location list
+(datacrystal.tcrf.net "List of Locations", DS ids == SNES ids for 0..511): 302 nonzero rooms
+are exactly the dungeon set (Guardia Forest, Prison, Heckran, Northern Ruins, Denadoro,
+Manoria, Magus's Castle, Ozzie's Fort, Giant's Claw, Labs 16/32, Factory, Sewers, Death
+Peak, Geno Dome, Mystic Mtn, Forest Maze, Reptite/Tyrano Lair, Hunting Range, Dactyl Nest,
+Black Omen, Blackbird, Mt. Woe, Ocean Palace, Lavos Tunnel, DS-only Lost Sanctum/Vortex
+532-668); 367 zero rooms are every town, house, Zeal Palace, End of Time, Bangor/Trann/
+Keeper's/Arris Dome hubs, endings and battle-only rooms. The magnitude (30..344, plus a
+lone 999 on single-floor DS room 604 and floor 4 of rooms 110/303) is NOT understood: it is
+not the NSC non-empty tile count (~468 for every map). Treat as a boolean until the reveal
+code in overlay 16 is read. Table 1 +0 (4/8/16) is a minimap scale, not a flag (Ocean Palace
+Grand Stairwell = 16). Script: `tools/ds_maps/fog_flag.py` (ndspy) + `tools/ds_maps/snes_locations.txt`. Not yet exported by
+the importer into area_calib.json.
+
+**Dungeon fog-of-war on the panel (2026-09-15).** Importer now writes `"fog": true` per room
+(single-floor) or per floor entry in area_calib.json (omitted when false; `RoomTable`/
+`gen_calib.py`/`JavaImportCheck` all agree, 669/669). `AreaMapCalib.isFogged(room, x, y)` picks
+the floor like `pickFloor`; `hasFogData()` is false for a pre-fog import and the settings toggle
+then reads "Dungeon fog: re-import ROM" (an old on-device import must be re-run once).
+`FogOfWar` keeps a 32x24-cell bitset per `<room>_<suffix>` (8x8 px cells of the 256x192 DS
+minimap), reveals cells within 12 minimap px of the leader's `toMapPixel` position each frame
+(reveal only from the live snapshot), and draws through a cached masked copy of the bitmap
+(cache bounded to 2 keys: current + crossfade-out; the prev-map snapshot is taken masked so
+leaving a room never pops the full map). Persistence: `<filesDir>/fog/<key>.bin`, 96 bytes,
+debounced 2 s per key with a trailing write, flushed on detach, generation-checked so a
+"Reset explored maps" tap can't be undone by an in-flight write. Settings: Pixel graphics and
+Dungeon fog share one row as half-width toggles (0.055h tall so "Pixel graphics: Off" fits),
+"Full effect after game restart" caption under the left one, text-style "Reset explored maps"
+under the right one; every other settings row keeps its original position. Pref `fog_on`
+(default on) in chronoduo_prefs. Reveal radius and cell size are constants in FogOfWar.
+Unverified on device as of writing: settings row fit, reveal radius feel.

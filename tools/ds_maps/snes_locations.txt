@@ -1,0 +1,504 @@
+000 Load Screen
+001 Crono's Kitchen
+002 Crono's Room
+003 Lucca's Kitchen
+004 Lucca's Workshop
+005 Millenial Fair
+006 Gato's Exhibit
+007 Prehistoric Exhibit
+008 Telepod Exhibit
+009 Lara's Room
+00A Lucca's Room
+00B Ending Selector
+00C Truce Inn (Present)
+00D Truce Mayor's Manor 1F
+00E Truce Mayor's Manor 2F
+00F Truce Single Woman Residence
+010 Truce Happy Screaming Couple Residence
+011 Truce Market (Present)
+012 Truce Ticket Office
+013 Guardia Forest (Present)
+014 Guardia Forest Dead End
+015 Guardia Throneroom (Present)
+016 King's Chamber (Present)
+017 Queen's Chamber (Present)
+018 Guardia Kitchen (Present)
+019 Guardia Barracks (Present)
+01A Guardia Basement
+01B Courtroom
+01C Prison Catwalks
+01D Prison Supervisor's Office
+01E Prison Torture Storage Room
+01F Medina Square
+020 Zenan Bridge (Present)
+021 Medina Elder's House 1F
+022 Medina Elder's House 2F
+023 Medina Inn
+024 Medina Portal
+025 Ending: Legendary Hero
+026 Guardia Throneroom (Ending: Legendary Hero)
+027 Medina Market
+028 Melchior's Kitchen
+029 Melchior's Workshop
+02A Forest Ruins
+02B Cursed Woods (Ending: The Unknown Past)
+02C Leene Square (Future)
+02D Denadoro Mountain Vista (Ending: Legendary Hero)
+02E Castle Magus Throne of Defense (Ending: Legendary Hero)
+02F Heckran Cave Passageways
+030 Heckran Cave Entrance
+031 Heckran Cave Underground River
+032 Porre Mayor's Manor 1F (Present)
+033 Porre Mayor's Manor 2F (Present)
+034 Porre Residence (Present)
+035 Snail Stop
+036 Porre Market (Present)
+037 Porre Inn (Present)
+038 Porre Ticket Office
+039 Fiona's Shrine
+03A Choras Mayor's Manor 1F
+03B Choras Mayor's Manor 2F
+03C Castle Magus Hall of Aggression (Ending: Legendary Hero)
+03D Choras Carpenter's Residence (Present)
+03E Choras Inn (Present)
+03F West Cape
+040 Sun Keep (Present)
+041 Northern Ruins Entrance (Present)
+042 Northern Ruins Basement Corridor (Present)
+043 Northern Ruins Landing (Present)
+044 Northern Ruins Antechamber (Present)
+045 Northern Ruins Vestibule (Present)
+046 Northern Ruins Back Room (Present)
+047 Prison Cells
+048 Prison Stairwells
+049 Northern Ruins Hero's Grave (Present)
+04A Unknown
+04B Prison Exterior
+04C Unknown (Lavos Spawn)
+04D Unknown (Lavos Spawn)
+04E Unknown (Lavos Spawn)
+04F Guardia Throneroom (Ending: Moonlight Parade)
+050 Millenial Fair (Ending: Moonlight Parade)
+051 Leene Square (Ending: Moonlight Parade)
+052 Ending Selector
+053 Fiona's Forest Recriminations
+054 End of Time (Ending: Moonlight Parade)
+055 Telepod Exhibit (Ending: Moonlight Parade)
+056 Death Peak Summit (Ending: Moonlight Parade)
+057 Manoria Sanctuary (Ending: The Successor of Guardia)
+058 The End
+059 Zenan Bridge (Ending: Moonlight Parade)
+05A Prison Catwalks (Ending: Moonlight Parade)
+05B Ending: People of the Times (Part 1)
+05C Ending: People of the Times (Part 2)
+05D Ending: People of the Times (Part 3)
+05E Ending: People of the Times (Part 4)
+05F Ending: People of the Times (Part 5)
+060 Black Omen Lavos Spawn
+061 Black Omen 3F Teleporter (no exits)
+062 Black Omen 45F Teleporter
+063 Black Omen Platform (no exit)
+064 Black Omen Platform Shaft (Downward)
+065 Black Omen Platform Shaft (Upward)
+066 Black Omen Celestial Gate (no map)
+067 Black Omen Celestial Gate (no map)
+068 Black Omen Celestial Gate (no map)
+069 Black Omen Celestial Gate (no map)
+06A Black Omen Celestial Gate (no map)
+06B Black Omen Celestial Gate
+06C Lucca Explains Paradoxes
+06D Ancient Tyrano Lair
+06E Ancient Tyrano Lair Traps
+06F Ancient Tyrano Lair Nizbel's Room
+070 Truce Canyon
+071 Truce Canyon Portal
+072 Truce Couple's Residence (Middle Ages)
+073 Truce Smithy's Residence
+074 Truce Inn 1F (Middle Ages)
+075 Truce Inn 2F (Middle Ages)
+076 Truce Market (Middle Ages)
+077 Guardia Forest (Middle Ages)
+078 Guardia Throneroom (Middle Ages)
+079 Guardia King's Chamber (Middle Ages)
+07A Guardia Queen's Chamber (Middle Ages)
+07B Guardia Kitchen (Middle Ages)
+07C Guardia Barracks (Middle Ages)
+07D Castle Magus Doppleganger Corridor
+07E Geno Dome Main Conveyor
+07F Geno Dome Elevator
+080 Geno Dome Long Corridor
+081 Manoria Sanctuary
+082 Manoria Main Hall
+083 Manoria Headquarters
+084 Manoria Royal Guard Hall
+085 Zenan Bridge (Wrecked)
+086 Zenan Bridge (Middle Ages, no map)
+087 Zenan Bridge (Middle Ages)
+088 Sandorino Pervert Residence
+089 Sandorino Elder's House
+08A Sandorino Inn
+08B Sandorino Market
+08C Cursed Woods
+08D Frog's Burrow
+08E Denadoro South Face
+08F Denadoro Cave of the Masamune Exterior
+090 Denadoro North Face
+091 Denadoro Entrance
+092 Denadoro Lower East Face
+093 Denadoro Upper East Face
+094 Denadoro Mountain Vista
+095 Denadoro West Face
+096 Denadoro Gauntlet
+097 Denadoro Cave of the Masamune
+098 Tata's House 1F
+099 Tata's House 2F
+09A Porre Elder's House (Middle Ages)
+09B Porre Cafe (Middle Ages)
+09C Porre Inn (Middle Ages)
+09D Porre Market (Middle Ages)
+09E Fiona's Villa
+09F Sunken Desert Entrance
+0A0 Sunken Desert Parasytes
+0A1 Sunken Desert Devourer
+0A2 Ozzie's Fort Entrance (no map)
+0A3 Magic Cave Exterior
+0A4 Magic Cave Interior
+0A5 Castle Magus Exterior
+0A6 Castle Magus Entrance
+0A7 Castle Magus Chamber of Guillotines
+0A8 Castle Magus Chamber of Pits
+0A9 Castle Magus Throne of Strength
+0AA Castle Magus Hall of Aggression
+0AB Castle Magus Hall of Deceit
+0AC Castle Magus Inner Sanctum
+0AD Castle Magus Throne of Magic
+0AE Castle Magus Throne of Defense
+0AF Castle Magus Hall of Apprehension
+0B0 Castle Magus Lower Battlements
+0B1 Ozzie's Fort Entrance
+0B2 Ozzie's Fort Hall of Disregard
+0B3 Ozzie's Fort Chamber of Kitchen Knives
+0B4 Ozzie's Fort Last Stand
+0B5 Ozzie's Fort Throne of Incompetence
+0B6 Ozzie's Fort Throne of Impertinence (wrong map)
+0B7 Ozzie's Fort Throne of Impertinence
+0B8 Ozzie's Fort Throne of Ineptitude
+0B9 Choras Old Couple Residence (Middle Ages)
+0BA Choras Carpenter's Residence 1F (Middle Ages)
+0BB Choras Carpenter's Residence 2F (Middle Ages)
+0BC Choras Cafe
+0BD Choras Inn (Middle Ages)
+0BE Choras Market (Middle Ages)
+0BF Sun Keep (Middle Ages)
+0C0 (empty map)
+0C1 (empty map)
+0C2 (empty map)
+0C3 Giant's Claw Entrance
+0C4 Giant's Claw Caverns
+0C5 Giant's Claw Last Tyranno
+0C6 Manoria Command
+0C7 Manoria Confinement
+0C8 Manoria Shrine Antechamber
+0C9 Manoria Storage
+0CA Manoria Kitchen
+0CB Manoria Shrine
+0CC Guardia Forest Frog King Battle
+0CD Denadoro Cyrus's Last Battle
+0CE Guardia Throneroom Cyrus's Final Mission
+0CF Schala's Room (no map)
+0D0 Bangor Dome
+0D1 Bangor Dome Sealed Room
+0D2 Trann Dome
+0D3 Trann Dome Sealed Room
+0D4 Lab 16 West
+0D5 Lab 16 East
+0D6 Arris Dome
+0D7 Arris Dome Infestation
+0D8 Arris Dome Auxiliary Console
+0D9 Arris Dome Lower Commons
+0DA Arris Dome Command Central
+0DB Arris Dome Guardian Chamber
+0DC Arris Dome Sealed Room
+0DD Arris Dome Rafters
+0DE Reptite Lair 2F
+0DF Lab 32 West Entrance
+0E0 Lab 32
+0E1 Lab 32 East Entrance
+0E2 Proto Dome
+0E3 Proto Dome Portal
+0E4 Factory Ruins Entrance
+0E5 Factory Ruins Auxiliary Console
+0E6 Factory Ruins Security Center
+0E7 Factory Ruins Crane Room
+0E8 Factory Ruins Infestation
+0E9 Factory Ruins Crane Control Room
+0EA Factory Ruins Information Archive
+0EB Factory Ruins Power Core
+0EC Sewer Access B1
+0ED Sewer Access B2
+0EE Ending: Dream Team (no map) (TBD)
+0EF Ending: A Slide Show?
+0F0 Ending: Goodnight
+0F1 Keeper's Dome
+0F2 Keeper's Dome Corridor
+0F3 Keeper's Dome Hanger
+0F4 Death Peak Entrance
+0F5 Death Peak South Face
+0F6 Death Peak Southeast Face
+0F7 Death Peak Northeast Face
+0F8 Geno Dome Entrance
+0F9 Geno Dome Conveyor Entrance
+0FA Geno Dome Conveyor Exit
+0FB Sun Palace
+0FC Millenial Fair (Ending: Dino Age)
+0FD Sun Keep (Last Village)
+0FE Skill Tutorial
+0FF Sun Keep (Future)
+100 Geno Dome Labs
+101 Geno Dome Storage
+102 Geno Dome Robot Hub
+103 Factory Ruins Data Core
+104 Death Peak Northwest Face
+105 Prehistoric Canyon
+106 Death Peak Upper North Face
+107 Death Peak Lower North Face
+108 Death Peak Cave
+109 Death Peak Summit
+10A Ending: Dream Team (no map) (TBD)
+10B Geno Dome Robot Elevator Access
+10C Geno Dome Mainframe
+10D Geno Dome Waste Disposal
+10E Leene's Square (Ending: Dino Age)
+10F Special Purpose Area
+110 Mystic Mtn Portal
+111 Mystic Mtn Base
+112 Mystic Mtn Gulch
+113 Chief's Hut
+114 Ioka Southwestern Hut
+115 Ioka Trading Post
+116 Ioka Sweet Water Hut
+117 Ioka Meeting Site
+118 Ioka Meeting Site (Party)
+119 Forest Maze Entrance
+11A Forest Maze
+11B Reptite Lair Entrance
+11C Reptite Lair 1F
+11D Reptite Lair Weevil Burrows B1
+11E Reptite Lair Weevil Burrows B2
+11F Reptite Lair Commons
+120 Reptite Lair Tunnel
+121 Reptite Lair Azala's Room
+122 Reptite Lair Access Shaft
+123 Hunting Range
+124 Laruba Ruins
+125 Dactyl Nest, Lower
+126 Dactyl Nest, Upper
+127 Dactyl Nest Summit
+128 Giant's Claw Lair Entrance
+129 Giant's Claw Lair Throneroom
+12A Tyrano Lair Exterior
+12B Tyrano Lair Entrance
+12C Tyrano Lair Throneroom
+12D Tyrano Lair Keep
+12E Tyrano Lair Antechambers
+12F Tyrano Lair Storage
+130 Tyrano Lair Nizbel's Room
+131 Tyrano Lair Room of Vertigo
+132 Debug Room?
+133 Lair Ruins Portal
+134 Black Omen 1F Entrance
+135 Black Omen 1F Walkway
+136 Black Omen 1F Defense Corridor
+137 Black Omen 1F Stairway
+138 Black Omen 3F Walkway
+139 Black Omen Auxilary Command
+13A Black Omen (TBD)
+13B Black Omen (TBD)
+13C Black Omen (TBD)
+13D Black Omen (TBD)
+13E Black Omen (TBD)
+13F Black Omen (TBD)
+140 Black Omen (TBD)
+141 Black Omen (TBD)
+142 Black Omen (TBD)
+143 Black Omen (TBD)
+144 Black Omen (TBD)
+145 Black Omen (TBD)
+146 Black Omen (TBD)
+147 Sunkeep (Prehistoric)
+148 Zeal Palace Schala's Room
+149 Zeal Palace Regal Hall
+14A Zeal Palace Corridor to the Mammon Machine
+14B Zeal Palace Hall of the Mammon Machine
+14C Zeal Palace Zeal Throneroom
+14D Zeal Palace Hall of the Mammon Machine (Night)
+14E Zeal Palace Zeal Throneroom (Night)
+14F Enhasa (wrong map)
+150 Land Bridge (TBD)
+151 Skyway? (TBD)
+152 Present Age Home Room (Ending: The Dream Project)
+153 Prehistoric Age Jungle (Ending: The Dream Project)
+154 Dark Age Ocean Palace Room (Ending: The Dream Project)
+155 Present Age Jail Cell (Ending: The Dream Project)
+156 Dark Age Earthbound Room (Ending: The Dream Project)
+157 Present Age Northern Ruins Room (Ending: The Dream Project)
+158 Arris Dome Food Locker
+159 Lucca's Workshop (Ending: The Oath)
+15A Arris Dome Guardian Chamber (Battle with Lavos)
+15B Prison Catwalks (Battle with Lavos)
+15C Heckran Cave (Battle with Lavos)
+15D Zenan Bridge (Battle with Lavos)
+15E Cave of the Masamune (Battle with Lavos)
+15F Dark Ages Portal
+160 Land Bridge (TBD)
+161 Land Bridge (TBD)
+162 Skyway (TBD)
+163 Enhasa
+164 Skyway (TBD)
+165 Kajar
+166 Kajar Study
+167 Kajar Belthasar's Private Room
+168 Kajar Magic Lab
+169 Zeal Palace Belthasar's Private Room
+16A Blackbird Scaffolding
+16B Blackbird Left Wing
+16C Blackbird Right Port
+16D Blackbird Left Port
+16E Blackbird Overhead
+16F Blackbird Hanger
+170 Blackbird Rear Halls
+171 Blackbird Forward Halls
+172 Blackbird Treasury
+173 Blackbird Cell
+174 Blackbird Barracks
+175 Blackbird Armory 3
+176 Blackbird Inventory
+177 Blackbird Lounge
+178 Blackbird Ducts
+179 Reborn Epoch
+17A Future Age Room (Ending: The Dream Project)
+17B End of Time (Ending: The Dream Project)
+17C Algetty
+17D Algetty Inn
+17E Algetty Elder's Grotto
+17F Algetty Commoner Grotto
+180 Algetty Shop
+181 Algetty Tsunami (wrong map)
+182 Algetty Entrance
+183 The Beast's Nest (wrong map)
+184 The Beast's Nest
+185 Zeal Teleporters
+186 Prehistoric Hut (Ending: The Dream Project)
+187 Castle Magus Room (Ending: The Dream Project)
+188 Mt. Woe Western Face
+189 Mt. Woe Lower Eastern Face
+18A Mt. Woe Middle Eastern Face
+18B Mt. Woe Upper Eastern Face
+18C Mt. Woe Summit (wrong map)
+18D Mt. Woe Summit
+18E Leene Square (Ending: What the Prophet Seeks)
+18F Crono's Kitchen (Ending: What the Prophet Seeks)
+190 The End (Ending: Multiple?)
+191 Zeal Palace
+192 Zeal Palace Hallway
+193 Zeal Palace Study
+194 Ocean Palace Entrance
+195 Ocean Palace Piazza
+196 Ocean Palace Side Rooms
+197 Ocean Palace Forward Area
+198 Ocean Palace B3 Landing
+199 Ocean Palace Grand Stairwell
+19A Ocean Palace B20 Landing
+19B Ocean Palace Southern Access Lift
+19C Ocean Palace Security Pool
+19D Ocean Palace Security Esplanade
+19E Ocean Palace Regal Antechamber
+19F Ocean Palace Throneroom
+1A0 Ocean Palace (TBD)
+1A1 Ocean Palace Eastern Access Lift
+1A2 Ocean Palace Western Access Lift
+1A3 Ocean Palace Time Freeze (wrong map)
+1A4 Ocean Palace Time Freeze (wrong map)
+1A5 Ocean Palace Time Freeze (wrong map)
+1A6 Time Distortion Mammon Machine
+1A7 Ocean Palace Time Freeze
+1A8 Last Village Commons
+1A9 Last Village Empty Hut
+1AA Last Village Shop
+1AB Last Village Residence
+1AC North Cape
+1AD Death Peak Summit
+1AE Tyrano Lair Main Cell
+1AF Title Screen (wrong map)
+1B0 Flying Epoch
+1B1 Title Screen
+1B2 Bekkler's Lab
+1B3 Magic Cave Exterior (after cutscene)
+1B4 Fiona's Forest Campfire
+1B5 Factory Ruins (TBD)
+1B6 Courtroom King's Trial
+1B7 Leene Square
+1B8 Guardia Rear Storage
+1B9 Courtroom Lobby
+1BA Blackbird Access Shaft
+1BB Blackbird Armory 2
+1BC Blackbird Armory 1
+1BD Blackbird Storage
+1BE Castle Magus Upper Battlements
+1BF Castle Magus Grand Stairway
+1C0 (Bad Event Data Packet)
+1C1 Black Omen Entrance
+1C2 Black Omen Omega Defense
+1C3 Black Omen Seat of Agelessness
+1C4 (Bad Event Data Packet)
+1C5 (Bad Event Data Packet)
+1C6 (Bad Event Data Packet)
+1C7 (Bad Event Data Packet)
+1C8 Reptite Lair (Battle with Lavos)
+1C9 Castle Magus Inner Sanctum (Battle with Lavos)
+1CA Tyrano Lair Keep (Battle with Lavos)
+1CB Mt. Woe Summit (Battle with Lavos)
+1CC Credits (TBD)
+1CD (Empty Data)
+1CE (Empty Data)
+1CF (Empty Data)
+1D0 End of Time
+1D1 Spekkio
+1D2 Apocalypse Lavos
+1D3 Lavos
+1D4 Guardia Queen's Tower (Middle Ages)
+1D5 Castle Magus Corridor of Combat
+1D6 Castle Magus Hall of Ambush
+1D7 Castle Magus Dungeon
+1D8 Apocalypse Epoch
+1D9 End of Time Epoch
+1DA Lavos Tunnel
+1DB Lavos Core
+1DC Truce Dome
+1DD Emergence of the Black Omen
+1DE Blackbird Wing Access
+1DF Tesseract
+1E0 Guardia King's Tower (Middle Ages)
+1E1 Death of the Blackbird
+1E2 Blackbird (no exits)
+1E3 Blackbird (no exits)
+1E4 Blackbird (no exits)
+1E5 Blackbird (no exits)
+1E6 Guardia King's Tower (Present)
+1E7 Guardia Queen's Tower (Present)
+1E8 Guardia Lawgiver's Tower
+1E9 Guardia Prison Tower
+1EA Ancient Tyrano Lair Room of Vertigo
+1EB (empty map)
+1EC (empty map)
+1ED Algetty Tsunami
+1EE Paradise Lost
+1EF Death Peak Guardian Spawn
+1F0 Present
+1F1 Middle Ages
+1F2 Future
+1F3 Prehistoric
+1F4 Dark Ages
+1F5 Kingdom of Zeal
+1F6 Last Village
+1F7 Apocalypse

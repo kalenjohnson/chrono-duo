@@ -27,24 +27,27 @@ import java.util.Iterator;
  * minimap file ids through a ROM table that is not the identity: e.g. the
  * Cathedral, room id 129, has no {@code area_minimap_129.png} -- its content
  * lives under a different file id, resolved via {@link #fileIdFor(int)}).
- * Each value is {@code {"file": <int>, "sx":.., "sy":.., "ox":.., "oy":..,
- * "rect_tiles":[x0,y0,x1,y1]}} for a single-floor room, or {@code {"file":
- * <int>, "floors": [ {"file":.., "suffix":.., "sx":.., ...}, ... ]}} for a
- * multi-floor room (no top-level transform in that case -- each floor
- * carries its own). {@link #load(File)} parses that file into {@link
- * #TABLE}/{@link #FLOORS}/{@link #FILES}.
+ * Each value is {@code {"file": <int>, "fog": true (omitted when false),
+ * "sx":.., "sy":.., "ox":.., "oy":.., "rect_tiles":[x0,y0,x1,y1]}} for a
+ * single-floor room, or {@code {"file": <int>, "floors": [ {"file":..,
+ * "fog":.., "suffix":.., "sx":.., ...}, ... ]}} for a multi-floor room (no
+ * top-level transform or fog flag in that case -- each floor carries its
+ * own). {@code "fog"} is the dungeon fog-of-war reveal gate, exposed via
+ * {@link #isFogged(int, float, float)}. {@link #load(File)} parses that
+ * file into {@link #TABLE}/{@link #FLOORS}/{@link #FILES}/{@link #FOG}.
  */
 public final class AreaMapCalib {
     private static final String TAG = "AreaMapCalib";
 
     private AreaMapCalib() {}
 
-    /** One floor variant's own file id, filename suffix, and transform. */
+    /** One floor variant's own file id, filename suffix, transform, and fog flag. */
     private static final class Floor {
         int file;
         int suffix;
         float sx, sy, ox, oy;
         float x0, y0, x1, y1;
+        boolean fog;
     }
 
     // Per-room single-floor transform {sx, sy, ox, oy}, keyed by room id.
@@ -56,6 +59,9 @@ public final class AreaMapCalib {
     private static final SparseArray<Integer> FILES = new SparseArray<>();
     // Per-room floor list, present only for multi-floor rooms.
     private static final SparseArray<Floor[]> FLOORS = new SparseArray<>();
+    // Per-room fog-of-war flag for single-floor rooms only (meaningless/absent
+    // for multi-floor rooms, which look up fog per-floor via FLOORS instead).
+    private static final SparseArray<Boolean> FOG = new SparseArray<>();
 
     /**
      * Resolves the minimap PNG file id for {@code roomId} (the "%03d" in
@@ -106,6 +112,41 @@ public final class AreaMapCalib {
             }
         }
         return floors[0];
+    }
+
+    /**
+     * Fog-of-war flag for a live field-tile position: for a multi-floor
+     * room, the flag of whichever floor {@link #pickFloor} would choose
+     * (NaN coordinates fall back to the first floor, same as {@link
+     * #fileIdFor(int, float, float)}); for a single-floor room, the room's
+     * own flag. Returns {@code false} when {@code roomId} is unknown or the
+     * calibration table isn't loaded.
+     */
+    public static boolean isFogged(int roomId, float tileX, float tileY) {
+        Floor[] floors = FLOORS.get(roomId);
+        if (floors != null) {
+            Floor f = pickFloor(roomId, tileX, tileY);
+            return f != null && f.fog;
+        }
+        Boolean fog = FOG.get(roomId);
+        return fog != null && fog;
+    }
+
+    /**
+     * True once the loaded calibration carries any fog flag at all. An
+     * {@code area_calib.json} written by an importer older than the fog
+     * export has none, in which case every room reads as unfogged and the
+     * settings screen asks for a ROM re-import -- see PartyPanelView.
+     */
+    public static boolean hasFogData() {
+        for (int i = 0; i < FOG.size(); i++) if (FOG.valueAt(i)) return true;
+        for (int i = 0; i < FLOORS.size(); i++) for (Floor f : FLOORS.valueAt(i)) if (f.fog) return true;
+        return false;
+    }
+
+    /** {@link #isFogged(int, float, float)} with no live position known (NaN/NaN). */
+    public static boolean isFogged(int roomId) {
+        return isFogged(roomId, Float.NaN, Float.NaN);
     }
 
     /**
@@ -165,6 +206,7 @@ public final class AreaMapCalib {
             Log.w(TAG, "failed to parse " + jsonFile, e);
             return;
         }
+        FOG.clear();
         Iterator<String> keys = root.keys();
         int loaded = 0;
         while (keys.hasNext()) {
@@ -193,6 +235,7 @@ public final class AreaMapCalib {
                         f.sy = (float) fj.getDouble("sy");
                         f.ox = (float) fj.getDouble("ox");
                         f.oy = (float) fj.getDouble("oy");
+                        f.fog = fj.optBoolean("fog", false);
                         JSONArray rect = fj.getJSONArray("rect_tiles");
                         f.x0 = (float) rect.getDouble(0);
                         f.y0 = (float) rect.getDouble(1);
@@ -208,6 +251,7 @@ public final class AreaMapCalib {
                     float ox = (float) entry.getDouble("ox");
                     float oy = (float) entry.getDouble("oy");
                     TABLE.put(id, new float[]{sx, sy, ox, oy});
+                    FOG.put(id, entry.optBoolean("fog", false));
                     FLOORS.remove(id);
                 }
                 loaded++;
