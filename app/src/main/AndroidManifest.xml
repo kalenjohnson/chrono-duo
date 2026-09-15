@@ -6,6 +6,11 @@
         <package android:name="com.square_enix.android_googleplay.chrono" />
     </queries>
 
+    <!-- Mods catalog: refresh check (raw.githubusercontent.com) and direct/Nexus-page
+         downloads (see com.kalenjohnson.chronoduo.mods.ModCatalog, AppActivity's
+         downloadAndImportMod/openModWebView). -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
     <application
         android:label="ChronoDuo"
         android:icon="@mipmap/ic_launcher"
@@ -24,6 +29,39 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- ".ctp" mod archive handler (see AppActivity#handleViewIntent): opening
+                 a downloaded/shared .ctp file offers ChronoDuo. Android's pathPattern
+                 globbing only treats '.' as a literal in the segment it's next to, so
+                 three variants (0/1/2 extra dots before ".ctp") are needed to match
+                 filenames with a varying number of dots (see the AOSP pathPattern
+                 caveat this mirrors elsewhere in the ecosystem. Two filters: one for
+                 "*/*" (a generic/undeclared content type) and one for the two concrete
+                 types a browser or file manager commonly reports for an unrecognized
+                 archive extension. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="*/*" />
+                <data android:pathPattern=".*\\.ctp" />
+                <data android:pathPattern=".*\\..*\\.ctp" />
+                <data android:pathPattern=".*\\..*\\..*\\.ctp" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="application/zip" />
+                <data android:pathPattern=".*\\.ctp" />
+                <data android:pathPattern=".*\\..*\\.ctp" />
+                <data android:pathPattern=".*\\..*\\..*\\.ctp" />
             </intent-filter>
         </activity>
     </application>

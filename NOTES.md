@@ -675,3 +675,73 @@ key-item mapping, and the meaning of the char-record `+1A` field (`9 999 999` se
   one-time migration in `AppActivity.migrateSaves` (moves `Chrono_sp_*`, `meta.bin`,
   `common.bin`, `UserDefault.xml`). Local builds are debug-signed → cannot install over the
   CI build; this Thor was uninstalled/reinstalled (versionCode 99).
+
+## Mods research (2026-09-15)
+
+Goal: turn ChronoDuo into a mod loader. Findings from the device archive
+inventory (`resources.bin` pulled from `split_assetPack.apk`, 9,494 entries,
+434 MiB uncompressed) and from `reference/ChronoMod` (Steam tool):
+
+- **Substitution point already exists**: the `ctr::ResourceManager::getData`
+  hook (gamestate.c ~840) is the single choke point for every archive read
+  (png/bmp/dat/bin/txt), falls through to ARC1 on a miss, returns raw bytes.
+  cocos `FileUtils` search paths are irrelevant here — the game reads through
+  its own archive, so a "search path overlay" would never be consulted.
+  Caveat: the registry keys on **basename only**. A general loader must key
+  on the full archive path (e.g. `Localize/en/msg/tech.txt` vs `.../ja/...`).
+- **Steam ↔ Android**: same ARC1 container and XOR/gzip scheme (our reader is
+  a port of ChronoMod's `resourcebin.cpp` and reads the Android archive).
+  ChronoMod `.ctp` patches are plain ZIPs whose entry names are archive paths
+  → a `.ctp` can be unzipped straight into a mod directory. Entry-name parity
+  with the Steam archive is NOT yet verified (need a Steam `resources.bin`
+  listing to diff against `entries.txt`).
+- **Fonts differ**: Steam ships TTFs as `string_N.bin` (encrypted with the
+  save key; ChronoMod "Replace Font"). The Android archive has **no**
+  `string_*.bin` / `.ttf` at all (only bitmap `staff_font.png`, `font2*`).
+  Android text is presumably rendered via `Cocos2dxBitmap` (system Typeface)
+  → a font mod on Android = swap the Typeface in the vendored Java class,
+  not an asset swap. Unverified.
+- **Archive layout**: `Game/` 8,008 (field 4,616 / chara 2,452 / battle 649 /
+  world 150 / common 73 / special 61), `Localize/<lang>/{msg,png,cell}` for
+  ja, zh-Hant, zh-Hans, ko, it, fr, es, en, de (86–87 msg txt files each:
+  cmes0–5, kmes0–2, mes*, menu, system, item*, tech, tec_mes, monster,
+  bgm, map, w_map, zukan, tutorial…), `Sound/` 505 `.sab` (SEAD banks:
+  BGM/ 85, SE/ 419) + `sead.config`, `Extension/` 53 (face.png 96×88 grid,
+  menu_win.png, shop_win.png, battle_interface.png, softkeywindow.png,
+  13 `ex_NNNN_name.png` portraits), `illust/` 25, `ending/` 19.
+- **Enemy data**: `Game/common/MonsterDataTable.dat`, `MonsterGainTable.dat`
+  (exp/gold/tp presumably), `Game/battle/tblb/Monster{Attack,Technic}Effect
+  Table.dat`, `MonsterNameData.dat`; `Game/battle/monact/` 336 = enemy AI
+  scripts. Hard mode = patch MonsterDataTable.dat at load (file-level mod,
+  no memory writes needed). Record layout not yet decoded.
+- **Tech/item tables**: `Game/battle/tblb/{ItemColTbl,ItemEffectTable,
+  ItemSeqTbl,PlayerTechnicEffectTable,TechConbi{Index,Obtain}Tbl,
+  TechTarget{Oft,Set}Tbl}.dat`, `Game/common/{ItemInfoDataTable,
+  ItemMenuDataTable,TechnicBaseDataTable,TechnicData0/1Table,
+  TechnicMemberTable,TechnicMpTable}.dat`; text `item_mes.txt`,
+  `item_mes2.txt`, `tec_mes.txt` per language.
+- **Game speed**: nothing researched yet. `Director::getInstance()` is
+  exported; `Scheduler::setTimeScale` would be the obvious lever (needs
+  GL-thread call), untested.
+
+### Mod loader shipped (2026-09-15, later)
+
+- Native: mods use their own full-archive-path keyed hash table (checked
+  before the basename-keyed orig_art table, never gated by the pixel pref);
+  `nativeRegisterModSubstitutions` swaps the table wholesale.
+- Java: `mods/ModManager` (`<externalFilesDir>/mods/<name>/` mirrors archive
+  paths, `.disabled` marker, `.source` provenance, nested `.ctp`/`.zip`
+  expanded in place — Nexus wraps the author's .ctp in an outer zip),
+  `mods/ModCatalog` (bundled `assets/mods/catalog.json`, refreshed from the
+  repo's raw GitHub URL when reachable). Boot scan is synchronous in
+  onCreate so the first getData already sees the table.
+- UI: Settings → Mods page lists the catalog; "Get" opens the Nexus page in
+  a WebView inside the bottom-screen Presentation (login untested — the IME
+  on a secondary display is the risk), its DownloadListener hands us
+  URL+cookies and we download/import/enable in-app. Fallback: "Import
+  file…" picker, and a `.ctp` VIEW intent-filter.
+- **Verified offline**: Nexus mod 9 (SNES Overworld Sprites Restoration) =
+  a single `Game/common/worldChara.png`, 384×384 like the Android original,
+  same 7×8+7 frame grid, 46 colours vs 37,919 — a drop-in for the one
+  sheet `rebuild_worldchara.py` proved unrebuildable. Steam ↔ Android file
+  parity therefore holds at least for this path.

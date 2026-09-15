@@ -62,6 +62,21 @@ public class AppActivity extends Cocos2dxActivity {
     // pattern as REQUEST_ROM_IMPORT above, distinct code so onActivityResult
     // can tell the two pickers apart.
     private static final int REQUEST_SAVE_IMPORT = 4243;
+    // Request code for the SAF document picker used by requestModImport/
+    // launchModPicker (mod .ctp/.zip import) -- same startActivityForResult
+    // pattern as REQUEST_ROM_IMPORT/REQUEST_SAVE_IMPORT above, distinct code
+    // so onActivityResult can tell the three pickers apart.
+    private static final int REQUEST_MOD_IMPORT = 4244;
+    // User mod loader (see com.kalenjohnson.chronoduo.mods.ModManager) --
+    // instantiated once ext (the external files dir) is known, in onCreate.
+    private com.kalenjohnson.chronoduo.mods.ModManager modManager;
+    // Curated mod catalog (see com.kalenjohnson.chronoduo.mods.ModCatalog) --
+    // loaded in the background in onCreate (loadModCatalog) and refreshed
+    // into this field + the panel every time it (re)loads. Volatile: read
+    // from the main thread (findCatalogEntry, for a "Get" tap) and from
+    // background import threads (handleViewIntent's fileHint match).
+    private volatile java.util.List<com.kalenjohnson.chronoduo.mods.ModCatalog.Entry> modCatalog =
+            java.util.Collections.emptyList();
     // Cancel signal for a background OrigArtRebuilder.rebuildAll pass (see
     // requestOrigArtBuild) -- polled between sheets by that call's own
     // BooleanSupplier param, set true in onDestroy so a build in flight when
@@ -169,6 +184,15 @@ public class AppActivity extends Cocos2dxActivity {
             @Override public void requestSaveImport() {
                 launchSavePicker();
             }
+            @Override public void requestModImport() {
+                launchModPicker();
+            }
+            @Override public void onModToggled(String name, boolean enabled) {
+                setModEnabled(name, enabled);
+            }
+            @Override public void requestModGet(String id) {
+                AppActivity.this.requestModGet(id);
+            }
         });
         controllerInput.ensureConnected();
         // Physical hat-axis d-pad left/right (see GameControllerInput.
@@ -201,6 +225,25 @@ public class AppActivity extends Cocos2dxActivity {
         renderWorldMaps();
         // Original-sprite replacements ride on the pixel-graphics preference.
         if (com.kalenjohnson.chronoduo.GameState.getPixelGraphicsPref(this)) scanOrigArtReplacements();
+        // Mods are unconditional -- unlike orig_art above, they don't ride on
+        // any preference. The boot scan runs synchronously: the game's first
+        // asset reads happen on the GL thread once the surface exists (after
+        // onCreate returns), so registering here guarantees even the very
+        // first getData() sees the mod table. Walking a few thousand files
+        // takes tens of ms. Later rescans (import/toggle) go through the
+        // background-thread scanMods().
+        modManager = new com.kalenjohnson.chronoduo.mods.ModManager(ext != null ? ext : getFilesDir());
+        try {
+            modManager.scan();
+        } catch (Throwable t) {
+            Log.e(TAG, "boot mod scan failed", t);
+        }
+        updateModsStatus(false, null);
+        loadModCatalog();
+        // A .ctp opened from outside (browser download, file manager, "Open
+        // with" on a shared file) before the app was running arrives as the
+        // launch intent rather than onNewIntent -- see handleViewIntent.
+        handleViewIntent(getIntent());
 
         com.kalenjohnson.chronoduo.GameState.attach();
         // Frame-perfect menu parking: a per-rendered-frame GL tick that kills
@@ -654,6 +697,305 @@ public class AppActivity extends Cocos2dxActivity {
         });
     }
 
+    // --- mod loader (see com.kalenjohnson.chronoduo.mods.ModManager) --------
+
+    /**
+     * Runs {@link com.kalenjohnson.chronoduo.mods.ModManager#scan} on a
+     * background thread (file IO) and posts the result to the bottom-screen
+     * panel's settings view. Called at boot (see {@link #onCreate}) and
+     * after every import/toggle.
+     */
+    private void scanMods() {
+        if (modManager == null) return;
+        final com.kalenjohnson.chronoduo.mods.ModManager mm = modManager;
+        new Thread(() -> {
+            mm.scan();
+            updateModsStatus(false, null);
+        }, "ChronoModScan").start();
+    }
+
+    /** Launches the SAF document picker so the user can pick a mod archive (.ctp/.zip). Mirrors {@link #launchSavePicker()}. */
+    private void launchModPicker() {
+        android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(android.content.Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        try {
+            startActivityForResult(intent, REQUEST_MOD_IMPORT);
+        } catch (android.content.ActivityNotFoundException e) {
+            Log.w(TAG, "no document picker available", e);
+            updateModsStatus(false, "no file picker available on this device");
+        }
+    }
+
+    /**
+     * Imports {@code uri} (a user-picked mod archive from {@link
+     * #launchModPicker()}) via {@link
+     * com.kalenjohnson.chronoduo.mods.ModManager#importArchive(android.net.Uri, android.content.ContentResolver)}
+     * on a background thread, then pushes the resulting mod list/status to
+     * the panel. Mirrors {@link #importSaveFromUri}.
+     */
+    private void importModFromUri(android.net.Uri uri) {
+        if (modManager == null) return;
+        updateModsStatus(true, null);
+        final com.kalenjohnson.chronoduo.mods.ModManager mm = modManager;
+        new Thread(() -> {
+            try {
+                mm.importArchive(uri, getContentResolver());
+                updateModsStatus(false, null);
+            } catch (Throwable t) {
+                Log.e(TAG, "mod import failed", t);
+                updateModsStatus(false, t.getMessage() != null ? t.getMessage() : t.toString());
+            }
+        }, "ChronoModImport").start();
+    }
+
+    /** Flips a mod's enabled state via {@link com.kalenjohnson.chronoduo.mods.ModManager#setEnabled} on a background thread, then pushes the result. Called from the settings screen's per-row toggle button. */
+    private void setModEnabled(String name, boolean enabled) {
+        if (modManager == null) return;
+        final com.kalenjohnson.chronoduo.mods.ModManager mm = modManager;
+        new Thread(() -> {
+            mm.setEnabled(name, enabled);
+            updateModsStatus(false, null);
+        }, "ChronoModToggle").start();
+    }
+
+    /** Posts the current mod list and an optional status/error message to the bottom-screen panel's settings view, if one is currently showing -- a no-op otherwise. Safe from any thread. Mirrors {@link #updateOrigArtStatus}. */
+    private void updateModsStatus(boolean importing, String error) {
+        final java.util.List<com.kalenjohnson.chronoduo.mods.ModManager.ModInfo> mods =
+                modManager != null ? modManager.lastMods() : java.util.Collections.emptyList();
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+            PartyPanelView panel = secondScreen != null ? secondScreen.getPanel() : null;
+            if (panel == null) return;
+            panel.setModsList(mods);
+            panel.setModsStatus(importing, error);
+        });
+    }
+
+    // --- curated mod catalog (see com.kalenjohnson.chronoduo.mods.ModCatalog) ----------
+
+    /** Loads the mod catalog in the background (bundled/cached/freshly-fetched -- see {@link com.kalenjohnson.chronoduo.mods.ModCatalog#loadAsync}) and pushes it to {@link #modCatalog} plus the settings panel once it's ready. Called once from {@link #onCreate}. */
+    private void loadModCatalog() {
+        com.kalenjohnson.chronoduo.mods.ModCatalog.loadAsync(this, entries -> {
+            modCatalog = entries;
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                PartyPanelView panel = secondScreen != null ? secondScreen.getPanel() : null;
+                if (panel != null) panel.setModCatalog(entries);
+            });
+        });
+    }
+
+    private com.kalenjohnson.chronoduo.mods.ModCatalog.Entry findCatalogEntry(String id) {
+        for (com.kalenjohnson.chronoduo.mods.ModCatalog.Entry e : modCatalog) {
+            if (e.id.equals(id)) return e;
+        }
+        return null;
+    }
+
+    /**
+     * A catalog row's "Get" button was tapped (see {@code
+     * PartyPanelView.SettingsHost#requestModGet}). If the entry has a direct
+     * {@code download} URL, downloads and imports it straight away (flow
+     * 3a); otherwise (the common Nexus case) opens its {@code page} in the
+     * bottom screen's in-app WebView so the user can log in / hit the
+     * in-page Download button, and waits for that WebView's {@code
+     * DownloadListener} to fire (flow 3b -- see {@link #openModWebView}).
+     */
+    private void requestModGet(String id) {
+        com.kalenjohnson.chronoduo.mods.ModCatalog.Entry entry = findCatalogEntry(id);
+        if (entry == null) {
+            Log.w(TAG, "mods: requestModGet for unknown catalog id " + id);
+            return;
+        }
+        if (entry.download != null && !entry.download.isEmpty()) {
+            downloadAndImportMod(entry, entry.download, null, null, null, null);
+        } else {
+            openModWebView(entry);
+        }
+    }
+
+    /** Opens {@code entry.page} in the bottom screen's mod WebView overlay (see {@link com.kalenjohnson.chronoduo.SecondScreenPresentation#openModWebView}) and wires its download callback into {@link #downloadAndImportMod}. No-op (with a status message) if no second-screen Presentation is currently showing. */
+    private void openModWebView(com.kalenjohnson.chronoduo.mods.ModCatalog.Entry entry) {
+        com.kalenjohnson.chronoduo.SecondScreenPresentation presentation =
+                secondScreen != null ? secondScreen.getPresentation() : null;
+        if (presentation == null) {
+            updateModsStatus(false, "no second screen available to open " + entry.name);
+            return;
+        }
+        presentation.openModWebView(entry.page, new com.kalenjohnson.chronoduo.SecondScreenPresentation.ModWebViewHost() {
+            @Override public void onDownloadStart(String url, String userAgent, String contentDisposition,
+                                                   String mimeType, long contentLength, String cookie) {
+                com.kalenjohnson.chronoduo.SecondScreenPresentation p =
+                        secondScreen != null ? secondScreen.getPresentation() : null;
+                if (p != null) p.setWebViewStatus("Downloading " + entry.name + "...");
+                String suggested = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType);
+                Runnable closeWebView = () -> {
+                    com.kalenjohnson.chronoduo.SecondScreenPresentation p2 =
+                            secondScreen != null ? secondScreen.getPresentation() : null;
+                    if (p2 != null) p2.closeModWebView();
+                };
+                downloadAndImportMod(entry, url, cookie, userAgent, suggested, closeWebView);
+            }
+            @Override public void onClosed() {
+                // Nothing to clean up here -- the mod-get itself (if a
+                // download did start) runs independently of the overlay's
+                // lifetime; its own status lands via updateModsStatus.
+            }
+        });
+    }
+
+    /**
+     * Downloads {@code url} (an entry's direct {@code download}, or a URL
+     * handed to us by the mod WebView's {@code DownloadListener}) to a temp
+     * file under {@link #getCacheDir()} on a background thread, then imports
+     * it under {@code entry.id} and enables it (see {@link
+     * com.kalenjohnson.chronoduo.mods.ModManager#importCatalogMod}), posting
+     * progress/result through {@link #updateModsStatus} the same way every
+     * other mod action here does. {@code cookie}/{@code userAgent} are
+     * forwarded as request headers when non-null/non-empty (a WebView
+     * download's cookie header only matters for same-origin URLs -- a
+     * pre-signed CDN download URL won't have one, which is fine). {@code
+     * onDownloadComplete}, if non-null, runs on the main thread once the
+     * bytes are fully down (success or failure) -- used to close the mod
+     * WebView overlay per the spec ("on completion close the WebView,
+     * import...").
+     */
+    private void downloadAndImportMod(com.kalenjohnson.chronoduo.mods.ModCatalog.Entry entry, String url,
+                                       String cookie, String userAgent, String suggestedName,
+                                       Runnable onDownloadComplete) {
+        if (modManager == null) return;
+        updateModsStatus(true, null);
+        final com.kalenjohnson.chronoduo.mods.ModManager mm = modManager;
+        new Thread(() -> {
+            File tmp = null;
+            Throwable failure = null;
+            try {
+                tmp = File.createTempFile("mod_", ".dl", getCacheDir());
+                java.net.HttpURLConnection conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                conn.setInstanceFollowRedirects(true);
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(30000);
+                if (cookie != null && !cookie.isEmpty()) conn.setRequestProperty("Cookie", cookie);
+                if (userAgent != null && !userAgent.isEmpty()) conn.setRequestProperty("User-Agent", userAgent);
+                int code = conn.getResponseCode();
+                if (code < 200 || code >= 300) {
+                    throw new java.io.IOException("HTTP " + code + " downloading " + entry.name);
+                }
+                try (java.io.InputStream in = conn.getInputStream();
+                     java.io.FileOutputStream out = new java.io.FileOutputStream(tmp)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                }
+            } catch (Throwable t) {
+                failure = t;
+            }
+            if (onDownloadComplete != null) {
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(onDownloadComplete);
+            }
+            if (failure == null) {
+                try {
+                    String name = suggestedName != null ? suggestedName : url;
+                    if (!looksLikeModArchive(name)) {
+                        Log.w(TAG, "mods: '" + name + "' doesn't look like a .ctp/.zip -- importing anyway");
+                    }
+                    try (java.io.InputStream in = new java.io.FileInputStream(tmp)) {
+                        mm.importCatalogMod(in, entry.id, entry.page != null ? entry.page : url);
+                    }
+                    mm.setEnabled(entry.id, true);
+                    updateModsStatus(false, null);
+                } catch (Throwable t) {
+                    failure = t;
+                }
+            }
+            if (failure != null) {
+                Log.e(TAG, "mod get failed for " + entry.id, failure);
+                String msg = failure.getMessage() != null ? failure.getMessage() : failure.toString();
+                String lower = msg.toLowerCase(java.util.Locale.ROOT);
+                if (lower.contains("central directory") || lower.contains("not in gzip")
+                        || lower.contains("zip")) {
+                    // ZipInputStream can't read 7z/rar -- Nexus mods are
+                    // frequently packaged as one of those, so name the
+                    // limitation explicitly rather than a bare stack-trace
+                    // message.
+                    msg = "not a zip archive (7z/rar not supported): " + msg;
+                }
+                updateModsStatus(false, msg);
+            }
+            if (tmp != null) tmp.delete();
+        }, "ChronoModGet").start();
+    }
+
+    private static boolean looksLikeModArchive(String name) {
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
+        return lower.endsWith(".ctp") || lower.endsWith(".zip");
+    }
+
+    /**
+     * Handles a {@code .ctp} VIEW intent (see the manifest's intent-filters,
+     * {@link #onCreate}'s {@code handleViewIntent(getIntent())}, and {@link
+     * #onNewIntent}): imports the file under a catalog id if its display
+     * name matches a catalog entry's {@code fileHint} (so it lands exactly
+     * where a catalog "Get" would have put it, and shows as installed on the
+     * Mods page), otherwise falls back to the normal sanitized-display-name
+     * import (same as the "Import file..." picker). No-op for any other
+     * intent (action/data), or before {@link #modManager} exists.
+     */
+    private static final String MODS_PREFS = "chronoduo_mods";
+    private static final String PREF_LAST_CTP_URI = "last_ctp_uri";
+
+    private void handleViewIntent(android.content.Intent intent) {
+        if (intent == null || !android.content.Intent.ACTION_VIEW.equals(intent.getAction())) return;
+        final android.net.Uri uri = intent.getData();
+        if (uri == null || modManager == null) return;
+        // singleTask means a cold relaunch (process killed, then reopened
+        // from Recents) calls onCreate again with the SAME launching Intent
+        // -- ActivityManager persists it independent of this process, so an
+        // in-memory "consume the intent" flag wouldn't survive the restart.
+        // Without this check, every such relaunch would silently re-import
+        // and re-enable the mod, undoing a manual "Off" toggle. A real
+        // repeat request (the user re-opens the same .ctp on purpose) is
+        // rare enough that "already imported, toggle it back on in Mods if
+        // you meant to re-run it" is an acceptable trade-off for v1.
+        android.content.SharedPreferences prefs = getSharedPreferences(MODS_PREFS, MODE_PRIVATE);
+        String uriStr = uri.toString();
+        if (uriStr.equals(prefs.getString(PREF_LAST_CTP_URI, null))) {
+            Log.i(TAG, "mods: ignoring already-handled .ctp intent for " + uri);
+            return;
+        }
+        prefs.edit().putString(PREF_LAST_CTP_URI, uriStr).apply();
+        final com.kalenjohnson.chronoduo.mods.ModManager mm = modManager;
+        String displayName = com.kalenjohnson.chronoduo.mods.ModManager.queryDisplayName(getContentResolver(), uri);
+        com.kalenjohnson.chronoduo.mods.ModCatalog.Entry match = null;
+        if (displayName != null) {
+            String lower = displayName.toLowerCase(java.util.Locale.ROOT);
+            for (com.kalenjohnson.chronoduo.mods.ModCatalog.Entry e : modCatalog) {
+                if (e.fileHint != null && lower.contains(e.fileHint.toLowerCase(java.util.Locale.ROOT))) {
+                    match = e;
+                    break;
+                }
+            }
+        }
+        final com.kalenjohnson.chronoduo.mods.ModCatalog.Entry finalMatch = match;
+        updateModsStatus(true, null);
+        new Thread(() -> {
+            try {
+                if (finalMatch != null) {
+                    try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
+                        if (in == null) throw new java.io.IOException("could not open " + uri);
+                        mm.importCatalogMod(in, finalMatch.id, "local:" + uri);
+                    }
+                    mm.setEnabled(finalMatch.id, true);
+                } else {
+                    mm.importArchive(uri, getContentResolver());
+                }
+                updateModsStatus(false, null);
+            } catch (Throwable t) {
+                Log.e(TAG, ".ctp import failed for " + uri, t);
+                updateModsStatus(false, t.getMessage() != null ? t.getMessage() : t.toString());
+            }
+        }, "ChronoModCtpImport").start();
+    }
+
     // Extension/menu_win.png is a 512x512 sheet of pre-baked DS-style window
     // panels at various fixed sizes (packed, not tiled). The largest one —
     // a beveled steel/navy panel with a black outline and a light bevel
@@ -925,7 +1267,25 @@ public class AppActivity extends Cocos2dxActivity {
         } else if (requestCode == REQUEST_SAVE_IMPORT) {
             if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
             importSaveFromUri(data.getData());
+        } else if (requestCode == REQUEST_MOD_IMPORT) {
+            if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+            importModFromUri(data.getData());
         }
+    }
+
+    /**
+     * A {@code .ctp} opened while the app is already running (singleTask, so
+     * this fires instead of a second {@link #onCreate}) -- see the manifest's
+     * VIEW intent-filters and {@link #handleViewIntent}. The launch-time case
+     * (app not yet running) is handled once in {@link #onCreate} via {@code
+     * handleViewIntent(getIntent())} instead, since onNewIntent doesn't fire
+     * for a cold start.
+     */
+    @Override
+    protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleViewIntent(intent);
     }
 
     /**

@@ -267,6 +267,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         void requestOrigArtBuild();
         /** "Import SNES/DS save..." tapped: launch the SAF picker for a save file. */
         void requestSaveImport();
+        /** "Import mod..." tapped: launch the SAF picker for a mod archive (.ctp/.zip). */
+        void requestModImport();
+        /** A mod row's enable/disable button tapped: {@code name} is the mod's directory name. */
+        void onModToggled(String name, boolean enabled);
+        /** A catalog row's "Get" button tapped: {@code id} is the {@link com.kalenjohnson.chronoduo.mods.ModCatalog.Entry#id}. */
+        void requestModGet(String id);
     }
     private SettingsHost settingsHost;
 
@@ -286,7 +292,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // settingsPage is the 0-based page in view, kept across open/close so
     // reopening lands where the user left off. The prev/next hit boxes are
     // set only while drawSettingsScreen draws the corresponding arrow.
-    private static final String[] SETTINGS_PAGES = {"Imports", "Graphics", "Maps"};
+    private static final String[] SETTINGS_PAGES = {"Imports", "Graphics", "Maps", "Mods"};
     private int settingsPage;
     private final RectF settingsPrevHitBox = new RectF();
     private final RectF settingsNextHitBox = new RectF();
@@ -330,6 +336,133 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         this.saveImportMessage = message;
         this.saveImportError = error;
         invalidate();
+    }
+
+    // --- Mods page (see com.kalenjohnson.chronoduo.mods.ModManager) --------
+    // Same idle/importing/error shape as the SNES-save row above, plus a
+    // list of installed mods pushed separately (setModsList) since it can
+    // change independently of an import (a toggle rescans too).
+    private boolean modsImporting;
+    private String modsError;
+    private java.util.List<com.kalenjohnson.chronoduo.mods.ModManager.ModInfo> modsList =
+            java.util.Collections.emptyList();
+    // Curated catalog (see com.kalenjohnson.chronoduo.mods.ModCatalog), pushed
+    // once AppActivity's background load/refresh finishes -- empty until
+    // then, which just means the page shows only already-installed mods
+    // (none, normally) until it arrives.
+    private java.util.List<com.kalenjohnson.chronoduo.mods.ModCatalog.Entry> modCatalog =
+            java.util.Collections.emptyList();
+    private final RectF modImportButtonHitBox = new RectF();
+    // One row per catalog entry (in catalog order) plus any installed mod not
+    // in the catalog -- see buildModRows(). Capped at MAX_MOD_ROWS and a
+    // "+N more…" indicator if the page runs out of vertical space first (see
+    // drawSettingsScreen's Mods case); one hit box per drawn row, cleared/
+    // rebuilt every pass alongside the parallel per-row arrays below (only
+    // the first modRowCount entries of each are valid on a given frame). A
+    // row is either a not-yet-installed catalog entry (modRowCatalogId set,
+    // tapping it calls requestModGet) or an installed mod's On/Off toggle
+    // (modRowDirName set instead, tapping it calls onModToggled) -- never
+    // both.
+    private static final int MAX_MOD_ROWS = 10;
+    private final RectF[] modRowHitBoxes = new RectF[MAX_MOD_ROWS];
+    private final String[] modRowDirName = new String[MAX_MOD_ROWS];
+    private final String[] modRowCatalogId = new String[MAX_MOD_ROWS];
+    private final boolean[] modRowEnabled = new boolean[MAX_MOD_ROWS];
+    private int modRowCount;
+    {
+        for (int i = 0; i < MAX_MOD_ROWS; i++) modRowHitBoxes[i] = new RectF();
+    }
+
+    /** Pushes mod import progress/result to the settings screen; called from AppActivity on the main thread. Mirrors {@link #setSaveImportStatus}: {@code importing} true means a background import is in flight; false with a non-null {@code error} means the last attempt failed; false with null means idle/success (the mod list itself, via {@link #setModsList}, is what shows a successful import). */
+    public void setModsStatus(boolean importing, String error) {
+        this.modsImporting = importing;
+        this.modsError = error;
+        invalidate();
+    }
+
+    /** Pushes the current installed-mod list (see {@link com.kalenjohnson.chronoduo.mods.ModManager#lastMods}) to the settings screen; called from AppActivity on the main thread after every scan/import/toggle. */
+    public void setModsList(java.util.List<com.kalenjohnson.chronoduo.mods.ModManager.ModInfo> mods) {
+        this.modsList = mods != null ? mods : java.util.Collections.emptyList();
+        invalidate();
+    }
+
+    /** Pushes the curated mod catalog (see {@link com.kalenjohnson.chronoduo.mods.ModCatalog}) to the settings screen; called from AppActivity on the main thread once the background load/refresh (bundled, cached, or freshly fetched) finishes. */
+    public void setModCatalog(java.util.List<com.kalenjohnson.chronoduo.mods.ModCatalog.Entry> entries) {
+        this.modCatalog = entries != null ? entries : java.util.Collections.emptyList();
+        invalidate();
+    }
+
+    /** One row of the Mods page's combined catalog+installed list -- see {@link #buildModRows}. */
+    private static final class ModRow {
+        final String title, summary, notes; // notes may be null
+        final boolean installed;
+        final String dirName;   // installed mods only: the actual directory name (for onModToggled)
+        final String catalogId; // not-yet-installed catalog entries only: id (for requestModGet)
+        final boolean enabled;
+        final String suffix;    // "N files"/"N files, conflicts: N" -- installed rows only, else null
+
+        ModRow(String title, String summary, String notes, boolean installed, String dirName,
+               String catalogId, boolean enabled, String suffix) {
+            this.title = title;
+            this.summary = summary;
+            this.notes = notes;
+            this.installed = installed;
+            this.dirName = dirName;
+            this.catalogId = catalogId;
+            this.enabled = enabled;
+            this.suffix = suffix;
+        }
+    }
+
+    /**
+     * Builds the Mods page's row list: every {@link #modCatalog} entry, in
+     * catalog order (a "Get" row if {@link
+     * com.kalenjohnson.chronoduo.mods.ModCatalog#findInstalledDirName} finds
+     * no matching installed directory, an On/Off row if it does), followed
+     * by any installed mod directory (from {@link #modsList}) that matches
+     * no catalog entry at all -- a mod imported before the catalog existed,
+     * or dropped in by hand. Pure w.r.t. this view's own fields.
+     */
+    private java.util.List<ModRow> buildModRows() {
+        java.util.List<ModRow> rows = new java.util.ArrayList<>();
+        java.util.List<String> dirNames = new java.util.ArrayList<>();
+        java.util.Map<String, com.kalenjohnson.chronoduo.mods.ModManager.ModInfo> byDir = new java.util.HashMap<>();
+        for (com.kalenjohnson.chronoduo.mods.ModManager.ModInfo m : modsList) {
+            dirNames.add(m.name);
+            byDir.put(m.name, m);
+        }
+        java.util.Set<String> matchedDirs = new java.util.HashSet<>();
+        for (com.kalenjohnson.chronoduo.mods.ModCatalog.Entry e : modCatalog) {
+            String dir = com.kalenjohnson.chronoduo.mods.ModCatalog.findInstalledDirName(e, dirNames);
+            if (dir != null) {
+                matchedDirs.add(dir);
+                com.kalenjohnson.chronoduo.mods.ModManager.ModInfo m = byDir.get(dir);
+                rows.add(new ModRow(e.name, e.summary, e.notes, true, dir, null, m.enabled, modSuffix(m)));
+            } else {
+                rows.add(new ModRow(e.name, e.summary, e.notes, false, null, e.id, false, null));
+            }
+        }
+        for (com.kalenjohnson.chronoduo.mods.ModManager.ModInfo m : modsList) {
+            if (matchedDirs.contains(m.name)) continue;
+            rows.add(new ModRow(m.name, "Imported mod", null, true, m.name, null, m.enabled, modSuffix(m)));
+        }
+        return rows;
+    }
+
+    private static String modSuffix(com.kalenjohnson.chronoduo.mods.ModManager.ModInfo m) {
+        return m.fileCount + (m.fileCount == 1 ? " file" : " files")
+                + (m.conflictCount > 0 ? ", conflicts: " + m.conflictCount : "");
+    }
+
+    /** Truncates {@code s} with a trailing "…" so it fits {@code maxW} under the {@link #text} paint's CURRENT size/typeface (caller must {@link #setText} first). */
+    private String ellipsize(String s, float maxW) {
+        if (s == null) return "";
+        if (text.measureText(s) <= maxW) return s;
+        String shown = s;
+        while (shown.length() > 1 && text.measureText(shown + "…") > maxW) {
+            shown = shown.substring(0, shown.length() - 1);
+        }
+        return shown + "…";
     }
 
     // Pixel-graphics toggle row (GOT-patches libchrono.so's Texture2D default
@@ -493,6 +626,24 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                     && saveImportButtonHitBox.contains(event.getX(), event.getY())) {
                 if (settingsHost != null) settingsHost.requestSaveImport();
                 return true;
+            }
+            if (!modsImporting && !modImportButtonHitBox.isEmpty()
+                    && modImportButtonHitBox.contains(event.getX(), event.getY())) {
+                if (settingsHost != null) settingsHost.requestModImport();
+                return true;
+            }
+            for (int i = 0; i < modRowCount; i++) {
+                if (!modRowHitBoxes[i].isEmpty()
+                        && modRowHitBoxes[i].contains(event.getX(), event.getY())) {
+                    if (settingsHost != null) {
+                        if (modRowCatalogId[i] != null) {
+                            settingsHost.requestModGet(modRowCatalogId[i]);
+                        } else {
+                            settingsHost.onModToggled(modRowDirName[i], !modRowEnabled[i]);
+                        }
+                    }
+                    return true;
+                }
             }
             if (!pixelGraphicsHitBox.isEmpty()
                     && pixelGraphicsHitBox.contains(event.getX(), event.getY())) {
@@ -2084,6 +2235,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         fogToggleHitBox.setEmpty();
         fogResetHitBox.setEmpty();
         origArtButtonHitBox.setEmpty();
+        modImportButtonHitBox.setEmpty();
+        for (int i = 0; i < MAX_MOD_ROWS; i++) modRowHitBoxes[i].setEmpty();
+        modRowCount = 0;
 
         int page = Math.floorMod(settingsPage, SETTINGS_PAGES.length);
         int inkDim = Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK));
@@ -2149,7 +2303,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 labelB = "Build original art";
                 break;
             }
-            default: { // Maps
+            case 2: { // Maps
                 y = drawSettingsHeading(c, "Dungeon fog", left, y, h);
                 y = drawSettingsBody(c, "Dungeon minimaps are revealed as you explore them, "
                         + "like on the DS. Towns and houses are always fully shown.",
@@ -2167,6 +2321,88 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                         + "the first time it runs.", left, y, textW, h, inkDim);
                 break;
             }
+            default: { // Mods -- a curated catalog (tap to get) plus any installed/imported mods.
+                y = drawSettingsHeading(c, "Mods", left, y, h);
+
+                java.util.List<ModRow> rows = buildModRows();
+                float rowBaseH = h * 0.044f;
+                float rowNotesExtra = h * 0.014f;
+                float toggleW = w * 0.15f;
+                float modsBtnH = h * 0.055f;
+                // Reserve room below the list for the status line (reserved
+                // whether or not it's actually shown right now, so the row
+                // count never reflows the instant an import/get starts or
+                // finishes), the Import-file button, the restart note, and
+                // the prev/Back/next nav row (drawn after this switch -- see
+                // navTop just below) -- anything that doesn't fit gets a
+                // "+N more…" line instead of clipping mid-row.
+                float navTop = parchment.bottom - h * 0.09f;
+                float footerReserve = h * 0.03f /* status line */ + modsBtnH
+                        + h * 0.02f /* gaps */ + h * 0.022f /* one-line restart note */;
+                float maxY = navTop - h * 0.02f - footerReserve;
+
+                int shown = 0;
+                float rowTextMaxW = textW - toggleW - w * 0.02f;
+                for (; shown < rows.size() && shown < MAX_MOD_ROWS; shown++) {
+                    ModRow row = rows.get(shown);
+                    boolean hasNotes = row.notes != null && !row.notes.isEmpty();
+                    float rowH = rowBaseH + (hasNotes ? rowNotesExtra : 0f);
+                    if (y + rowH > maxY) break;
+
+                    setText(h * 0.020f, row.installed && !row.enabled ? inkDim : INK, true, Paint.Align.LEFT, false);
+                    text.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+                    c.drawText(ellipsize(row.title, rowTextMaxW), left, y + h * 0.018f, text);
+
+                    setText(h * 0.016f, inkDim, false, Paint.Align.LEFT, false);
+                    c.drawText(ellipsize(row.summary, rowTextMaxW), left, y + h * 0.033f, text);
+
+                    if (hasNotes) {
+                        setText(h * 0.013f, inkDim, false, Paint.Align.LEFT, false);
+                        c.drawText(ellipsize(row.notes, rowTextMaxW), left, y + h * 0.045f, text);
+                    }
+
+                    RectF box = modRowHitBoxes[shown];
+                    float boxH = h * 0.028f;
+                    box.set(parchment.right - w * 0.03f - toggleW, y + h * 0.003f,
+                            parchment.right - w * 0.03f, y + h * 0.003f + boxH);
+                    modRowDirName[shown] = row.dirName;
+                    modRowCatalogId[shown] = row.catalogId;
+                    modRowEnabled[shown] = row.enabled;
+                    if (row.suffix != null) {
+                        setText(h * 0.012f, inkDim, false, Paint.Align.CENTER, false);
+                        c.drawText(row.suffix, box.centerX(), box.bottom + h * 0.013f, text);
+                    }
+                    y += rowH;
+                }
+                modRowCount = shown;
+                if (shown < rows.size()) {
+                    setText(h * 0.016f, inkDim, false, Paint.Align.LEFT, false);
+                    c.drawText("+ " + (rows.size() - shown) + " more…", left, y + h * 0.016f, text);
+                    y += h * 0.024f;
+                }
+                y += h * 0.008f;
+
+                // Fixed advance (not drawSettingsBody's own return) regardless
+                // of whether anything is actually drawn here, so the button/
+                // note below never shifts position the instant an
+                // import/get starts, finishes, or errors -- that shift was
+                // exactly what made the row budget above unsafe to compute
+                // once, up front.
+                if (modsImporting) {
+                    drawSettingsBody(c, "working...", left, y, textW, h, INK);
+                } else if (modsError != null) {
+                    drawSettingsBody(c, "error: " + modsError, left, y, textW, h, Color.rgb(150, 30, 30));
+                }
+                y += h * 0.03f;
+
+                btnA = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.006f,
+                        parchment.centerX() + btnW / 2f, y + h * 0.006f + modsBtnH);
+                labelA = "Import file (.ctp / .zip)...";
+                y = btnA.bottom + h * 0.02f;
+
+                drawSettingsBody(c, "Restart the game for a full refresh.", left, y, textW, h, inkDim);
+                break;
+            }
         }
 
         c.restore();
@@ -2178,7 +2414,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         } else if (page == 1) {
             drawSettingsButton(c, btnA, labelA, winTex, false, pixelGraphicsHitBox);
             drawSettingsButton(c, btnB, labelB, winTex, origArtBuilding, origArtButtonHitBox);
-        } else {
+        } else if (page == 2) {
             drawSettingsButton(c, btnA, labelA, winTex, false, fogToggleHitBox);
             // Small text-style "Reset explored maps" action under the fog
             // toggle (its hit box is padded well beyond the glyphs).
@@ -2189,6 +2425,28 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             float resetHalfW = text.measureText(resetLabel) / 2f + w * 0.01f;
             fogResetHitBox.set(btnA.centerX() - resetHalfW, btnA.bottom,
                     btnA.centerX() + resetHalfW, captionY + h * 0.02f);
+        } else { // page == 3, Mods
+            drawSettingsButton(c, btnA, labelA, winTex, modsImporting, modImportButtonHitBox);
+            for (int i = 0; i < modRowCount; i++) {
+                RectF box = modRowHitBoxes[i];
+                if (box.isEmpty()) continue;
+                String label = modRowCatalogId[i] != null ? "Get" : (modRowEnabled[i] ? "On" : "Off");
+                drawCommandButton(c, box, label, winTex, false);
+                if (modsImporting) {
+                    // Mirror drawSettingsButton's busy dimming (scrim +
+                    // emptied hit box): no row action can double-fire, or
+                    // even visually look tappable, while an import/get/
+                    // toggle is in flight.
+                    fill.setShader(null);
+                    fill.setColor(Color.argb(150, 0, 0, 0));
+                    c.drawRect(box, fill);
+                    box.setEmpty();
+                }
+                // Otherwise the hit box is this same RectF instance --
+                // already correctly positioned by the text pass above, so no
+                // further set() is needed (unlike drawSettingsButton's
+                // single-button case).
+            }
         }
 
         // Bottom row: [prev] [Back] [next], arrows kept close to square.

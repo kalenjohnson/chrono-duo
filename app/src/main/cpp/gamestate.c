@@ -837,34 +837,167 @@ static unsigned char *file_subst_read_all(const char *path, int *out_len) {
     return buf;
 }
 
+// ---------------------------------------------------------------------------
+// Mod loader: a second, independent substitution table layered onto the same
+// getData choke point above. Two things set it apart from the orig_art
+// registry (g_file_subst[]) above:
+//
+//   * it matches on the FULL archive path (e.g. "Localize/en/msg/tech.txt"),
+//     not just the basename -- a mod tree mirrors the archive layout exactly,
+//     so a name collision between e.g. two different "tech.txt" files under
+//     different Localize/<lang>/msg/ dirs must not cross-substitute;
+//   * it is never gated on g_file_subst_enabled (the Pixel graphics pref) --
+//     mods apply regardless of that toggle.
+//
+// Sized dynamically from whatever nativeRegisterModSubstitutions is handed
+// (a mod pack can be a few files or several thousand), as an open-addressing
+// hash table keyed by the normalized archive path: a linear scan over
+// thousands of strcmp per asset read would be needless when getData is only
+// called per asset load (not per frame). No tombstones/deletions are needed
+// since a registration always rebuilds the whole table from scratch (the
+// "clears then sets" contract), so an empty slot reliably terminates a probe
+// chain.
+// ---------------------------------------------------------------------------
+
+#define MOD_SUBST_KEY_MAX  220
+#define MOD_SUBST_PATH_MAX 300
+typedef struct {
+    char key[MOD_SUBST_KEY_MAX];   // normalized full archive path
+    char path[MOD_SUBST_PATH_MAX]; // absolute path of the replacement file
+    int  used;
+    int  logged;                   // one "substituted" log line per entry
+} mod_subst_t;
+
+static mod_subst_t    *g_mod_subst;        // malloc'd open-addressing table, power-of-two size
+static int              g_mod_subst_cap;    // g_mod_subst's capacity (slot count)
+static int              g_mod_subst_count;  // entries actually stored
+static pthread_mutex_t  g_mod_subst_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t         g_mod_subst_hits;
+static uint32_t         g_mod_subst_misses;
+
+// Strips a single leading "./" and then any number of leading "/" from an
+// archive path -- pointer bump only, never copies -- so "./Game/x.png",
+// "/Game/x.png" and "Game/x.png" all normalize to the same key. Must be
+// applied identically at registration (to the stored key) and at lookup (to
+// the path getData is asked for), or every mod entry silently misses.
+static const char *normalize_archive_path(const char *p) {
+    if (p[0] == '.' && p[1] == '/') p += 2;
+    while (p[0] == '/') p += 1;
+    return p;
+}
+
+static uint32_t mod_subst_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    for (; *s; s++) {
+        h ^= (unsigned char) *s;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static int next_pow2_at_least(int n) {
+    int p = 64;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+// Read-side probe: returns the matching slot or NULL. Caller must hold
+// g_mod_subst_mutex.
+static mod_subst_t *mod_subst_find(const char *key) {
+    int cap = g_mod_subst_cap;
+    if (cap == 0 || !g_mod_subst) return NULL;
+    uint32_t h = mod_subst_hash(key);
+    int idx = (int) (h & (uint32_t) (cap - 1));
+    for (int probe = 0; probe < cap; probe++) {
+        mod_subst_t *slot = &g_mod_subst[idx];
+        if (!slot->used) return NULL; // empty slot terminates the probe chain
+        if (strcmp(slot->key, key) == 0) return slot;
+        idx = (idx + 1) & (cap - 1);
+    }
+    return NULL;
+}
+
+// Insert-side probe used only while building a fresh table during
+// registration (table is otherwise untouched by concurrent readers, since
+// it isn't published into g_mod_subst until the build finishes).
+static void mod_subst_insert(mod_subst_t *table, int cap, const char *key, const char *path) {
+    uint32_t h = mod_subst_hash(key);
+    int idx = (int) (h & (uint32_t) (cap - 1));
+    for (int probe = 0; probe < cap; probe++) {
+        mod_subst_t *slot = &table[idx];
+        if (!slot->used) {
+            slot->used = 1;
+            strncpy(slot->key, key, sizeof(slot->key) - 1);
+            strncpy(slot->path, path, sizeof(slot->path) - 1);
+            slot->logged = 0;
+            return;
+        }
+        if (strcmp(slot->key, key) == 0) {
+            // Duplicate key within one registration call: last one wins.
+            strncpy(slot->path, path, sizeof(slot->path) - 1);
+            return;
+        }
+        idx = (idx + 1) & (cap - 1);
+    }
+    // Table full -- can't happen given the 2x-headroom sizing in
+    // nativeRegisterModSubstitutions, but drop silently rather than overrun.
+}
+
 static unsigned char *hooked_getData(const void *stdstring, int *out_len) {
-    if (g_file_subst_enabled && g_file_subst_count > 0 && stdstring && out_len) {
+    if (stdstring && out_len
+            && (g_mod_subst_count > 0 || (g_file_subst_enabled && g_file_subst_count > 0))) {
         char sbuf[512];
         const char *full = sso_cstr((void *) stdstring, sbuf, sizeof(sbuf));
         if (full && full[0]) {
             const char *slash = strrchr(full, '/');
             const char *base = slash ? slash + 1 : full;
-            // Everything needed from the registry -- the path, and whether
-            // this entry has logged yet -- is copied out under the mutex, and
-            // the `logged` flag is claimed there too, so nothing dereferences
-            // a registry slot afterwards: a concurrent re-registration (the
-            // settings toggle) rewrites the table wholesale and would
+            const char *norm_full = normalize_archive_path(full);
+            // Everything needed from either registry -- the path, and
+            // whether this entry has logged yet -- is copied out under that
+            // registry's own mutex, and the `logged` flag is claimed there
+            // too, so nothing dereferences a registry slot afterwards: a
+            // concurrent re-registration (the settings toggle, or a mod
+            // import/toggle) rewrites the table wholesale and would
             // otherwise invalidate a held pointer.
-            char path[FILE_SUBST_PATH_MAX];
-            int hit = 0, want_log = 0;
+            char path[MOD_SUBST_PATH_MAX > FILE_SUBST_PATH_MAX ? MOD_SUBST_PATH_MAX : FILE_SUBST_PATH_MAX];
+            int hit = 0, want_log = 0, is_mod = 0;
             path[0] = 0;
-            pthread_mutex_lock(&g_file_subst_mutex);
-            for (int i = 0; i < g_file_subst_count; i++) {
-                if (strcmp(g_file_subst[i].name, base) == 0) {
+
+            // Mods match on the full archive path and are checked FIRST, so
+            // a mod can override an orig_art sheet -- and they are never
+            // gated on g_file_subst_enabled.
+            if (g_mod_subst_count > 0) {
+                pthread_mutex_lock(&g_mod_subst_mutex);
+                mod_subst_t *slot = mod_subst_find(norm_full);
+                if (slot) {
                     hit = 1;
-                    want_log = !g_file_subst[i].logged;
-                    g_file_subst[i].logged = 1;
-                    strncpy(path, g_file_subst[i].path, sizeof(path) - 1);
+                    is_mod = 1;
+                    want_log = !slot->logged;
+                    slot->logged = 1;
+                    strncpy(path, slot->path, sizeof(path) - 1);
                     path[sizeof(path) - 1] = 0;
-                    break;
                 }
+                pthread_mutex_unlock(&g_mod_subst_mutex);
             }
-            pthread_mutex_unlock(&g_file_subst_mutex);
+
+            // orig_art matches on the basename only, and only while the
+            // Pixel graphics pref is on -- unchanged from before mods
+            // existed.
+            if (!hit && g_file_subst_enabled && g_file_subst_count > 0) {
+                pthread_mutex_lock(&g_file_subst_mutex);
+                for (int i = 0; i < g_file_subst_count; i++) {
+                    if (strcmp(g_file_subst[i].name, base) == 0) {
+                        hit = 1;
+                        want_log = !g_file_subst[i].logged;
+                        g_file_subst[i].logged = 1;
+                        strncpy(path, g_file_subst[i].path, sizeof(path) - 1);
+                        path[sizeof(path) - 1] = 0;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&g_file_subst_mutex);
+            }
+
             if (hit) {
                 // File IO deliberately outside the registry mutex: getData runs
                 // on whichever thread is loading (not necessarily the GL one),
@@ -872,17 +1005,18 @@ static unsigned char *hooked_getData(const void *stdstring, int *out_len) {
                 int len = 0;
                 unsigned char *bytes = file_subst_read_all(path, &len);
                 if (bytes) {
-                    g_file_subst_hits++;
+                    if (is_mod) g_mod_subst_hits++; else g_file_subst_hits++;
                     if (want_log) {
-                        LOGI("pixel-gfx: substituted %s (%d bytes) from %s", base, len, path);
+                        LOGI("%s: substituted %s (%d bytes) from %s",
+                             is_mod ? "mods" : "pixel-gfx", is_mod ? norm_full : base, len, path);
                     }
                     *out_len = len;
                     return bytes;
                 }
-                g_file_subst_misses++;
+                if (is_mod) g_mod_subst_misses++; else g_file_subst_misses++;
                 if (want_log) {
-                    LOGE("pixel-gfx: substitution %s: cannot read %s (errno=%d) -- using original",
-                         base, path, errno);
+                    LOGE("%s: substitution %s: cannot read %s (errno=%d) -- using original",
+                         is_mod ? "mods" : "pixel-gfx", is_mod ? norm_full : base, path, errno);
                 }
             }
         }
@@ -1658,10 +1792,11 @@ JNIEXPORT void JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeLogPixelStats(JNIEnv *env, jclass cls) {
     LOGI("pixel-gfx: stats texImage2D_calls=%u glGenerateMipmap_calls=%u texParam_rewrites=%u "
          "nearest_probed=%u nearest_was_linear=%u file_subst_registered=%d file_subst_hits=%u "
-         "file_subst_misses=%u",
+         "file_subst_misses=%u mod_subst_registered=%d mod_subst_hits=%u mod_subst_misses=%u",
          g_pixel_teximage_calls, g_pixel_genmipmap_calls, g_pixel_texparami_rewrites,
          g_pixel_nearest_probed, g_pixel_nearest_was_linear, g_file_subst_count,
-         g_file_subst_hits, g_file_subst_misses);
+         g_file_subst_hits, g_file_subst_misses, g_mod_subst_count, g_mod_subst_hits,
+         g_mod_subst_misses);
 }
 
 // Registers the mechanism-7 file-substitution table (see the
@@ -1720,6 +1855,84 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeRegisterFileSubstitutions(
     pthread_mutex_unlock(&g_file_subst_mutex);
     LOGI("pixel-gfx: registered %d file substitution(s) (hook=%s, enabled=%d)",
          count, g_pixel_getdata_slot ? "installed" : "MISSING", g_file_subst_enabled);
+    return count;
+}
+
+// Registers the mod-loader substitution table (see the mod_subst_t block
+// above hooked_getData): `archivePaths` are FULL archive paths as the game
+// asks for them (e.g. "Localize/en/msg/tech.txt"), `diskPaths` the matching
+// absolute paths of the replacement files on disk, one per entry, same
+// length. Unlike nativeRegisterFileSubstitutions above, these entries are
+// never gated on the Pixel graphics pref, and match on the full path (after
+// stripping a leading "./" or "/") rather than the basename, so a mod tree
+// that mirrors the archive layout can't collide with a same-named file under
+// a different directory.
+//
+// Replaces the mod table wholesale, independently of the orig_art table
+// above -- ModManager calls this on every scan()/import/toggle, and it never
+// disturbs g_file_subst[]. Builds the new hash table off to the side and
+// only swaps it in under the mutex, so a lookup racing a rescan sees either
+// the old table or the new one in full, never a partial rebuild; the old
+// table is freed only after the swap (readers copy out from a matched slot
+// while still holding the mutex -- see hooked_getData -- so nothing can be
+// left holding a pointer into it once this returns).
+//
+// Returns the number of entries registered.
+JNIEXPORT jint JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeRegisterModSubstitutions(
+        JNIEnv *env, jclass cls, jobjectArray archivePaths, jobjectArray diskPaths) {
+    jsize n = 0;
+    if (archivePaths && diskPaths) {
+        n = (*env)->GetArrayLength(env, archivePaths);
+        jsize m = (*env)->GetArrayLength(env, diskPaths);
+        if (n != m) {
+            LOGE("mods: nativeRegisterModSubstitutions: archivePaths/diskPaths length mismatch "
+                 "(%d/%d) -- registering nothing", (int) n, (int) m);
+            n = 0;
+        }
+    }
+
+    int cap = next_pow2_at_least(n > 0 ? (int) n * 2 : 1);
+    mod_subst_t *table = n > 0 ? (mod_subst_t *) calloc((size_t) cap, sizeof(mod_subst_t)) : NULL;
+    if (n > 0 && !table) {
+        LOGE("mods: nativeRegisterModSubstitutions: calloc(%d slots) failed -- registering nothing",
+             cap);
+        n = 0;
+    }
+
+    int count = 0;
+    for (jsize i = 0; i < n; i++) {
+        jstring jkey = (jstring) (*env)->GetObjectArrayElement(env, archivePaths, i);
+        jstring jpath = (jstring) (*env)->GetObjectArrayElement(env, diskPaths, i);
+        const char *ckey = jkey ? (*env)->GetStringUTFChars(env, jkey, NULL) : NULL;
+        const char *cpath = jpath ? (*env)->GetStringUTFChars(env, jpath, NULL) : NULL;
+        if (ckey && cpath && ckey[0] && cpath[0]) {
+            const char *norm = normalize_archive_path(ckey);
+            if (norm[0] && strlen(norm) < MOD_SUBST_KEY_MAX && strlen(cpath) < MOD_SUBST_PATH_MAX) {
+                mod_subst_insert(table, cap, norm, cpath);
+                count++;
+            } else {
+                LOGE("mods: substitution path empty or too long, skipping: %s", ckey);
+            }
+        }
+        if (ckey) (*env)->ReleaseStringUTFChars(env, jkey, ckey);
+        if (cpath) (*env)->ReleaseStringUTFChars(env, jpath, cpath);
+        if (jkey) (*env)->DeleteLocalRef(env, jkey);
+        if (jpath) (*env)->DeleteLocalRef(env, jpath);
+    }
+
+    pthread_mutex_lock(&g_mod_subst_mutex);
+    mod_subst_t *old = g_mod_subst;
+    g_mod_subst = table;
+    g_mod_subst_cap = table ? cap : 0;
+    g_mod_subst_count = table ? count : 0;
+    g_mod_subst_hits = 0;
+    g_mod_subst_misses = 0;
+    pthread_mutex_unlock(&g_mod_subst_mutex);
+    free(old);
+
+    LOGI("mods: registered %d substitution(s) (table capacity=%d, hook=%s)",
+         count, cap, g_pixel_getdata_slot ? "installed" : "MISSING");
     return count;
 }
 

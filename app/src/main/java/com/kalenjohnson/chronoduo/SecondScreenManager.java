@@ -89,6 +89,17 @@ public final class SecondScreenManager {
     }
 
     /**
+     * The current presentation itself, or null when none is showing -- lets
+     * {@code AppActivity} reach {@link SecondScreenPresentation#openModWebView}/
+     * {@code closeModWebView} for the Nexus-page mod-get flow (see {@code
+     * PartyPanelView.SettingsHost#requestModGet}), which needs the
+     * Presentation (for its window/focus), not just its panel view.
+     */
+    public SecondScreenPresentation getPresentation() {
+        return presentation;
+    }
+
+    /**
      * Sets (or clears, with null) the host wired onto every panel this
      * manager creates -- see {@link PartyPanelView.SettingsHost} and the
      * {@link #settingsHost} field doc. Applied immediately to the current

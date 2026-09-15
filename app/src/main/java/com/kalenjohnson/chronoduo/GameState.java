@@ -112,6 +112,24 @@ public final class GameState {
      */
     public static native int nativeRegisterFileSubstitutions(String[] names, String[] paths);
 
+    /**
+     * Registers the mod-loader's file substitution table (gamestate.c's
+     * separate mod_subst_t hash table, layered onto the same getData hook
+     * as {@link #nativeRegisterFileSubstitutions} above): {@code
+     * archivePaths} are FULL archive paths exactly as the game asks for them
+     * (e.g. "Localize/en/msg/tech.txt"), not basenames, and {@code
+     * diskPaths} the matching absolute replacement file paths, one per
+     * entry. Unlike the orig_art registry, these are never gated on the
+     * Pixel graphics pref, and are checked BEFORE the basename-keyed
+     * orig_art registry, so a mod can override an orig_art sheet.
+     *
+     * <p>Replaces the mod table wholesale (independent of the orig_art
+     * table); called by {@link com.kalenjohnson.chronoduo.mods.ModManager}
+     * from a background thread on scan()/import/enable-toggle. Returns the
+     * number of entries registered.</p>
+     */
+    public static native int nativeRegisterModSubstitutions(String[] archivePaths, String[] diskPaths);
+
     /** Clears the registered texture-replacement registry. See gamestate.c. */
     public static native void nativeClearTextureReplacements();
 

@@ -1,0 +1,62 @@
+[
+  {
+    "id": "snes-overworld-sprites",
+    "name": "SNES Overworld Sprites Restoration",
+    "author": null,
+    "summary": "Original SNES overworld walking sprites",
+    "page": "https://www.nexusmods.com/chronotrigger/mods/9",
+    "download": null,
+    "fileHint": "SNESOverworld",
+    "notes": null
+  },
+  {
+    "id": "crono-snes-palette",
+    "name": "Crono SNES Sprite Replacement",
+    "author": null,
+    "summary": "Crono's SNES palette (removes the yellow skin tone)",
+    "page": "https://www.nexusmods.com/chronotrigger/mods/3",
+    "download": null,
+    "fileHint": null,
+    "notes": null
+  },
+  {
+    "id": "consistent-magus",
+    "name": "Consistent Magus Sprite",
+    "author": null,
+    "summary": "Red-cloak Magus matching his portrait",
+    "page": "https://www.nexusmods.com/chronotrigger/mods/5",
+    "download": null,
+    "fileHint": null,
+    "notes": null
+  },
+  {
+    "id": "transparent-portraits-icons",
+    "name": "Transparent Portraits and Improved Icons",
+    "author": null,
+    "summary": "Cleaner portraits and menu icons",
+    "page": "https://www.nexusmods.com/chronotrigger/mods/12",
+    "download": null,
+    "fileHint": null,
+    "notes": null
+  },
+  {
+    "id": "portraits-redone",
+    "name": "Character Portraits Redone",
+    "author": null,
+    "summary": "Redrawn character portraits",
+    "page": "https://www.nexusmods.com/chronotrigger/mods/10",
+    "download": null,
+    "fileHint": null,
+    "notes": null
+  },
+  {
+    "id": "rework",
+    "name": "-ReWork-",
+    "author": null,
+    "summary": "Reworked title, menus, shop UI and font",
+    "page": "https://www.nexusmods.com/chronotrigger/mods/43",
+    "download": null,
+    "fileHint": null,
+    "notes": "Built for the PC CTExt loader; UI parts may not apply on Android"
+  }
+]
