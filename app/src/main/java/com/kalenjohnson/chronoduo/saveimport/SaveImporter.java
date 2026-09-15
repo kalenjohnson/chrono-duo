@@ -13,11 +13,11 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Drives an SNES -&gt; ChronoDuo save import end to end: reads an .srm,
- * converts the chosen slot via {@link SaveConverter}, and installs the
- * result as a {@code Chrono_sp_<N>_0.dat} file plus an updated
+ * Drives an SNES/DS -&gt; ChronoDuo save import end to end: reads an .srm or
+ * DS .sav, converts the chosen slot via {@link SaveConverter}, and installs
+ * the result as a {@code Chrono_sp_<N>_0.dat} file plus an updated
  * {@code meta.bin}, per REPORT.md #6.2/#6.3 (facts confirmed live on
- * device, not just from the report).
+ * device, not just from the report) and #7 (DS format).
  */
 public final class SaveImporter {
     private SaveImporter() {
@@ -26,6 +26,55 @@ public final class SaveImporter {
     public static final int NUM_MENU_SLOTS = 20;
     private static final int SUSPEND_MENU_SLOT_FILE_NUMBER = 6;
     private static final int META_SLOT_COUNT = 23;
+
+    /**
+     * A save file read off disk, parsed as either SNES or DS -- decided by
+     * size (8192 -&gt; SNES; anything DS-shaped -&gt; DS, see
+     * {@link #parseSaveFile}). Lets the UI flow (slot picker, destination
+     * picker, import) work the same way regardless of source format.
+     */
+    public static final class ParsedSaveFile {
+        public final boolean isDs;
+        public final SnesSrm.SrmFile snes; // non-null iff !isDs
+        public final DsSav.DsSlot[] ds; // non-null iff isDs
+
+        private ParsedSaveFile(boolean isDs, SnesSrm.SrmFile snes, DsSav.DsSlot[] ds) {
+            this.isDs = isDs;
+            this.snes = snes;
+            this.ds = ds;
+        }
+
+        public int slotCount() {
+            return isDs ? ds.length : snes.slots.length;
+        }
+
+        public boolean slotUsedInFile(int i) {
+            return isDs ? ds[i].used : snes.slots[i] != null;
+        }
+
+        public String describe(int i) {
+            return isDs ? SaveImporter.describeSlot(ds[i]) : SaveImporter.describeSlot(snes.slots[i]);
+        }
+    }
+
+    /**
+     * File-size gate for {@code .srm}/DS uploads via the SAF picker: an
+     * 8192-byte SNES {@code .srm}, or one of the DS wrapper sizes from
+     * REPORT.md #7 (raw 65536; 262644 ARDS export; 524288 padded image;
+     * 65536+122 DeSmuME {@code .dsv}).
+     */
+    public static boolean isRecognizedSaveFileSize(int size) {
+        return size == 8192 || size == DsSav.IMAGE_SIZE || size == DsSav.ARDS_TOTAL_SIZE
+                || size == 524288 || size == DsSav.IMAGE_SIZE + DsSav.DESMUME_FOOTER_SIZE;
+    }
+
+    /** Parses {@code data} as SNES (exactly 8192 bytes) or DS (any other recognized wrapper). */
+    public static ParsedSaveFile parseSaveFile(byte[] data) {
+        if (data.length == 8192) {
+            return new ParsedSaveFile(false, SnesSrm.parseSrm(data), null);
+        }
+        return new ParsedSaveFile(true, null, DsSav.parseFile(data));
+    }
 
     /**
      * Menu slot N (0-based, 0..19) -&gt; {@code Chrono_sp_<n>_0.dat}, where
@@ -64,6 +113,22 @@ public final class SaveImporter {
                 + String.format("%02d:%02d", slot.playHours, slot.playMinutes);
     }
 
+    /** Same as {@link #describeSlot(SnesSrm.SnesSlot)}, for a DS slot (REPORT.md #7). */
+    public static String describeSlot(DsSav.DsSlot slot) {
+        StringBuilder party = new StringBuilder();
+        for (byte pb : slot.party) {
+            int id = pb & 0xFF;
+            if (id >= 7) continue;
+            if (party.length() > 0) party.append(", ");
+            String name = (id < slot.names.length) ? slot.names[id] : null;
+            if (name == null || name.isEmpty()) name = SnesSrm.CHAR_ORDER[id];
+            party.append(name).append(" Lv").append(slot.chars[id].level);
+        }
+        long hours = slot.playTimeSeconds / 3600;
+        long minutes = (slot.playTimeSeconds % 3600) / 60;
+        return party + " · " + slot.gold + " G · " + String.format("%02d:%02d", hours, minutes);
+    }
+
     /**
      * Converts {@code slot} and writes it into {@code destSlot} of
      * {@code saveDir}, atomically (temp file + rename), then updates
@@ -78,14 +143,39 @@ public final class SaveImporter {
         if (pick == null) throw new IllegalStateException("no save templates available");
         CtSave templateSave = CtSave.parse(pick.candidate.payload);
         CtSave result = SaveConverter.snesToCt(slot, templateSave);
+        return installConverted(result, pick.candidate.name, destSlot, saveDir, random);
+    }
 
+    /** DS counterpart of {@link #importSave(SnesSrm.SnesSlot, int, File, List, SecureRandom)}. */
+    public static String importSave(DsSav.DsSlot slot, int destSlot, File saveDir,
+                                     List<SaveConverter.TemplateCandidate> templates,
+                                     SecureRandom random) throws IOException {
+        if (slot == null || !slot.used) throw new IllegalArgumentException("slot is unused");
+        SaveConverter.PickResult pick = SaveConverter.pickTemplate(slot.flags, templates);
+        if (pick == null) throw new IllegalStateException("no save templates available");
+        CtSave templateSave = CtSave.parse(pick.candidate.payload);
+        CtSave result = SaveConverter.dsToCt(slot, templateSave);
+        return installConverted(result, pick.candidate.name, destSlot, saveDir, random);
+    }
+
+    /** Dispatches to the SNES or DS {@code importSave} based on {@link ParsedSaveFile#isDs}. */
+    public static String importSave(ParsedSaveFile file, int slotIndex, int destSlot, File saveDir,
+                                     List<SaveConverter.TemplateCandidate> templates,
+                                     SecureRandom random) throws IOException {
+        return file.isDs
+                ? importSave(file.ds[slotIndex], destSlot, saveDir, templates, random)
+                : importSave(file.snes.slots[slotIndex], destSlot, saveDir, templates, random);
+    }
+
+    private static String installConverted(CtSave result, String templateName, int destSlot, File saveDir,
+                                            SecureRandom random) throws IOException {
         byte[] payload = result.serialize();
         byte[] fileBytes = CtContainer.encrypt(payload, random);
 
         String destName = destinationFileName(destSlot);
         writeAtomic(saveDir, destName, fileBytes);
         updateMetaSavedTime(saveDir, destSlot, random);
-        return pick.candidate.name;
+        return templateName;
     }
 
     private static void writeAtomic(File dir, String name, byte[] bytes) throws IOException {

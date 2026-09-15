@@ -213,6 +213,77 @@ public final class SaveConverter {
         return out;
     }
 
+    /**
+     * Overlays a DS slot onto a copy of {@code template} (REPORT.md #7).
+     * Unlike {@link #snesToCt}, the DS struct is positionally the same as
+     * the port's: equipment/inventory ids are already in the port's
+     * (category&lt;&lt;12)|idx encoding, HP/MP are already max-first, and
+     * all 10 names plus location-name id and era mask come straight from
+     * the DS slot rather than being left to the template.
+     */
+    public static CtSave dsToCt(DsSav.DsSlot slot, CtSave template) {
+        CtSave out = template.deepCopy();
+
+        out.flags = slot.flags.clone();
+
+        for (int i = 0; i < 7; i++) {
+            DsSav.DsChar dc = slot.chars[i];
+            CtSave.CtChar cc = out.chars[i];
+            cc.setMaxHp(dc.maxHp);
+            cc.setCurHp(dc.curHp);
+            cc.setMaxMp(dc.maxMp);
+            cc.setCurMp(dc.curMp);
+            cc.setBaseMaxHp(dc.baseMaxHp);
+            cc.setBasePower(dc.power);
+            cc.setBaseStamina(dc.stamina);
+            cc.setBaseSpeed(dc.speed);
+            cc.setBaseMagic(dc.magic);
+            cc.setBaseHit(dc.hit);
+            cc.setBaseEvade(dc.evade);
+            cc.setBaseMdef(dc.mdef);
+            cc.setLevel(dc.level);
+            cc.setExp(dc.exp);
+            cc.setTpNext(dc.tpNext);
+            cc.setEquipWeapon(dc.equipWeapon);
+            cc.setEquipArmor(dc.equipArmor);
+            cc.setEquipHelmet(dc.equipHelmet);
+            cc.setEquipAccessory(dc.equipAccessory);
+            cc.setExpNext(dc.expNext);
+            cc.setTpRelated(dc.tpRelated);
+            cc.setGrowth(dc.growth);
+            cc.setCurStats(dc.curStats);
+            cc.setPerCharConstants(dc.perCharConstants);
+        }
+
+        java.util.Map<String, List<CtSave.Entry>> newInventory = new java.util.LinkedHashMap<>();
+        for (CtSave.InventorySection sec : CtSave.INVENTORY_SECTIONS) {
+            List<CtSave.Entry> entries = slot.inventory.get(sec.name);
+            if (entries == null || entries.size() != sec.capacity) {
+                throw new IllegalStateException(sec.name + ": DS capacity "
+                        + (entries == null ? 0 : entries.size()) + " != port capacity " + sec.capacity);
+            }
+            newInventory.put(sec.name, entries);
+        }
+        out.inventory = newInventory;
+
+        out.techBlock = slot.techBlock.clone();
+
+        List<String> names = new ArrayList<>();
+        for (String n : slot.names) names.add(n);
+        out.names = names;
+
+        out.party = slot.party.clone();
+        out.reserve = slot.reserve.clone();
+        out.recruitedMask = slot.recruitedMask;
+
+        out.gold = slot.gold;
+        out.playTimeSeconds = slot.playTimeSeconds;
+        out.locationNameId = slot.locationNameId;
+        out.eraMask = slot.eraMask;
+
+        return out;
+    }
+
     private static int u16(byte[] a, int off) {
         return (a[off] & 0xFF) | ((a[off + 1] & 0xFF) << 8);
     }

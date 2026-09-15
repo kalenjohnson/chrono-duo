@@ -7,11 +7,13 @@ Usage:
 """
 import argparse
 import glob
+import os
 import struct
 import sys
 
 import ctcrypto
 import ctsave
+import ds_sav
 import snes_srm
 
 STEAM_DIR_DEFAULT = "steam"
@@ -160,36 +162,139 @@ def snes_to_ct(slot: snes_srm.SnesSlot, template: ctsave.CtSave) -> ctsave.CtSav
     return out
 
 
+def ds_to_ct(slot: "ds_sav.DsSlot", template: ctsave.CtSave) -> ctsave.CtSave:
+    """Overlay a DS slot onto a copy of `template` (REPORT.md #7).
+
+    Unlike `snes_to_ct`, the DS struct is positionally the same as the
+    port's, so equipment/inventory ids are already in the port's
+    `(category<<12)|idx` encoding (no `equip_field`/`classify_item`
+    re-mapping needed), HP/MP are already max-first (no swap), and all 10
+    names -- plus location-name id and era mask -- come straight from the
+    DS slot rather than being left to the template.
+    """
+    out = ctsave.CtSave.parse(template.serialize())  # deep copy via round-trip
+
+    # Flags: verbatim.
+    out.flags = bytearray(slot.flags)
+
+    # Characters.
+    for i in range(7):
+        dc = slot.chars[i]
+        cc = out.chars[i]
+        cc.max_hp = dc.max_hp
+        cc.cur_hp = dc.cur_hp
+        cc.max_mp = dc.max_mp
+        cc.cur_mp = dc.cur_mp
+        cc.base_max_hp = dc.base_max_hp
+        cc.base_power = dc.power
+        cc.base_stamina = dc.stamina
+        cc.base_speed = dc.speed
+        cc.base_magic = dc.magic
+        cc.base_hit = dc.hit
+        cc.base_evade = dc.evade
+        cc.base_mdef = dc.mdef
+        cc.level = dc.level
+        cc.exp = dc.exp
+        cc.tp_next = dc.tp_next
+        cc.equip_weapon = dc.equip_weapon
+        cc.equip_armor = dc.equip_armor
+        cc.equip_helmet = dc.equip_helmet
+        cc.equip_accessory = dc.equip_accessory
+        cc.exp_next = dc.exp_next
+        cc.tp_related = dc.tp_related
+        cc.growth = dc.growth
+        cc.cur_stats = dc.cur_stats
+        cc.per_char_constants = dc.per_char_constants
+        # +01/+02/+03 (the "80 86 90 xx" DS constant / port's per-character
+        # id bytes) aren't carried across -- same as snes_to_ct, the template's
+        # own constants for that character id are kept.
+
+    # Inventory: DS sections already have the same capacity/order/idx
+    # numbering as the port, so entries carry straight across.
+    new_inventory = {}
+    for name, capacity, _cat in ctsave.INVENTORY_SECTIONS:
+        entries = list(slot.inventory[name])
+        assert len(entries) == capacity, f"{name}: DS capacity {len(entries)} != port capacity {capacity}"
+        new_inventory[name] = entries
+    out.inventory = new_inventory
+
+    # Tech block: verbatim 45 bytes.
+    out.tech_block = bytearray(slot.tech_block)
+
+    # Names: all 10, straight from the DS slot (already NFKC-normalized).
+    out.names = list(slot.names)
+
+    # Party / reserve / recruited: verbatim.
+    out.party = slot.party
+    out.reserve = slot.reserve
+    out.recruited_mask = slot.recruited_mask
+
+    out.gold = slot.gold
+    out.play_time_seconds = slot.play_time_seconds
+    out.location_name_id = slot.location_name_id
+    out.era_mask = slot.era_mask
+
+    return out
+
+
+def _looks_like_ds_file(path: str) -> bool:
+    """DS saves are detected by content (an ARDS export's b"ARDS" prefix, or
+    one of the known wrapper sizes), not by extension -- an ARDS export can
+    show up as .dst/.dsv/.duc/anything (REPORT.md #7)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    if head == b"ARDS":
+        return True
+    if size in (ds_sav.ARDS_TOTAL_SIZE, ds_sav.IMAGE_SIZE, 524288, ds_sav.IMAGE_SIZE + ds_sav.DESMUME_FOOTER_SIZE):
+        return True
+    return path.lower().endswith((".dst", ".dsv", ".duc"))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("srm")
+    ap.add_argument("save_file", help="SNES .srm (8192 bytes) or DS .sav/.dst/.dsv save")
     ap.add_argument("slot", type=int, choices=[0, 1, 2])
     ap.add_argument("out")
     ap.add_argument("--template", default=None)
     args = ap.parse_args()
 
-    slots, _last_used, checksums = snes_srm.load_srm(args.srm)
-    slot = slots[args.slot]
-    if slot is None:
-        print(f"slot {args.slot} is unused in {args.srm}", file=sys.stderr)
-        sys.exit(1)
-    computed = snes_srm.slot_checksum(slot.raw)
-    if computed != checksums[args.slot]:
-        print(f"warning: slot checksum mismatch (stored {checksums[args.slot]:#06x}, "
-              f"computed {computed:#06x}) -- see snes_srm.slot_checksum docstring",
-              file=sys.stderr)
+    is_ds = _looks_like_ds_file(args.save_file)
+
+    if is_ds:
+        ds_slots = ds_sav.load_ds_sav(args.save_file)
+        slot = ds_slots[args.slot]
+        if not slot.used:
+            print(f"slot {args.slot} is unused in {args.save_file}", file=sys.stderr)
+            sys.exit(1)
+        flags = slot.flags
+    else:
+        slots, _last_used, checksums = snes_srm.load_srm(args.save_file)
+        slot = slots[args.slot]
+        if slot is None:
+            print(f"slot {args.slot} is unused in {args.save_file}", file=sys.stderr)
+            sys.exit(1)
+        computed = snes_srm.slot_checksum(slot.raw)
+        if computed != checksums[args.slot]:
+            print(f"warning: slot checksum mismatch (stored {checksums[args.slot]:#06x}, "
+                  f"computed {computed:#06x}) -- see snes_srm.slot_checksum docstring",
+                  file=sys.stderr)
+        flags = slot.flags
 
     if args.template:
         template_path = args.template
         template_ct = ctsave.load(template_path)
-        dist = hamming_distance(slot.flags, template_ct.flags)
+        dist = hamming_distance(flags, template_ct.flags)
     else:
-        template_path, dist = pick_template(slot.flags)
+        template_path, dist = pick_template(flags)
         template_ct = ctsave.load(template_path)
 
     print(f"chosen template: {template_path} (Hamming distance {dist})")
 
-    result = snes_to_ct(slot, template_ct)
+    result = ds_to_ct(slot, template_ct) if is_ds else snes_to_ct(slot, template_ct)
     ctsave.save(args.out, result)
     print(f"wrote {args.out}")
 

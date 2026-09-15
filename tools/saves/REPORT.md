@@ -182,3 +182,59 @@ byte 0 := 1, one converted SNES slot) all appear in the load menu and load:
 
 Still open: item names for an import UI (port item table), semantics of char +1A / +36, and
 how far the template's scene state may diverge from the SNES flags before something breaks.
+
+## 7. Nintendo DS save (`.sav`, 64 KB EEPROM) — 2026-09-15
+
+Fixture: `ds/chrono-trigger.22851.dst` (Action Replay DS export: 500-byte `ARDS` header +
+64 KB image; Japanese-region 100 % game with three used slots). Other wrappers to strip:
+raw 65536 bytes; 512 KB images are the same 64 KB padded with 0xFF; DeSmuME `.dsv` has a
+122-byte footer. Everything is little-endian, uncompressed, no encryption.
+
+**Layout**: three slots of 0x2800 at 0x0000 / 0x2800 / 0x5000, then common data at 0x7800
+(bestiary/encyclopedia/… — not needed). Slot header: u32 magic `FEDCBA98` on the last-saved
+slot only (the others are 0xFFFFFFFF but still hold valid data); Shift-JIS labels; u32 at
++0x28 (checksum-like, unverified — we only read); u32 at +0x2C.
+
+The DS slot is the port's own struct laid out flat, so the mapping to the port stream is
+positional (port offsets for default names):
+
+| DS slot | Size | Port | Field |
+|---|---|---|---|
+| 0x050 | 0x200 | 0x001 | region A (u8 each; the port widens to u32 in memory) — DS 0x24E = 3 = port 0x1FF |
+| 0x250 | 0x200 | 0x201 | event flags (427/512 bytes equal to a *different* 100 % game's template) |
+| 0x450 | 0x30 | 0x401 | scene block: u16 location id (0x1D0 = End of Time), u8 x, u8 y, … |
+| 0x484 | 7×0x60 | 0x430 (7×0x58) | character records: `u32 id ‖ 80 86 90 57 ‖` then **identical** to the port record from max HP on, except a u16 between level and exp that the port drops (see below) |
+| 0x724 | 111×4 | 0x698 | weapons `{u16 (cat<<12\|idx), u16 count}` — same ids as the port, 4-byte entries instead of 3 |
+| 0x8E0 | 50×4 | 0x7E5 | armour |
+| 0x9A8 | 39×4 | 0x87B | helmets |
+| 0xA44 | 59×4 | 0x8F0 | accessories |
+| 0xB30 | 43×4 | 0x9A1 | consumables |
+| 0xBDC | 45×4 | 0xA22 | key items |
+| 0xC90 | 45 | 0xAA9 | tech block (7 counts, 7 masks, 31 dual/triple) verbatim |
+| 0xCBD | 3 | — | ? |
+| 0xCC0 | 10×16 | 0xAD6 | names, fixed 16-byte Shift-JIS strings (full-width `Ｃｒｏｎｏ`); 10th is "Nadia". Convert with NFKC (full-width → ASCII) before writing the port's length-prefixed strings |
+| 0xD60 | 3+6+1 | names+0 | party, reserve, recruited mask — verbatim |
+| 0xD6A | 1 | +0x0A | ? (0) |
+| 0xD6C | u32 | +0x0B u24 | gold |
+| 0xD70 | u32 | — | 99 in the fixture (save count?) |
+| 0xD74 | u32 | +0x0F u24 | play time, seconds |
+| 0xD7C | u16 | — | 2 |
+| 0xD7E | u16 | — | 0xE800 ? |
+| 0xD80 | u16 | +0x15 | save-menu location-name id (0x3E End of Time) |
+| 0xD82 | u16 | +0x17 | era/gate mask (0x3FF) |
+| 0xD84 | … | 0x1E0C? | field state; from 0xDB0 and 0x1000–0x2800 8-px-wide bitmaps = the DS explored-minimap bits (potential fog-of-war import later) |
+
+**Character record, DS 0x60 → port 0x58**: DS +0x04..+0x07 = `80 86 90 57` (port +1..+3 =
+`80 86 80`, i.e. port +1 = DS +4, port +2 = DS +5, port +3 = 0x80 constant); DS +0x08..+0x19 =
+port +0x04..+0x15 (max HP, cur HP, max MP, cur MP, base max HP, 7 base stats, level); DS +0x1A
+u16 = extra (0x7564, 0x85E4, 0 …; not in the port); DS +0x1C u32 exp = port +0x16; DS +0x20 u32 =
+port +0x1A; DS +0x24..+0x35 zeros; DS +0x36 4×u16 equipment = port +0x2C; DS +0x3E u16 = port
++0x34; DS +0x40 u16 = port +0x36; DS +0x42 6 bytes = port +0x38; DS +0x48 9 bytes = port +0x3E;
+DS +0x51 4 bytes = port +0x47; rest zero.
+
+Conversion = the same template overlay as SNES (§5), overlaying flags, characters, all six
+inventory sections, techs, names, party/reserve/recruited, gold, play time, location-name id
+and era mask. Region A / scene block / tail stay with the template for now (untested whether
+copying the DS ones verbatim also works; it probably does since the struct is the same).
+Slot "used" test: u16 at +0x484+8 (Crono max HP) not 0 or 0xFFFF (unused slots are 0xFF-filled) nonzero and names decodable; do not rely on
+the magic.

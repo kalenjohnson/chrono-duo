@@ -924,7 +924,7 @@ public class AppActivity extends Cocos2dxActivity {
             importRomFromUri(data.getData());
         } else if (requestCode == REQUEST_SAVE_IMPORT) {
             if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
-            importSrmFromUri(data.getData());
+            importSaveFromUri(data.getData());
         }
     }
 
@@ -1088,11 +1088,11 @@ public class AppActivity extends Cocos2dxActivity {
         }, "DsMapImport").start();
     }
 
-    // --- SNES save import (see com.kalenjohnson.chronoduo.saveimport) -----
+    // --- SNES/DS save import (see com.kalenjohnson.chronoduo.saveimport) --
 
     /**
-     * Launches the SAF document picker so the user can pick an SNES Chrono
-     * Trigger .srm save file. Mirrors {@link #launchRomPicker()}.
+     * Launches the SAF document picker so the user can pick an SNES or DS
+     * Chrono Trigger save file. Mirrors {@link #launchRomPicker()}.
      */
     private void launchSavePicker() {
         android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT);
@@ -1109,15 +1109,18 @@ public class AppActivity extends Cocos2dxActivity {
     }
 
     /**
-     * Reads {@code uri} (a user-picked .srm from {@link #launchSavePicker()})
-     * off the main thread, validates its size, and parses it with {@link
-     * com.kalenjohnson.chronoduo.saveimport.SnesSrm}. On success, hands off
-     * to {@link #showSnesSlotPicker} on the main thread to run the rest of
-     * the flow (slot pick -> destination pick -> optional overwrite confirm
-     * -> background import), all via {@link android.app.AlertDialog} on the
+     * Reads {@code uri} (a user-picked SNES/DS save from {@link
+     * #launchSavePicker()}) off the main thread, validates its size, and
+     * parses it as either format with {@link
+     * com.kalenjohnson.chronoduo.saveimport.SaveImporter#parseSaveFile}
+     * (8192 bytes -&gt; SNES .srm; any other recognized DS wrapper size ->
+     * DS .sav, REPORT.md #7). On success, hands off to {@link
+     * #showSaveSlotPicker} on the main thread to run the rest of the flow
+     * (slot pick -> destination pick -> optional overwrite confirm ->
+     * background import), all via {@link android.app.AlertDialog} on the
      * top screen (no dual-screen handling needed for dialogs).
      */
-    private void importSrmFromUri(android.net.Uri uri) {
+    private void importSaveFromUri(android.net.Uri uri) {
         updateSaveImportStatus(true, null, false);
         new Thread(() -> {
             try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
@@ -1126,58 +1129,60 @@ public class AppActivity extends Cocos2dxActivity {
                     return;
                 }
                 byte[] data = com.kalenjohnson.chronoduo.saveimport.SaveImporter.readAll(in);
-                if (data.length != 8192) {
-                    postSaveImportError("file is " + data.length + " bytes -- expected an 8192-byte SNES .srm save");
+                if (!com.kalenjohnson.chronoduo.saveimport.SaveImporter.isRecognizedSaveFileSize(data.length)) {
+                    postSaveImportError("file is " + data.length + " bytes -- expected an SNES .srm (8192 bytes) "
+                            + "or a DS save (64 KB, 256 KB ARDS export, 512 KB padded image, or DeSmuME .dsv)");
                     return;
                 }
-                com.kalenjohnson.chronoduo.saveimport.SnesSrm.SrmFile srm;
+                com.kalenjohnson.chronoduo.saveimport.SaveImporter.ParsedSaveFile parsed;
                 try {
-                    srm = com.kalenjohnson.chronoduo.saveimport.SnesSrm.parseSrm(data);
+                    parsed = com.kalenjohnson.chronoduo.saveimport.SaveImporter.parseSaveFile(data);
                 } catch (RuntimeException e) {
-                    postSaveImportError("could not parse .srm: " + e.getMessage());
+                    postSaveImportError("could not parse save file: " + e.getMessage());
                     return;
                 }
                 boolean anyUsed = false;
-                for (com.kalenjohnson.chronoduo.saveimport.SnesSrm.SnesSlot s : srm.slots) {
-                    if (s != null) { anyUsed = true; break; }
+                for (int i = 0; i < parsed.slotCount(); i++) {
+                    if (parsed.slotUsedInFile(i)) { anyUsed = true; break; }
                 }
                 if (!anyUsed) {
-                    postSaveImportError("no used save slots found in this .srm");
+                    postSaveImportError("no used save slots found in this file");
                     return;
                 }
-                final com.kalenjohnson.chronoduo.saveimport.SnesSrm.SrmFile finalSrm = srm;
+                final com.kalenjohnson.chronoduo.saveimport.SaveImporter.ParsedSaveFile finalParsed = parsed;
                 new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
                     updateSaveImportStatus(false, null, false);
-                    showSnesSlotPicker(finalSrm);
+                    showSaveSlotPicker(finalParsed);
                 });
             } catch (Throwable t) {
-                Log.e(TAG, "SNES save import (read) failed", t);
+                Log.e(TAG, "SNES/DS save import (read) failed", t);
                 postSaveImportError(t.getMessage() != null ? t.getMessage() : t.toString());
             }
-        }, "SnesSaveRead").start();
+        }, "SaveRead").start();
     }
 
-    /** First dialog: pick which used SNES slot to import (main thread). */
-    private void showSnesSlotPicker(com.kalenjohnson.chronoduo.saveimport.SnesSrm.SrmFile srm) {
+    /** First dialog: pick which used save slot to import (main thread). */
+    private void showSaveSlotPicker(com.kalenjohnson.chronoduo.saveimport.SaveImporter.ParsedSaveFile parsed) {
         List<Integer> usedIndices = new ArrayList<>();
         List<String> labels = new ArrayList<>();
-        for (int i = 0; i < srm.slots.length; i++) {
-            if (srm.slots[i] == null) continue;
+        for (int i = 0; i < parsed.slotCount(); i++) {
+            if (!parsed.slotUsedInFile(i)) continue;
             usedIndices.add(i);
-            labels.add("Slot " + (i + 1) + ": " + com.kalenjohnson.chronoduo.saveimport.SaveImporter.describeSlot(srm.slots[i]));
+            labels.add("Slot " + (i + 1) + ": " + parsed.describe(i));
         }
         new android.app.AlertDialog.Builder(this)
-                .setTitle("Import which SNES save slot?")
+                .setTitle("Import which save slot?")
                 .setItems(labels.toArray(new String[0]), (dialog, which) -> {
                     int slotIndex = usedIndices.get(which);
-                    showDestinationSlotPicker(srm.slots[slotIndex]);
+                    showDestinationSlotPicker(parsed, slotIndex);
                 })
                 .setNegativeButton("Cancel", null)
                 .show();
     }
 
     /** Second dialog: pick a ChronoDuo destination menu slot 1..20 (main thread). */
-    private void showDestinationSlotPicker(com.kalenjohnson.chronoduo.saveimport.SnesSrm.SnesSlot chosenSlot) {
+    private void showDestinationSlotPicker(com.kalenjohnson.chronoduo.saveimport.SaveImporter.ParsedSaveFile parsed,
+                                            int slotIndex) {
         File saveDir = getExternalFilesDir(null);
         if (saveDir == null) saveDir = getFilesDir();
         final File finalSaveDir = saveDir;
@@ -1192,12 +1197,12 @@ public class AppActivity extends Cocos2dxActivity {
                     if (com.kalenjohnson.chronoduo.saveimport.SaveImporter.slotUsed(finalSaveDir, which)) {
                         new android.app.AlertDialog.Builder(this)
                                 .setTitle("Overwrite slot " + (which + 1) + "?")
-                                .setMessage("Slot " + (which + 1) + " already has a save. Overwrite it with the imported SNES save?")
-                                .setPositiveButton("Overwrite", (d2, w2) -> runSnesSaveImport(chosenSlot, which, finalSaveDir))
+                                .setMessage("Slot " + (which + 1) + " already has a save. Overwrite it with the imported save?")
+                                .setPositiveButton("Overwrite", (d2, w2) -> runSaveImport(parsed, slotIndex, which, finalSaveDir))
                                 .setNegativeButton("Cancel", null)
                                 .show();
                     } else {
-                        runSnesSaveImport(chosenSlot, which, finalSaveDir);
+                        runSaveImport(parsed, slotIndex, which, finalSaveDir);
                     }
                 })
                 .setNegativeButton("Cancel", null)
@@ -1205,24 +1210,24 @@ public class AppActivity extends Cocos2dxActivity {
     }
 
     /** Runs the actual conversion+write on a background thread, then posts the result. */
-    private void runSnesSaveImport(com.kalenjohnson.chronoduo.saveimport.SnesSrm.SnesSlot chosenSlot,
-                                    int destSlot, File saveDir) {
+    private void runSaveImport(com.kalenjohnson.chronoduo.saveimport.SaveImporter.ParsedSaveFile parsed,
+                                int slotIndex, int destSlot, File saveDir) {
         updateSaveImportStatus(true, null, false);
         new Thread(() -> {
             try {
                 List<com.kalenjohnson.chronoduo.saveimport.SaveConverter.TemplateCandidate> templates =
                         loadSaveTemplates();
                 String template = com.kalenjohnson.chronoduo.saveimport.SaveImporter.importSave(
-                        chosenSlot, destSlot, saveDir, templates, new java.security.SecureRandom());
-                Log.i(TAG, "SNES save imported into slot " + (destSlot + 1) + " using template " + template);
+                        parsed, slotIndex, destSlot, saveDir, templates, new java.security.SecureRandom());
+                Log.i(TAG, "save imported into slot " + (destSlot + 1) + " using template " + template);
                 updateSaveImportStatus(false,
                         "Imported into slot " + (destSlot + 1) + " -- return to the title screen and choose Load",
                         false);
             } catch (Throwable t) {
-                Log.e(TAG, "SNES save import failed", t);
+                Log.e(TAG, "save import failed", t);
                 updateSaveImportStatus(false, t.getMessage() != null ? t.getMessage() : t.toString(), true);
             }
-        }, "SnesSaveImport").start();
+        }, "SaveImport").start();
     }
 
     /**

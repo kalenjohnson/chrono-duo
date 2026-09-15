@@ -1,5 +1,6 @@
 import com.kalenjohnson.chronoduo.saveimport.CtContainer;
 import com.kalenjohnson.chronoduo.saveimport.CtSave;
+import com.kalenjohnson.chronoduo.saveimport.DsSav;
 import com.kalenjohnson.chronoduo.saveimport.SaveConverter;
 import com.kalenjohnson.chronoduo.saveimport.SnesSrm;
 
@@ -16,14 +17,17 @@ import java.util.List;
  * app/src/main/java/com/kalenjohnson/chronoduo/saveimport/.
  *
  * Checks two things:
- *  1. Slot-conversion parity: for every used slot of every snes/**\/*.srm,
- *     picks the same nearest-flags template the Python convert.py would
- *     (recomputed here, from the same steam/*.bin candidates) and compares
- *     the serialized payload byte-for-byte against a Python reference dump
+ *  1. Slot-conversion parity: for every used slot of every snes/**\/*.srm
+ *     and every used slot of every ds/*.dst, ds/*.duc DS save, picks the
+ *     same nearest-flags template the Python convert.py would (recomputed
+ *     here, from the same steam/*.bin candidates) and compares the
+ *     serialized payload byte-for-byte against a Python reference dump
  *     (see manifest file below -- produced by a one-off helper script that
- *     imports tools/saves' own modules and calls pick_template/snes_to_ct
- *     directly, so the reference is the exact same code path convert.py
- *     uses on the command line).
+ *     imports tools/saves' own modules and calls
+ *     pick_template/snes_to_ct/ds_to_ct directly, so the reference is the
+ *     exact same code path convert.py uses on the command line). Manifest
+ *     lines are told apart by the save file's extension: {@code .srm} is
+ *     SNES, anything else (.dst/.duc/.dsv/.sav) is DS.
  *  2. Template round-trip parity: for every steam/*.bin template, decrypt
  *     -> CtSave.parse -> CtSave.serialize -> re-encrypt with the ORIGINAL
  *     IV must reproduce the original file bytes exactly (the reference here
@@ -67,51 +71,76 @@ public class JavaSaveCheck {
         }
         System.out.println("Loaded " + templates.size() + " templates from " + steamDir);
 
-        // --- 1. Slot-conversion parity ---
+        // --- 1. Slot-conversion parity (SNES + DS) ---
         int slotChecked = 0, slotPass = 0;
+        int snesChecked = 0, dsChecked = 0;
         List<String> slotFailures = new ArrayList<>();
         for (String line : Files.readAllLines(manifestFile.toPath())) {
             line = line.trim();
             if (line.isEmpty()) continue;
             String[] parts = line.split("\t");
-            String srmRel = parts[0];
+            String saveRel = parts[0];
             int slotIndex = Integer.parseInt(parts[1]);
             String expectedTemplateName = parts[2];
             int expectedDist = Integer.parseInt(parts[3]);
             String refFileName = parts[4];
+            boolean isDs = !saveRel.toLowerCase(java.util.Locale.ROOT).endsWith(".srm");
 
-            byte[] srmData = Files.readAllBytes(new File(savesDir, srmRel).toPath());
-            SnesSrm.SrmFile srm = SnesSrm.parseSrm(srmData);
-            SnesSrm.SnesSlot slot = srm.slots[slotIndex];
-            if (slot == null) {
-                slotFailures.add(srmRel + " slot " + slotIndex + ": slot is unused in Java parse (manifest expected used)");
-                continue;
-            }
-
-            int computedChecksum = SnesSrm.slotChecksum(slot.raw);
-            if (computedChecksum != srm.checksums[slotIndex]) {
-                slotFailures.add(srmRel + " slot " + slotIndex + ": checksum mismatch (stored "
-                        + Integer.toHexString(srm.checksums[slotIndex]) + ", computed " + Integer.toHexString(computedChecksum) + ")");
-            }
-
-            SaveConverter.PickResult pick = SaveConverter.pickTemplate(slot.flags, templates);
+            byte[] fileData = Files.readAllBytes(new File(savesDir, saveRel).toPath());
+            byte[] flags;
+            CtSave result;
             slotChecked++;
             boolean ok = true;
-            if (!pick.candidate.name.equals(expectedTemplateName) || pick.distance != expectedDist) {
-                ok = false;
-                slotFailures.add(srmRel + " slot " + slotIndex + ": template mismatch (Java picked "
-                        + pick.candidate.name + " dist " + pick.distance + ", expected " + expectedTemplateName
-                        + " dist " + expectedDist + ")");
+
+            if (isDs) {
+                dsChecked++;
+                DsSav.DsSlot[] dsSlots = DsSav.parseFile(fileData);
+                DsSav.DsSlot slot = dsSlots[slotIndex];
+                if (slot == null || !slot.used) {
+                    slotFailures.add(saveRel + " slot " + slotIndex + ": slot is unused in Java parse (manifest expected used)");
+                    continue;
+                }
+                flags = slot.flags;
+                SaveConverter.PickResult pick = SaveConverter.pickTemplate(flags, templates);
+                if (!pick.candidate.name.equals(expectedTemplateName) || pick.distance != expectedDist) {
+                    ok = false;
+                    slotFailures.add(saveRel + " slot " + slotIndex + ": template mismatch (Java picked "
+                            + pick.candidate.name + " dist " + pick.distance + ", expected " + expectedTemplateName
+                            + " dist " + expectedDist + ")");
+                }
+                CtSave templateSave = CtSave.parse(pick.candidate.payload);
+                result = SaveConverter.dsToCt(slot, templateSave);
+            } else {
+                snesChecked++;
+                SnesSrm.SrmFile srm = SnesSrm.parseSrm(fileData);
+                SnesSrm.SnesSlot slot = srm.slots[slotIndex];
+                if (slot == null) {
+                    slotFailures.add(saveRel + " slot " + slotIndex + ": slot is unused in Java parse (manifest expected used)");
+                    continue;
+                }
+                int computedChecksum = SnesSrm.slotChecksum(slot.raw);
+                if (computedChecksum != srm.checksums[slotIndex]) {
+                    slotFailures.add(saveRel + " slot " + slotIndex + ": checksum mismatch (stored "
+                            + Integer.toHexString(srm.checksums[slotIndex]) + ", computed " + Integer.toHexString(computedChecksum) + ")");
+                }
+                flags = slot.flags;
+                SaveConverter.PickResult pick = SaveConverter.pickTemplate(flags, templates);
+                if (!pick.candidate.name.equals(expectedTemplateName) || pick.distance != expectedDist) {
+                    ok = false;
+                    slotFailures.add(saveRel + " slot " + slotIndex + ": template mismatch (Java picked "
+                            + pick.candidate.name + " dist " + pick.distance + ", expected " + expectedTemplateName
+                            + " dist " + expectedDist + ")");
+                }
+                CtSave templateSave = CtSave.parse(pick.candidate.payload);
+                result = SaveConverter.snesToCt(slot, templateSave);
             }
 
-            CtSave templateSave = CtSave.parse(pick.candidate.payload);
-            CtSave result = SaveConverter.snesToCt(slot, templateSave);
             byte[] javaPayload = result.serialize();
             byte[] refPayload = Files.readAllBytes(new File(refDir, refFileName).toPath());
             if (!Arrays.equals(javaPayload, refPayload)) {
                 ok = false;
                 int firstDiff = firstDifference(javaPayload, refPayload);
-                slotFailures.add(srmRel + " slot " + slotIndex + ": payload mismatch (java " + javaPayload.length
+                slotFailures.add(saveRel + " slot " + slotIndex + ": payload mismatch (java " + javaPayload.length
                         + " bytes, ref " + refPayload.length + " bytes, first diff at " + firstDiff + ")");
             }
             if (ok) slotPass++;
@@ -163,7 +192,7 @@ public class JavaSaveCheck {
 
         System.out.println();
         System.out.println("=== Slot-conversion parity ===");
-        System.out.println(slotPass + "/" + slotChecked + " slots passed");
+        System.out.println(slotPass + "/" + slotChecked + " slots passed (" + snesChecked + " SNES, " + dsChecked + " DS)");
         for (String f : slotFailures) System.out.println("  FAIL " + f);
 
         System.out.println();

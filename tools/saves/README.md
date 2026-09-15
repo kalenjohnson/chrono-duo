@@ -12,32 +12,46 @@ full reverse-engineered format spec; the code here implements it.
 | `snes/retromaggedon/sN/.../Chrono Trigger (USA).srm` | 5 SRMs, slot 0 only | retromaggedon.com |
 | `steam/NN_chapter.bin` | 31 chapter saves + 12 NG+ (`X*`) saves + `meta.bin` + `common.bin` | Steam Community guide 2482326379 (Google Drive) |
 | `steam/*.bin.dec` | decrypted plaintext (generated, git-ignored) | `python3 ctcrypto.py steam/*.bin` |
+| `ds/chrono-trigger.22851.dst` | Action Replay DS export (500-byte ARDS header + 256 KB image, only the first 64 KB real), Japanese, 3 used slots | REPORT.md #7 |
+| `ds/chrono-trigger.18311.duc` | same ARDS container (`.duc` extension), 1 used slot (slots 1-2 are 0xFF-filled) | REPORT.md #7 |
+| `ds/chrono-trigger.18490.duc` | ARDS export, English region, exactly 500+64 KB (no extra padding), 3 used slots -- the cross-region check for the DS field mapping | REPORT.md #7 |
 
 ## Modules
 
 - `ctcrypto.py` -- Blowfish-CBC container encrypt/decrypt (pre-existing, unmodified).
 - `snes_srm.py` -- parses an 8 KB `.srm` into `SnesSlot`/`SnesChar` records and
   verifies the per-slot checksum.
+- `ds_sav.py` -- parses a Nintendo DS 64 KB `.sav` (any of the wrappers in
+  REPORT.md #7: raw, ARDS export, 512 KB padded, DeSmuME `.dsv`) into
+  `DsSlot`/`DsChar` records. Note vs. REPORT.md #7: the char-record block
+  actually starts at DS slot offset **0x484**, not the table's 0x480 (see
+  the module docstring); everything else in #7 checked out against all
+  three fixtures, including the English-region one.
 - `ctsave.py` -- `CtSave`/`CtChar` stream model of the port's save payload;
   `load()`/`save()` handle the encrypted container.
-- `convert.py` -- `snes_to_ct()`: picks the closest-matching chapter template
-  and overlays SNES data onto it.
-- `test_saves.py` -- parsing, round-trip, and conversion checks over every fixture.
+- `convert.py` -- `snes_to_ct()`/`ds_to_ct()`: picks the closest-matching
+  chapter template and overlays SNES or DS data onto it. The CLI detects
+  SNES vs. DS from the input file (extension/size/`ARDS` prefix).
+- `test_saves.py` -- parsing, round-trip, and conversion checks over every
+  SNES and DS fixture.
 - `JavaSaveCheck.java` -- desktop parity check for the Java port of these
   modules (`app/src/main/java/com/kalenjohnson/chronoduo/saveimport/`, used
-  by ChronoDuo's in-app "Import SNES save" feature). Compares every used
-  SRM slot's converted payload byte-for-byte against a Python-generated
-  reference, and every `steam/*.bin` template's decrypt-parse-serialize-
-  re-encrypt round trip against the original file bytes. Build and run from
-  this directory:
+  by ChronoDuo's in-app "Import SNES/DS save" feature). Compares every used
+  SRM slot's and every used DS slot's converted payload byte-for-byte
+  against a Python-generated reference, and every `steam/*.bin` template's
+  decrypt-parse-serialize-re-encrypt round trip against the original file
+  bytes. Build and run from this directory:
   ```
   javac -d /tmp/svclasses ../../app/src/main/java/com/kalenjohnson/chronoduo/saveimport/*.java JavaSaveCheck.java
   java -cp /tmp/svclasses JavaSaveCheck <manifest.tsv> <refDir>
   ```
   `<manifest.tsv>`/`<refDir>` come from a one-off Python helper (not
-  checked in) that imports `ctsave`/`snes_srm`/`convert` directly and dumps
-  each used slot's `snes_to_ct(...).serialize()` bytes plus a manifest line
-  `<srm>\t<slot>\t<template basename>\t<hamming distance>\t<ref file>`.
+  checked in) that imports `ctsave`/`snes_srm`/`ds_sav`/`convert` directly
+  and dumps each used slot's `snes_to_ct(...)`/`ds_to_ct(...).serialize()`
+  bytes plus a manifest line
+  `<srm or ds file>\t<slot>\t<template basename>\t<hamming distance>\t<ref file>`
+  -- DS lines are told apart by extension (anything but `.srm`).
+  Current fixture set: 53 SNES slots / 31 templates / 7 DS slots, all pass.
 
 ## Running
 
@@ -47,6 +61,12 @@ python3 snes_srm.py snes/fantasyanime/ctsave01-kidnapping/chrono_trigger.srm
 
 # Convert one SNES save slot to a port save:
 python3 convert.py <path.srm> <slot 0-2> out.bin [--template steam/16_thefiendlordskeep.bin]
+
+# Summarize every slot of a DS .sav (any wrapper -- ARDS export, raw, DeSmuME .dsv):
+python3 ds_sav.py ds/chrono-trigger.22851.dst
+
+# Convert one DS save slot to a port save (same CLI, auto-detected):
+python3 convert.py ds/chrono-trigger.22851.dst 0 out.bin
 
 # Run the full test suite:
 python3 test_saves.py

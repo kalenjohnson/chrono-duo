@@ -265,7 +265,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         void onPixelGraphicsChanged(boolean enabled);
         /** "Build original sprites" tapped: kick off the background OrigArtRebuilder pass. */
         void requestOrigArtBuild();
-        /** "Import SNES save..." tapped: launch the SAF picker for an .srm file. */
+        /** "Import SNES/DS save..." tapped: launch the SAF picker for a save file. */
         void requestSaveImport();
     }
     private SettingsHost settingsHost;
@@ -2066,7 +2066,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         setText(h * 0.02f, Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK)),
                 false, Paint.Align.LEFT, false);
         text.setTypeface(Typeface.MONOSPACE);
-        c.drawText("SNES save: " + saveImportStatusText(), parchment.left + w * 0.06f,
+        c.drawText("SNES/DS save: " + saveImportStatusText(), parchment.left + w * 0.06f,
                 parchment.top + h * 0.233f, text);
 
         setText(h * 0.032f, INK, false, Paint.Align.LEFT, false);
@@ -2091,7 +2091,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
         Bitmap winTex = ChronoAssets.getWindowTex();
 
-        // "Import DS ROM..." and "Import SNES save..." share one row as two
+        // "Import DS ROM..." and "Import SNES/DS save..." share one row as two
         // half-width buttons (same split-row shape as the pixel/fog toggle
         // row below), rather than each taking a full 0.6-parchment-width
         // slot -- keeps every row below at its original vertical position.
@@ -2114,7 +2114,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
         RectF saveImportBtn = new RectF(importBtn.right + btnGap, btnTop,
                 importBtn.right + btnGap + btnW, btnTop + btnH);
-        drawCommandButton(c, saveImportBtn, "Import SNES save...", winTex, false);
+        drawCommandButton(c, saveImportBtn, "Import SNES/DS save...", winTex, false);
         if (savingImport) {
             fill.setShader(null);
             fill.setColor(Color.argb(150, 0, 0, 0));

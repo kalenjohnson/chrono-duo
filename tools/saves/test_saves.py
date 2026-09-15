@@ -8,6 +8,7 @@ import sys
 import convert
 import ctcrypto
 import ctsave
+import ds_sav
 import snes_srm
 
 SCRATCH_DIR = ("/tmp/claude-1000/-home-kalenj-Work-chrono-trigger/"
@@ -147,10 +148,58 @@ def test_conversion():
     check(n_reload_ok == n_converted, "not all converted saves round-tripped on reload")
 
 
+# --- (d) DS -> port conversion + round trip -------------------------------
+def test_ds_conversion():
+    print("=== (d) DS -> port conversion ===")
+    os.makedirs(SCRATCH_DIR, exist_ok=True)
+    ds_paths = sorted(glob.glob("ds/*.dst")) + sorted(glob.glob("ds/*.duc"))
+
+    n_converted = 0
+    n_reload_ok = 0
+    for ds_path in ds_paths:
+        slots = ds_sav.load_ds_sav(ds_path)
+        for slot_idx, slot in enumerate(slots):
+            if not slot.used:
+                continue
+            template_path, dist = convert.pick_template(slot.flags)
+            template_ct = ctsave.load(template_path)
+            result = convert.ds_to_ct(slot, template_ct)
+
+            safe_name = os.path.basename(ds_path).replace('.', '_')
+            out_path = os.path.join(SCRATCH_DIR, f"ds_{safe_name}.slot{slot_idx}.bin")
+            ctsave.save(out_path, result)
+            n_converted += 1
+
+            reloaded = ctsave.load(out_path)
+            round_trip_ok = reloaded.serialize() == result.serialize()
+            if round_trip_ok:
+                n_reload_ok += 1
+            else:
+                check(False, f"{out_path}: reload/round-trip mismatch")
+
+            party_ids = [b for b in slot.party if b < 7]
+            party_names = [slot.names[cid] for cid in party_ids]
+            levels = [slot.chars[cid].level for cid in party_ids]
+            hours = slot.play_time_seconds // 3600
+            minutes = (slot.play_time_seconds % 3600) // 60
+            seconds = slot.play_time_seconds % 60
+            print(f"  {ds_path} slot{slot_idx}: template={os.path.basename(template_path)} "
+                  f"dist={dist} party={','.join(party_names)} levels={levels} "
+                  f"gold={slot.gold} time={hours:02d}:{minutes:02d}:{seconds:02d}")
+
+    print(f"  converted {n_converted} slots, {n_reload_ok}/{n_converted} reload round trips OK")
+    # 3 fixtures: chrono-trigger.22851.dst (3 used slots) +
+    # chrono-trigger.18311.duc (1 used slot; slots 1-2 are 0xFF-filled) +
+    # chrono-trigger.18490.duc (3 used slots) = 7.
+    check(n_converted == 7, f"expected 7 used DS slots across 3 fixtures, got {n_converted}")
+    check(n_reload_ok == n_converted, "not all converted DS saves round-tripped on reload")
+
+
 def main():
     test_srm_parsing()
     test_steam_round_trip()
     test_conversion()
+    test_ds_conversion()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILURE(S):")
