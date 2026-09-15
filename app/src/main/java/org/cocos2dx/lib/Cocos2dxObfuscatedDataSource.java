@@ -3,8 +3,10 @@ package org.cocos2dx.lib;
 import android.content.res.AssetFileDescriptor;
 import android.media.MediaDataSource;
 
+import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 
@@ -15,16 +17,23 @@ import java.nio.channels.FileChannel;
  * wrapped this way, so MediaPlayer rejects the raw asset ("Can't play this video").
  * De-obfuscating on the fly with positional reads keeps playback zero-copy and
  * seekable; nothing is written to disk.
+ *
+ * <p>Also usable over a plain {@link File} on disk (e.g. a mod's FMV
+ * replacement under {@code ModManager}'s mod root) via the {@link
+ * #Cocos2dxObfuscatedDataSource(File)} constructor -- see {@code
+ * Cocos2dxVideoView#openVideo()}'s mod-override path.
  */
 public class Cocos2dxObfuscatedDataSource extends MediaDataSource {
     private final AssetFileDescriptor mAfd;
     private final FileInputStream mStream;
+    private final RandomAccessFile mRaf;
     private final FileChannel mChannel;
     private final long mStart;
     private final long mLength;
 
     public Cocos2dxObfuscatedDataSource(AssetFileDescriptor afd) throws IOException {
         mAfd = afd;
+        mRaf = null;
         mStart = afd.getStartOffset();
         mLength = afd.getLength();
         // Plain FileInputStream on the shared fd: positional channel reads (pread)
@@ -32,6 +41,20 @@ public class Cocos2dxObfuscatedDataSource extends MediaDataSource {
         // AssetManager's other users of the APK.
         mStream = new FileInputStream(afd.getFileDescriptor());
         mChannel = mStream.getChannel();
+    }
+
+    /**
+     * Same XOR de-obfuscation, but over a stand-alone file on disk (a mod's
+     * FMV replacement) rather than an APK asset entry. {@code file}'s entire
+     * contents are treated as obfuscated from offset 0.
+     */
+    public Cocos2dxObfuscatedDataSource(File file) throws IOException {
+        mAfd = null;
+        mStream = null;
+        mStart = 0;
+        mRaf = new RandomAccessFile(file, "r");
+        mChannel = mRaf.getChannel();
+        mLength = mRaf.length();
     }
 
     @Override
@@ -50,10 +73,22 @@ public class Cocos2dxObfuscatedDataSource extends MediaDataSource {
             if (n < 0) break;
             total += n;
         }
-        for (int k = 0; k < total; k++) {
-            buffer[offset + k] ^= (byte) (0xFF - ((position + k) & 0xFF));
-        }
+        deobfuscate(buffer, offset, total, position);
         return total == 0 ? -1 : total;
+    }
+
+    /**
+     * Applies {@code out[i] = in[i] ^ (0xFF - (i & 0xFF))} in place to {@code
+     * count} bytes of {@code buffer} starting at {@code offset}, where {@code
+     * filePosition} is the absolute obfuscated-file offset of {@code
+     * buffer[offset]} (the XOR key depends on absolute file position, not the
+     * buffer offset). Factored out of {@link #readAt} so the pure XOR/position
+     * logic can be exercised without a MediaDataSource/Android dependency.
+     */
+    static void deobfuscate(byte[] buffer, int offset, int count, long filePosition) {
+        for (int k = 0; k < count; k++) {
+            buffer[offset + k] ^= (byte) (0xFF - ((filePosition + k) & 0xFF));
+        }
     }
 
     @Override
@@ -65,9 +100,10 @@ public class Cocos2dxObfuscatedDataSource extends MediaDataSource {
     public void close() throws IOException {
         try {
             mChannel.close();
-            mStream.close();
+            if (mStream != null) mStream.close();
+            if (mRaf != null) mRaf.close();
         } finally {
-            mAfd.close();
+            if (mAfd != null) mAfd.close();
         }
     }
 }

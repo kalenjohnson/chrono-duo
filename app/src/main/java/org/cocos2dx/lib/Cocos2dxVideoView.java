@@ -34,7 +34,9 @@ import android.view.SurfaceView;
 import android.widget.FrameLayout;
 import android.widget.MediaController.MediaPlayerControl;
 
+import java.io.File;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.util.Map;
 
 public class Cocos2dxVideoView extends SurfaceView implements MediaPlayerControl {
@@ -295,12 +297,15 @@ public class Cocos2dxVideoView extends SurfaceView implements MediaPlayerControl
             mDuration = -1;
             mCurrentBufferPercentage = 0;
             if (mIsAssetRouse) {
-                AssetFileDescriptor afd = mCocos2dxActivity.getAssets().openFd(mVideoFilePath);
-                if (mVideoFilePath.endsWith(".dat")) {
-                    // Chrono Trigger's FMVs are XOR-obfuscated MP4s; decode on the fly.
-                    mMediaPlayer.setDataSource(new Cocos2dxObfuscatedDataSource(afd));
-                } else {
-                    mMediaPlayer.setDataSource(afd.getFileDescriptor(),afd.getStartOffset(),afd.getLength());
+                if (!trySetModFmvDataSource(mVideoFilePath)) {
+                    Log.i(TAG, "FMV: " + mVideoFilePath + " <- asset");
+                    AssetFileDescriptor afd = mCocos2dxActivity.getAssets().openFd(mVideoFilePath);
+                    if (mVideoFilePath.endsWith(".dat")) {
+                        // Chrono Trigger's FMVs are XOR-obfuscated MP4s; decode on the fly.
+                        mMediaPlayer.setDataSource(new Cocos2dxObfuscatedDataSource(afd));
+                    } else {
+                        mMediaPlayer.setDataSource(afd.getFileDescriptor(),afd.getStartOffset(),afd.getLength());
+                    }
                 }
             } else {
                 mMediaPlayer.setDataSource(mCocos2dxActivity, mVideoUri);
@@ -327,6 +332,78 @@ public class Cocos2dxVideoView extends SurfaceView implements MediaPlayerControl
         }
     }
     
+    /**
+     * If a mod overrides {@code archivePath} (tried as-is, with a
+     * {@code .dat}->{@code .mp4} swap, and -- if it has a directory prefix --
+     * the bare basename of each), points {@code mMediaPlayer} at that file
+     * instead of the APK asset and returns true. Sniffs the file's first 12
+     * bytes: a plain ISO-BMFF/MP4 ({@code ftyp} at offset 4) is set directly
+     * by path; anything else is assumed obfuscated like the originals and
+     * fed through a file-backed {@link Cocos2dxObfuscatedDataSource}. Any
+     * failure here is logged and treated as "no override" so the caller
+     * falls back to the normal asset path unchanged.
+     */
+    private boolean trySetModFmvDataSource(String archivePath) {
+        Cocos2dxObfuscatedDataSource obfuscatedSrc = null;
+        try {
+            File modFile = resolveFmvModFile(archivePath);
+            if (modFile == null || !modFile.isFile() || !modFile.canRead()) {
+                return false;
+            }
+            if (looksLikePlainMp4(modFile)) {
+                Log.i(TAG, "FMV: " + archivePath + " <- " + modFile.getPath() + " (plain mp4)");
+                mMediaPlayer.setDataSource(modFile.getAbsolutePath());
+            } else {
+                Log.i(TAG, "FMV: " + archivePath + " <- " + modFile.getPath() + " (obfuscated)");
+                obfuscatedSrc = new Cocos2dxObfuscatedDataSource(modFile);
+                mMediaPlayer.setDataSource(obfuscatedSrc);
+                obfuscatedSrc = null; // ownership handed to mMediaPlayer
+            }
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "FMV: mod override failed for " + archivePath + ", falling back to asset", e);
+            if (obfuscatedSrc != null) {
+                try {
+                    obfuscatedSrc.close();
+                } catch (IOException ignored) {
+                }
+            }
+            return false;
+        }
+    }
+
+    /** Tries {@link com.kalenjohnson.chronoduo.mods.ModManager#resolveStatic} under a few equivalent spellings of an FMV's archive path; returns the first hit, or null. */
+    private static File resolveFmvModFile(String archivePath) {
+        java.util.LinkedHashSet<String> candidates = new java.util.LinkedHashSet<>();
+        candidates.add(archivePath);
+        if (archivePath.endsWith(".dat")) {
+            candidates.add(archivePath.substring(0, archivePath.length() - 4) + ".mp4");
+        }
+        int slash = archivePath.lastIndexOf('/');
+        if (slash >= 0) {
+            String base = archivePath.substring(slash + 1);
+            candidates.add(base);
+            if (base.endsWith(".dat")) {
+                candidates.add(base.substring(0, base.length() - 4) + ".mp4");
+            }
+        }
+        for (String candidate : candidates) {
+            File f = com.kalenjohnson.chronoduo.mods.ModManager.resolveStatic(candidate);
+            if (f != null) return f;
+        }
+        return null;
+    }
+
+    /** True if {@code file}'s first 12 bytes look like an ISO-BMFF/MP4 box header (bytes 4..7 == "ftyp"). */
+    private static boolean looksLikePlainMp4(File file) throws IOException {
+        byte[] header = new byte[12];
+        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+            int read = raf.read(header);
+            if (read < 8) return false;
+        }
+        return header[4] == 'f' && header[5] == 't' && header[6] == 'y' && header[7] == 'p';
+    }
+
     private boolean mKeepRatio = false;
     
     public void setKeepRatio(boolean enabled) {
