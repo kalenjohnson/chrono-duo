@@ -613,3 +613,34 @@ Dungeon fog share one row as half-width toggles (0.055h tall so "Pixel graphics:
 under the right one; every other settings row keeps its original position. Pref `fog_on`
 (default on) in chronoduo_prefs. Reveal radius and cell size are constants in FogOfWar.
 Unverified on device as of writing: settings row fit, reveal radius feel.
+
+## SNES save import — format research (2026-09-15)
+
+Goal: load SNES `.srm` games into the hosted port. Full record in `tools/saves/REPORT.md`;
+fixtures (21 SRMs covering the whole game, 43 Steam chapter saves) live under `tools/saves/`.
+
+**Port save container SOLVED from the Steam files.** `save_NN.bin` = 8-byte header + Blowfish-CBC
+(key `BA EC B7 8A EA 25 CA E4`, IV = header XOR `75 FA 29 95 05 4D 41 5F`, ported from
+`reference/ChronoMod/ChronoCrypto.cpp`); plaintext = `payload ‖ u16 checksum ‖ garbage pad ‖ u32 len`.
+`tools/saves/ctcrypto.py` decrypts all 45 files. Android/Switch files are `Chrono_sp_N_0.dat`
+plus `common.bin` / `meta.bin` (ct_nx README), same engine — key assumed identical, unverified.
+
+**Payload is a serialized stream** (names are length-prefixed; a renamed character shifts
+everything after 0xB0F). The port's data is the SNES SRAM slot re-encoded: event flags
+byte-identical (`port 0x200..0x400` = `slot 0x602..0x802`), character records widened
+0x50→0x58 with **HP/MP stored max-then-current** (SNES is current-then-max), equipment and
+inventory as `(category<<12)|idx` with idx = SNES id minus the category base (weapons 0,
+armour 0x5A, helmets 0x7B, accessories 0x94, consumables 0xBC, key items 0xCF — key-item
+order diverges after Gate Key), tech block 45 bytes verbatim, party/reserve 9 bytes verbatim,
+gold/time as u24. Region A (0x000–0x200), the 0x400 block and the 0x1E0C block are scene/
+position state with no SRAM source → conversion = overlay SNES state on the closest Steam
+chapter template (flag-block Hamming distance).
+
+**SNES slot checksum** = 16-bit add-with-carry over the 1280 words, final carry dropped
+(53/53). **Port trailer checksum UNKNOWN**: exhaustively not any CRC-16, not CRC-32 halves, not
+byte/word/dword sums, not any multiplicative hash (same-length XOR/difference tests cancel any
+seed). Needs the save routine in `libchrono.so` (symbols kept → look for Save/Serialize) — the
+lib is not on disk any more, pull `split_config.arm64_v8a.apk` from the device next time it is
+plugged in. Also to confirm on device: key, `Chrono_sp_N` slot numbering, whether the loader
+checks the checksum at all, the port's item table (`ctres.py` on `resources.bin`) for the
+key-item mapping, and the meaning of the char-record `+1A` field (`9 999 999` sentinel).
