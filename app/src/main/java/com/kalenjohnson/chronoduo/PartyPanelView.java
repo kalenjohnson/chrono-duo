@@ -265,6 +265,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         void onPixelGraphicsChanged(boolean enabled);
         /** "Build original sprites" tapped: kick off the background OrigArtRebuilder pass. */
         void requestOrigArtBuild();
+        /** "Import SNES save..." tapped: launch the SAF picker for an .srm file. */
+        void requestSaveImport();
     }
     private SettingsHost settingsHost;
 
@@ -293,6 +295,34 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // empty while importing, so a tap can't double-fire a second import).
     private final RectF importButtonHitBox = new RectF();
     private final RectF settingsBackHitBox = new RectF();
+
+    // SNES-save-import status, pushed from AppActivity via setSaveImportStatus
+    // as the (quick, foreground-triggered) background import runs -- same
+    // idle/importing/error shape as importing/importError above, but no
+    // done/total/stage progress since the conversion is effectively
+    // instantaneous once the user has picked a slot in AppActivity's
+    // AlertDialog flow. saveImportMessage holds either the success line
+    // ("Imported into slot N -- ...") or the failure message.
+    private boolean savingImport;
+    private String saveImportMessage;
+    private boolean saveImportError;
+    private final RectF saveImportButtonHitBox = new RectF();
+
+    /**
+     * Pushes SNES-save-import progress/result to the settings screen; called
+     * from AppActivity on the main thread. {@code importing} true means a
+     * background import is in flight (button disabled meanwhile); false with
+     * {@code error} true means {@code message} is a failure to show; false
+     * with {@code error} false and a non-null {@code message} means success
+     * (shown once, same as the DS-ROM row's error case, until the next
+     * attempt or a screen re-entry clears it).
+     */
+    public void setSaveImportStatus(boolean importing, String message, boolean error) {
+        this.savingImport = importing;
+        this.saveImportMessage = message;
+        this.saveImportError = error;
+        invalidate();
+    }
 
     // Pixel-graphics toggle row (GOT-patches libchrono.so's Texture2D default
     // filter -- see GameState.nativeSetPixelGraphics). Persisted via
@@ -449,6 +479,11 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             if (!importing && !importButtonHitBox.isEmpty()
                     && importButtonHitBox.contains(event.getX(), event.getY())) {
                 if (settingsHost != null) settingsHost.requestRomImport();
+                return true;
+            }
+            if (!savingImport && !saveImportButtonHitBox.isEmpty()
+                    && saveImportButtonHitBox.contains(event.getX(), event.getY())) {
+                if (settingsHost != null) settingsHost.requestSaveImport();
                 return true;
             }
             if (!pixelGraphicsHitBox.isEmpty()
@@ -1961,6 +1996,15 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         return n > 0 ? (n + " maps") : "not imported";
     }
 
+    /** Status text for the "SNES save: ..." row -- see {@link #setSaveImportStatus}. */
+    private String saveImportStatusText() {
+        if (savingImport) return "importing...";
+        if (saveImportMessage != null) {
+            return (saveImportError ? "error: " : "") + saveImportMessage;
+        }
+        return "not imported";
+    }
+
     /** Counts {@code *.png} files directly under {@code <filesDir>/orig_art} for the settings screen's "Original art" status row -- see {@link #drawSettingsScreen}. Mirrors {@link #countDsMaps}; this is the same directory {@link org.cocos2dx.cpp.AppActivity}'s OrigArtRebuilder and MapchipRebuilder write into and scanOrigArtReplacements() scans, so the count covers character sheets and field chip sheets together. */
     private int countOrigArtSheets() {
         File dir = new File(getContext().getFilesDir(), "orig_art");
@@ -2019,6 +2063,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         c.drawText("Chrono Trigger DS ROM (.nds or .zip).",
                 parchment.left + w * 0.06f, parchment.top + h * 0.212f, text);
 
+        setText(h * 0.02f, Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK)),
+                false, Paint.Align.LEFT, false);
+        text.setTypeface(Typeface.MONOSPACE);
+        c.drawText("SNES save: " + saveImportStatusText(), parchment.left + w * 0.06f,
+                parchment.top + h * 0.233f, text);
+
         setText(h * 0.032f, INK, false, Paint.Align.LEFT, false);
         text.setTypeface(Typeface.MONOSPACE);
         c.drawText("Original art: " + origArtStatusText(), parchment.left + w * 0.06f,
@@ -2041,10 +2091,17 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
         Bitmap winTex = ChronoAssets.getWindowTex();
 
-        float btnW = parchment.width() * 0.6f;
+        // "Import DS ROM..." and "Import SNES save..." share one row as two
+        // half-width buttons (same split-row shape as the pixel/fog toggle
+        // row below), rather than each taking a full 0.6-parchment-width
+        // slot -- keeps every row below at its original vertical position.
+        float btnRowW = parchment.width() * 0.92f;
+        float btnGap = parchment.width() * 0.02f;
+        float btnW = (btnRowW - btnGap) / 2f;
         float btnH = h * 0.075f;
-        RectF importBtn = new RectF(parchment.centerX() - btnW / 2f, parchment.top + h * 0.245f,
-                parchment.centerX() + btnW / 2f, parchment.top + h * 0.245f + btnH);
+        float btnTop = parchment.top + h * 0.245f;
+        float btnLeft = parchment.centerX() - btnRowW / 2f;
+        RectF importBtn = new RectF(btnLeft, btnTop, btnLeft + btnW, btnTop + btnH);
         drawCommandButton(c, importBtn, "Import DS ROM...", winTex, false);
         if (importing) {
             fill.setShader(null);
@@ -2053,6 +2110,18 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             importButtonHitBox.setEmpty();
         } else {
             importButtonHitBox.set(importBtn);
+        }
+
+        RectF saveImportBtn = new RectF(importBtn.right + btnGap, btnTop,
+                importBtn.right + btnGap + btnW, btnTop + btnH);
+        drawCommandButton(c, saveImportBtn, "Import SNES save...", winTex, false);
+        if (savingImport) {
+            fill.setShader(null);
+            fill.setColor(Color.argb(150, 0, 0, 0));
+            c.drawRect(saveImportBtn, fill);
+            saveImportButtonHitBox.setEmpty();
+        } else {
+            saveImportButtonHitBox.set(saveImportBtn);
         }
 
         // Pixel graphics and Dungeon fog share one row as two half-width

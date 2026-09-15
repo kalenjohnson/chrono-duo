@@ -23,6 +23,21 @@ full reverse-engineered format spec; the code here implements it.
 - `convert.py` -- `snes_to_ct()`: picks the closest-matching chapter template
   and overlays SNES data onto it.
 - `test_saves.py` -- parsing, round-trip, and conversion checks over every fixture.
+- `JavaSaveCheck.java` -- desktop parity check for the Java port of these
+  modules (`app/src/main/java/com/kalenjohnson/chronoduo/saveimport/`, used
+  by ChronoDuo's in-app "Import SNES save" feature). Compares every used
+  SRM slot's converted payload byte-for-byte against a Python-generated
+  reference, and every `steam/*.bin` template's decrypt-parse-serialize-
+  re-encrypt round trip against the original file bytes. Build and run from
+  this directory:
+  ```
+  javac -d /tmp/svclasses ../../app/src/main/java/com/kalenjohnson/chronoduo/saveimport/*.java JavaSaveCheck.java
+  java -cp /tmp/svclasses JavaSaveCheck <manifest.tsv> <refDir>
+  ```
+  `<manifest.tsv>`/`<refDir>` come from a one-off Python helper (not
+  checked in) that imports `ctsave`/`snes_srm`/`convert` directly and dumps
+  each used slot's `snes_to_ct(...).serialize()` bytes plus a manifest line
+  `<srm>\t<slot>\t<template basename>\t<hamming distance>\t<ref file>`.
 
 ## Running
 
