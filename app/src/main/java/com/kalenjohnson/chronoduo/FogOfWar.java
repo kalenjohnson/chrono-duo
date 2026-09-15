@@ -38,14 +38,14 @@ import java.util.concurrent.Executors;
  * down.
  *
  * <p>{@link #applyMask} hands back a masked ARGB_8888 copy of a source
- * bitmap with every unrevealed cell's pixels made fully transparent (via a
- * {@code PorterDuff.Mode.CLEAR} rect per unrevealed cell -- cheap and does
- * not touch already-transparent source pixels differently than opaque
- * ones). The masked copy is cached per key and only regenerated when the
- * mask has actually changed (tracked by a per-key version counter, bumped
- * only when {@link #reveal} flips a bit) or the caller passes a different
- * source {@link Bitmap} *instance* -- so a steady-state frame in an
- * unrevealed-but-already-seen room does zero allocation.
+ * bitmap: a 32x24 per-cell alpha image (hidden = 0, revealed = 1, with a
+ * {@link #FADE_NANOS} ease-in for cells revealed this session) is drawn
+ * over the copy bilinearly upscaled with {@code DST_IN}, so edges are soft
+ * gradients rather than 8px steps. The copy is cached per key (and its
+ * bitmap reused in place) and only regenerated when the mask changed
+ * (per-key version counter, bumped only when {@link #reveal} flips a bit),
+ * the caller passes a different source {@link Bitmap} *instance*, or a
+ * fade-in is still running -- so a settled frame does zero allocation.
  */
 public final class FogOfWar {
     private static final String TAG = "FogOfWar";
@@ -63,6 +63,9 @@ public final class FogOfWar {
     public static final float DEFAULT_REVEAL_RADIUS_PX = 12f;
 
     private static final long WRITE_DEBOUNCE_NANOS = 2_000_000_000L;
+
+    /** How long a newly revealed cell takes to fade from hidden to visible. */
+    public static final long FADE_NANOS = 400_000_000L;
     private static final String FOG_SUBDIR = "fog";
 
     private static File fogDir;
@@ -74,6 +77,13 @@ public final class FogOfWar {
     private static final Object LOCK = new Object();
     private static final Map<String, byte[]> masks = new HashMap<>();
     private static final Map<String, Integer> maskVersion = new HashMap<>();
+    // Per-key System.nanoTime() each cell was revealed at, in-memory only:
+    // 0 = revealed before this process (loaded from disk) or never, so it
+    // draws at full alpha with no fade. Drives the fade-in in applyMask.
+    private static final Map<String, long[]> revealedAt = new HashMap<>();
+    // nanoTime of the most recent reveal anywhere; isAnimating() compares
+    // against it so the panel keeps redrawing while a fade-in is running.
+    private static volatile long lastRevealNanos = Long.MIN_VALUE / 2;
     // Keys with changes not yet on disk.
     private static final java.util.Set<String> dirty = new java.util.HashSet<>();
     private static final Map<String, Long> lastWriteAt = new HashMap<>();
@@ -92,6 +102,22 @@ public final class FogOfWar {
     private static final java.util.LinkedHashMap<String, Bitmap> maskedCache = new java.util.LinkedHashMap<>(4, 0.75f, true);
     private static final Map<String, Bitmap> maskedCacheSource = new HashMap<>();
     private static final Map<String, Integer> maskedCacheVersion = new HashMap<>();
+    // True when the cached copy was rendered mid-fade and needs one more
+    // rebuild once the fade settles.
+    private static final Map<String, Boolean> maskedCacheAnimating = new HashMap<>();
+    // 32x24 scratch: one pixel per cell, white with the cell's alpha, drawn
+    // scaled (bilinear) over the masked copy with DST_IN -- the upscale
+    // filter is what turns 8px steps into soft edges.
+    private static Bitmap smallMask;
+    private static final Paint maskPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private static final Paint srcPaint = new Paint();
+    private static final int[] smallPixels = new int[GRID_W * GRID_H];
+    private static final android.graphics.Rect smallSrc = new android.graphics.Rect(0, 0, GRID_W, GRID_H);
+    private static final android.graphics.Rect dstRect = new android.graphics.Rect();
+    static {
+        maskPaint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.DST_IN));
+        srcPaint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC));
+    }
 
     private static final ExecutorService writer = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "FogOfWar-writer");
@@ -182,12 +208,16 @@ public final class FogOfWar {
 
         synchronized (LOCK) {
             byte[] mask = getMask(key);
+            long[] stamps = revealedAt.get(key);
+            if (stamps == null) { stamps = new long[GRID_W * GRID_H]; revealedAt.put(key, stamps); }
+            long now = System.nanoTime();
             int leaderCx = clamp((int) (mapPx / CELL_PX), 0, GRID_W - 1);
             int leaderCy = clamp((int) (mapPy / CELL_PX), 0, GRID_H - 1);
 
             boolean changed = false;
             if (!getBit(mask, leaderCx, leaderCy)) {
                 setBit(mask, leaderCx, leaderCy);
+                stamps[leaderCy * GRID_W + leaderCx] = now;
                 changed = true;
             }
 
@@ -205,6 +235,7 @@ public final class FogOfWar {
                     float dx = ccx - mapPx, dy = ccy - mapPy;
                     if (dx * dx + dy * dy <= r2) {
                         setBit(mask, cx, cy);
+                        stamps[cy * GRID_W + cx] = now;
                         changed = true;
                     }
                 }
@@ -212,6 +243,7 @@ public final class FogOfWar {
 
             if (changed) {
                 maskVersion.put(key, maskVersion.getOrDefault(key, 0) + 1);
+                lastRevealNanos = now;
                 scheduleWrite(key, mask);
             }
             return changed;
@@ -300,54 +332,78 @@ public final class FogOfWar {
         }
     }
 
+    /** True while any cell revealed in the last {@link #FADE_NANOS} is still fading in; the panel keeps scheduling frames while this holds. */
+    public static boolean isAnimating() {
+        return System.nanoTime() - lastRevealNanos < FADE_NANOS;
+    }
+
     /**
-     * Returns a masked ARGB_8888 copy of {@code source} with every
-     * unrevealed 8x8 cell of {@code key}'s mask fully transparent, or
-     * {@code source} itself if it's null. The result is cached per key and
-     * reused across calls until either the mask changes (see {@link
-     * #reveal}) or {@code source} is a different {@link Bitmap} instance
-     * than the one the cached copy was built from -- see the class doc.
+     * Returns a masked ARGB_8888 copy of {@code source}: each 8x8 cell of
+     * {@code key}'s mask contributes an alpha of 1 (revealed, settled), 0
+     * (hidden), or a ramp in between during the {@link #FADE_NANOS} after it
+     * was revealed. The 32x24 per-cell alpha image is drawn over the copy
+     * scaled up with bilinear filtering and DST_IN, so cell boundaries
+     * become ~8px gradients rather than hard steps. The copy is cached per
+     * key (bitmap reused in place) and rebuilt only when the mask changed,
+     * {@code source} is a different {@link Bitmap} instance, or a fade is
+     * still running. Returns {@code source} itself if it's null.
      */
     public static Bitmap applyMask(String key, Bitmap source) {
         if (source == null) return null;
-        byte[] maskCopy;
         int curVersion;
+        Bitmap masked;
+        boolean animating = false;
         synchronized (LOCK) {
             curVersion = maskVersion.getOrDefault(key, 0);
             Bitmap cachedMasked = maskedCache.get(key); // access-ordered: marks key most recent
             Bitmap cachedSource = maskedCacheSource.get(key);
             Integer cachedVersion = maskedCacheVersion.get(key);
-            if (cachedMasked != null && cachedSource == source
+            boolean cachedAnimating = Boolean.TRUE.equals(maskedCacheAnimating.get(key));
+            if (cachedMasked != null && cachedSource == source && !cachedAnimating
                     && cachedVersion != null && cachedVersion == curVersion) {
                 return cachedMasked;
             }
-            maskCopy = getMask(key).clone();
-        }
 
-        Bitmap masked = source.copy(Bitmap.Config.ARGB_8888, true);
-        if (masked == null) return source; // copy failed (e.g. recycled source) -- fall back to unmasked rather than crash
-
-        Canvas canvas = new Canvas(masked);
-        Paint clear = new Paint();
-        clear.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
-        int w = masked.getWidth(), h = masked.getHeight();
-        for (int cy = 0; cy < GRID_H; cy++) {
-            int py0 = cy * CELL_PX;
-            if (py0 >= h) break;
-            int py1 = Math.min(py0 + CELL_PX, h);
-            for (int cx = 0; cx < GRID_W; cx++) {
-                if (getBit(maskCopy, cx, cy)) continue;
-                int px0 = cx * CELL_PX;
-                if (px0 >= w) break;
-                int px1 = Math.min(px0 + CELL_PX, w);
-                canvas.drawRect(px0, py0, px1, py1, clear);
+            // Per-cell alpha into the scratch pixel array.
+            byte[] mask = getMask(key);
+            long[] stamps = revealedAt.get(key);
+            long now = System.nanoTime();
+            for (int i = 0; i < smallPixels.length; i++) {
+                int a;
+                if ((mask[i >> 3] & (1 << (i & 7))) == 0) {
+                    a = 0;
+                } else {
+                    long t = stamps != null ? stamps[i] : 0L;
+                    if (t == 0L || now - t >= FADE_NANOS) {
+                        a = 255;
+                    } else {
+                        float f = (now - t) / (float) FADE_NANOS;
+                        f = f * (2f - f); // ease-out
+                        a = Math.round(f * 255f);
+                        animating = true;
+                    }
+                }
+                smallPixels[i] = (a << 24) | 0x00FFFFFF;
             }
-        }
+            if (smallMask == null) smallMask = Bitmap.createBitmap(GRID_W, GRID_H, Bitmap.Config.ARGB_8888);
+            smallMask.setPixels(smallPixels, 0, GRID_W, 0, 0, GRID_W, GRID_H);
 
-        synchronized (LOCK) {
+            int w = source.getWidth(), h = source.getHeight();
+            if (cachedMasked != null && !cachedMasked.isRecycled()
+                    && cachedMasked.getWidth() == w && cachedMasked.getHeight() == h) {
+                masked = cachedMasked;
+            } else {
+                masked = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            }
+            Canvas canvas = new Canvas(masked);
+            canvas.drawBitmap(source, 0f, 0f, srcPaint);
+            dstRect.set(0, 0, w, h);
+            canvas.drawBitmap(smallMask, smallSrc, dstRect, maskPaint);
+
             maskedCache.put(key, masked);
             maskedCacheSource.put(key, source);
             maskedCacheVersion.put(key, curVersion);
+            maskedCacheAnimating.put(key, animating);
             while (maskedCache.size() > MASKED_CACHE_MAX) {
                 // Evict the least recently drawn key. Not recycled: the
                 // panel may still hold it as the fading-out prevAreaMapBitmap.
@@ -355,6 +411,7 @@ public final class FogOfWar {
                 maskedCache.remove(eldest);
                 maskedCacheSource.remove(eldest);
                 maskedCacheVersion.remove(eldest);
+                maskedCacheAnimating.remove(eldest);
             }
         }
         return masked;
@@ -377,6 +434,8 @@ public final class FogOfWar {
             maskedCache.clear();
             maskedCacheSource.clear();
             maskedCacheVersion.clear();
+            maskedCacheAnimating.clear();
+            revealedAt.clear();
             dir = fogDir;
         }
         if (dir != null) deleteRecursive(dir);

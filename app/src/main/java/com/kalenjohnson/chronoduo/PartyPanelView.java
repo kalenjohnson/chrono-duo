@@ -768,8 +768,25 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
     private static ContentMode modeOf(PartySnapshot s) {
         if (s.inBattle) return ContentMode.BATTLE;
+        if (isWorldMapLocation(s.fieldMapId)) return ContentMode.OVERWORLD;
         return (s.mapName == null || s.mapName.isEmpty()) ? ContentMode.OVERWORLD : ContentMode.FIELD;
     }
+
+    /**
+     * Location ids 0x1F0..0x1F7 are the eight overworlds themselves
+     * ("Present", "Middle Ages", ... "Apocalypse"). The game reports one of
+     * them as the field map while the menu is open on the overworld (the
+     * WorldScene is gone, so worldScenePresent is false) -- there is no area
+     * map for them, so the panel keeps showing the overworld instead of a
+     * "#497" placeholder.
+     */
+    static boolean isWorldMapLocation(int id) {
+        return id >= 0x1F0 && id <= 0x1F7;
+    }
+
+    // Last snapshot taken with the WorldScene live; reused to keep drawing
+    // the overworld panel while the menu covers the world map.
+    private PartySnapshot lastOverworldSnap;
 
     public void update(PartySnapshot s) {
         if (settingsMode && s.inBattle) {
@@ -2124,10 +2141,14 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // nameless field scene (e.g. story cutscenes with no location) used
         // to be mistaken for the overworld and showed a map that didn't apply.
         boolean overworld = s.worldScenePresent;
+        if (overworld) lastOverworldSnap = s;
         boolean nameless = s.mapName == null || s.mapName.isEmpty();
         String title = overworld ? "World Map" : (nameless ? "" : s.mapName);
         if (overworld) {
             drawOverworldContent(c, parchment, s, title);
+        } else if (isWorldMapLocation(s.fieldMapId) && lastOverworldSnap != null) {
+            // menu open on the overworld: keep the last live overworld view
+            drawOverworldContent(c, parchment, lastOverworldSnap, "World Map");
         } else {
             drawFieldContent(c, parchment, s, title, live);
         }
@@ -2550,6 +2571,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
         if (titleFadeStart >= 0) animating = true;
         if (areaMapFadeStart >= 0) animating = true;
+        if (FogOfWar.isAnimating()) animating = true; // newly revealed fog cells fading in
         if (resultsMessageFadeStart >= 0) animating = true;
         if (snap.resultsActive && !resultsVisible(snap)) animating = true; // waiting out the victory pose
         if (pressedCommand >= 0 && pressedAt >= 0
