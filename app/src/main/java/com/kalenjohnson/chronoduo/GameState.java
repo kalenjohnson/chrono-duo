@@ -386,6 +386,17 @@ public final class GameState {
     // Live battle actor array (10 * 0x80-byte slots), or null if not in battle
     // or any pointer in the chase is bad. Any thread; uses cached node ptr.
     public static native byte[] nativeReadBattleActors();
+    // Live target-selection state: [active, allMode, count, slot...] where
+    // slots are battle actor slots (0-2 party in party order, 3-10 enemies)
+    // currently under the game's target cursor; null when not in battle.
+    // Any thread (cached-pointer reads, like nativeReadBattleActors). See
+    // gamestate.c's "Battle target-selection state" block.
+    public static native int[] nativeReadBattleTargeting();
+    // Moves the game's target cursor to actor slot `slot` (honored on the
+    // next battle tick, exactly like dpad input). False when not selecting
+    // a target, in all-target mode, or when that slot isn't a candidate.
+    // GL thread only.
+    public static native boolean nativeSetBattleTargetSlot(int slot);
     // Battle command button (MenuItemToggle) positions/visibility/selection,
     // cached by nativeUpdateBattleFlag: flat [x0,y0,vis0,sel0,selIdx0, ...]
     // quintuples in worldspace pixels; vis/sel are 0.0/1.0, selIdx is the
@@ -408,6 +419,12 @@ public final class GameState {
     // couldn't be resolved (skip tapping that row). Any thread; uses the
     // cached array populated on the GL thread.
     public static native float[] nativeGetBattleList();
+    // Selects and commits row `idx` of the currently open Tech/Item submenu
+    // in one step by driving the game's own input manager (see gamestate.c's
+    // nativeCommitBattleListRow comment block for why a single tap can't).
+    // GL thread only. Returns false when nothing was issued, in which case
+    // the caller should fall back to tapping the row's screen position.
+    public static native boolean nativeCommitBattleListRow(int idx);
     // Opts the BattleTechMenu/BattleItemMenu submenu nodes into the same
     // opacity hiding nativeEnforceUiTick applies to the rest of the battle
     // chrome (see nativeSetHideBattleUi) -- only meaningful once the caller

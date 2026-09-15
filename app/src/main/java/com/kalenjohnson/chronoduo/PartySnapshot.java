@@ -86,6 +86,7 @@ public final class PartySnapshot {
     public static final class Enemy {
         public int curHp, maxHp;
         public int id; // monster id, actor block +0x00 (u8); index into monster.txt name table
+        public int slot; // battle actor slot (3-10); what targetSlots refers to
     }
 
     /**
@@ -129,6 +130,13 @@ public final class PartySnapshot {
 
     public final List<Member> members = new ArrayList<>();
     public boolean inBattle;
+    // Target-selection phase (see GameState.nativeReadBattleTargeting):
+    // true while the game's hand cursor is up; targetSlots are the actor
+    // slots currently selected (one, or all of them when targetAll).
+    public boolean targetingActive;
+    public boolean targetAll;
+    public int[] targetSlots = EMPTY_INTS;
+    private static final int[] EMPTY_INTS = new int[0];
     public final List<Enemy> enemies = new ArrayList<>();
     // Up to 3 live command-menu targets (Attack, Tech, Item), in that order;
     // empty when the command menu isn't currently open (ATB not ready, or a
@@ -194,7 +202,12 @@ public final class PartySnapshot {
     // native state machine itself has wound down.
     public int resultsStep = -1;
     public int resultsExp, resultsGold, resultsTp;
-    public int[] resultsItems = new int[0];
+    public int[] resultsItems = new int[0]; // the six raw drop slots (0 = empty), see nativeGetBattleResults
+    // comment_out2 companion state (see gamestate.c nativeGetBattleResults):
+    // sub-counter, character slot cursor, and the ids the current window
+    // would name (-1 when unknown).
+    public int resultsSub = -1, resultsSlot = -1, resultsCharId = -1;
+    public int resultsTechId = -1, resultsDualTechId = -1, resultsTripleTechId = -1;
     public boolean resultsActive;
     public int gold;        // cSfcWork+0x1a04 (u32), found by differential dump
     public int playSeconds; // cSfcWork+0x1a10 (u32), monotonically rising
@@ -361,7 +374,16 @@ public final class PartySnapshot {
                 e.curHp = curHp;
                 e.maxHp = maxHp;
                 e.id = u8(btl, base + 0x00);
+                e.slot = i;
                 snap.enemies.add(e);
+            }
+            int[] tgt = GameState.nativeReadBattleTargeting();
+            if (tgt != null && tgt.length >= 3 && tgt[0] != 0) {
+                snap.targetingActive = true;
+                snap.targetAll = tgt[1] != 0;
+                int n = Math.max(0, Math.min(tgt[2], tgt.length - 3));
+                snap.targetSlots = new int[n];
+                System.arraycopy(tgt, 3, snap.targetSlots, 0, n);
             }
 
             float[] toggles = GameState.nativeGetBattleToggles();
@@ -449,23 +471,27 @@ public final class PartySnapshot {
             snap.listOpen = snap.listKind >= 0;
 
             int[] results = GameState.nativeGetBattleResults();
-            if (results != null && results.length >= 6) {
+            if (results != null && results.length >= 12) {
                 snap.resultsStep = results[0];
                 snap.resultsExp = results[1];
                 snap.resultsGold = results[2];
                 snap.resultsTp = results[3];
-                int itemCount = Math.max(0, Math.min(8, results[5]));
-                int avail = results.length - 6;
-                itemCount = Math.min(itemCount, avail);
+                snap.resultsSub = results[5];
+                snap.resultsSlot = results[6];
+                snap.resultsCharId = results[7];
+                snap.resultsTechId = results[8];
+                snap.resultsDualTechId = results[9];
+                snap.resultsTripleTechId = results[10];
+                int itemCount = Math.max(0, Math.min(results[11], results.length - 12));
                 snap.resultsItems = new int[itemCount];
-                System.arraycopy(results, 6, snap.resultsItems, 0, itemCount);
+                System.arraycopy(results, 12, snap.resultsItems, 0, itemCount);
             }
             boolean allEnemiesDead = !snap.enemies.isEmpty();
             for (Enemy e : snap.enemies) {
                 if (e.curHp != 0) { allEnemiesDead = false; break; }
             }
             snap.resultsActive = allEnemiesDead
-                    && snap.resultsStep >= 1 && snap.resultsStep <= 30; // step 0 = engine still waiting out death animations; 1 = first window is up
+                    && snap.resultsStep >= 1 && snap.resultsStep <= 31; // step 0 = engine still waiting out death animations; 1 = first window is up; 32 = done
         }
         return snap;
     }
@@ -558,10 +584,15 @@ public final class PartySnapshot {
                 || fieldMapId != o.fieldMapId
                 || !feq(fieldX, o.fieldX) || !feq(fieldY, o.fieldY)) return false;
         if (inBattle != o.inBattle || enemies.size() != o.enemies.size()) return false;
+        if (targetingActive != o.targetingActive || targetAll != o.targetAll
+                || !java.util.Arrays.equals(targetSlots, o.targetSlots)) return false;
         if (menuOpen != o.menuOpen || commandTargets.size() != o.commandTargets.size()) return false;
         if (autoBattleAvailable != o.autoBattleAvailable || autoBattleOn != o.autoBattleOn) return false;
         if (listKind != o.listKind || listRows.size() != o.listRows.size()) return false;
         if (resultsActive != o.resultsActive || resultsStep != o.resultsStep
+                || resultsSub != o.resultsSub || resultsSlot != o.resultsSlot
+                || resultsTechId != o.resultsTechId || resultsDualTechId != o.resultsDualTechId
+                || resultsTripleTechId != o.resultsTripleTechId
                 || resultsExp != o.resultsExp || resultsGold != o.resultsGold
                 || resultsTp != o.resultsTp
                 || !java.util.Arrays.equals(resultsItems, o.resultsItems)) return false;
@@ -575,7 +606,7 @@ public final class PartySnapshot {
         }
         for (int i = 0; i < enemies.size(); i++) {
             Enemy a = enemies.get(i), b = o.enemies.get(i);
-            if (a.curHp != b.curHp || a.maxHp != b.maxHp || a.id != b.id) return false;
+            if (a.curHp != b.curHp || a.maxHp != b.maxHp || a.id != b.id || a.slot != b.slot) return false;
         }
         for (int i = 0; i < commandTargets.size(); i++) {
             CommandTarget a = commandTargets.get(i), b = o.commandTargets.get(i);

@@ -107,6 +107,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // top-strip chips, tap injection, battle d-pad nav) lives in BattleChrome;
     // this view routes touch/d-pad/draw/update to it.
     final BattleChrome battle;
+    // Party status box rects (one per drawn member, in party order) for
+    // tap-to-target on allies -- see onTouchEvent / BattleChrome.selectTargetSlot.
+    private final RectF[] memberBoxes = {new RectF(), new RectF(), new RectF()};
+    private int memberBoxCount;
     // The map side (overworld map + marker, field area minimap + fog + marker,
     // title / area-map crossfades) lives in MapContent.
     final MapContent map;
@@ -257,6 +261,13 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         if (!snap.inBattle && settings.gearHit(event.getX(), event.getY())) {
             settings.open();
             return true;
+        }
+        if (snap.inBattle && snap.targetingActive) {
+            for (int i = 0; i < memberBoxCount; i++) {
+                if (memberBoxes[i].contains(event.getX(), event.getY())) {
+                    return battle.selectTargetSlot(i);
+                }
+            }
         }
         return battle.onTouchDown(event.getX(), event.getY());
     }
@@ -892,8 +903,20 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         float boxH = h * 0.145f;
         float boxW = Math.min(w * 0.31f, (w - pad * (n + 1)) / n);
         float x = pad;
-        for (PartySnapshot.Member m : snap.members) {
+        memberBoxCount = 0;
+        for (int i = 0; i < n; i++) {
+            PartySnapshot.Member m = snap.members.get(i);
             drawStatusBox(c, m, x, pad, boxW, boxH);
+            // Party member i is battle actor slot i (see PartySnapshot.read),
+            // so an ally-targeting tech/item highlights its box here.
+            if (snap.inBattle && BattleChrome.isTargetSlot(snap, i)) {
+                RectF box = new RectF(x - 3f, pad - 3f, x + boxW + 3f, pad + boxH + 3f);
+                battle.drawTargetHighlight(c, box);
+            }
+            if (i < memberBoxes.length) {
+                memberBoxes[i].set(x, pad, x + boxW, pad + boxH);
+                memberBoxCount = i + 1;
+            }
             x += boxW + pad;
         }
 

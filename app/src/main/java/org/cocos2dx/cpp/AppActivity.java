@@ -352,6 +352,10 @@ public class AppActivity extends Cocos2dxActivity {
         android.content.IntentFilter filter =
                 new android.content.IntentFilter("com.kalenjohnson.chronoduo.SCENE_DUMP");
         filter.addAction("com.kalenjohnson.chronoduo.BATTLE_HIDE_MASK");
+        // BATTLE_UI_SHOW --ez show true|false: un-blanks (or re-blanks) the
+        // game's own top-screen battle UI, submenus included, so it can be
+        // compared against the bottom-screen mirror live.
+        filter.addAction("com.kalenjohnson.chronoduo.BATTLE_UI_SHOW");
         filter.addAction("com.kalenjohnson.chronoduo.WORLD_MAP_CAPTURE");
         android.content.BroadcastReceiver devReceiver = new android.content.BroadcastReceiver() {
             @Override public void onReceive(Context c, android.content.Intent i) {
@@ -360,6 +364,15 @@ public class AppActivity extends Cocos2dxActivity {
                     File dir = getExternalFilesDir(null);
                     com.kalenjohnson.chronoduo.WorldMapLive.requestDebugCapture(
                             dir != null ? new File(dir, "worldmap_capture_debug.png") : null);
+                    return;
+                }
+                if ("com.kalenjohnson.chronoduo.BATTLE_UI_SHOW".equals(action)) {
+                    boolean show = i.getBooleanExtra("show", true);
+                    Cocos2dxHelper.runOnGLThread(() -> {
+                        com.kalenjohnson.chronoduo.GameState.nativeSetHideBattleUi(!show);
+                        com.kalenjohnson.chronoduo.GameState.nativeSetHideBattleSubmenus(
+                                !show && PartyPanelView.HIDE_SUBMENUS);
+                    });
                     return;
                 }
                 if ("com.kalenjohnson.chronoduo.BATTLE_HIDE_MASK".equals(action)) {

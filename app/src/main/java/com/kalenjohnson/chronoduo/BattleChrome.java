@@ -181,6 +181,16 @@ final class BattleChrome {
     // (never the fading-out one) so a stale rect can't outlive its target.
     private static final String[] COMMAND_LABELS = {"Attack", "Tech", "Item"};
     private final RectF[] commandHitBoxes = {new RectF(), new RectF(), new RectF()};
+    // Tap-to-target: one hit rect per drawn enemy row (live snapshot only),
+    // plus the row's actor slot; only consulted while targeting is active.
+    // Tapping a row that isn't the current target moves the game's cursor
+    // there (GameState.nativeSetBattleTargetSlot); tapping the row that
+    // already is the target confirms it, like the Confirm button.
+    private static final int ENEMY_ROWS_MAX = 8;
+    private final RectF[] enemyHitBoxes = new RectF[ENEMY_ROWS_MAX];
+    private final int[] enemyHitSlots = new int[ENEMY_ROWS_MAX];
+    private int enemyHitCount;
+    { for (int i = 0; i < ENEMY_ROWS_MAX; i++) enemyHitBoxes[i] = new RectF(); }
     private int commandCount;
     // Panel-owned command-row selection (0..commandCount-1), independent of
     // the game's own cursor (see PartySnapshot.CommandTarget.selected, which
@@ -211,8 +221,28 @@ final class BattleChrome {
     // current snapshot. See injectCommand (arms it) and update() (clears it
     // early on the two exit conditions: the next command menu opening, or
     // battle ending).
-    private static final long TARGETING_DURATION_NANOS = 8_000_000_000L;
+    // Since 2026-09-16 the band is driven by the game's own target-selection
+    // phase counter (snap.targetingActive, see GameState.
+    // nativeReadBattleTargeting); this timer is now only a short grace so
+    // the band appears the instant a confirm is injected, before the next
+    // 150ms poll catches the game up -- it used to be an 8s deadline that
+    // made the band vanish under a slow player and linger after a cancel.
+    private static final long TARGETING_DURATION_NANOS = 1_500_000_000L;
     private long targetingUntil = -1L;
+    // Third targeting exit: B during target selection for a tech/item sends
+    // the game back to the submenu list, not the command menu, so menuOpen
+    // never flips and the band used to sit there until the 8s timer ran
+    // out (read as lag). The list closes when the row is decided, so
+    // "list observed closed since arming, now open again" is the reopen.
+    // Armed from a command confirm (Attack), the list was never open, so any
+    // list open at all also ends targeting.
+    private boolean targetingSawListClosed;
+    // What the targeting band is choosing a target FOR ("Attack", or the
+    // committed tech/item's display name) -- drawn as the confirm button's
+    // label so the band reads as "use X on the highlighted target". Set at
+    // arm time from the same name tables the list rows use; null falls back
+    // to the plain "Confirm" label.
+    private String targetingLabel;
 
     // Double-A fix: after a successful command or list-row confirm,
     // snap.menuOpen/listOpen can stay true for up to one poll interval
@@ -333,6 +363,9 @@ final class BattleChrome {
                     return true;
                 }
             }
+            for (int i = 0; i < enemyHitCount; i++) {
+                if (enemyHitBoxes[i].contains(x, y)) return selectTargetSlot(enemyHitSlots[i]);
+            }
         }
         if (snap.inBattle && snap.listOpen && !listBackHitBox.isEmpty()
                 && listBackHitBox.contains(x, y)) {
@@ -359,7 +392,8 @@ final class BattleChrome {
      * window armed by the last successful {@link #injectCommand}.
      */
     private boolean isTargetingActive(long now) {
-        return snap.inBattle && !snap.menuOpen && targetingUntil > 0 && now < targetingUntil;
+        if (!snap.inBattle || snap.menuOpen) return false;
+        return snap.targetingActive || (targetingUntil > 0 && now < targetingUntil);
     }
 
     /**
@@ -426,12 +460,24 @@ final class BattleChrome {
         if (idx < 0 || idx >= snap.listRows.size()) return;
         PartySnapshot.ListRow row = snap.listRows.get(idx);
         if (!row.usable) return;
-        if (Float.isNaN(row.x) || Float.isNaN(row.y)) return;
         long now = System.nanoTime();
         if (lastConfirmInjectAt >= 0 && now - lastConfirmInjectAt < CONFIRM_COOLDOWN_NANOS) return;
         lastConfirmInjectAt = now;
-        BattleInput.tap(row.x, row.y);
+        // Preferred path: drive the game's input manager directly so a row
+        // that isn't the currently focused one commits in one step (a tap
+        // on a non-focused row only moves focus -- see GameState.
+        // nativeCommitBattleListRow). Falls back to the tap when the native
+        // side can't resolve the open menu; the tap is posted from the GL
+        // thread back to the main thread, where BattleInput expects to run.
+        final float tx = row.x, ty = row.y;
+        org.cocos2dx.lib.Cocos2dxHelper.runOnGLThread(() -> {
+            if (GameState.nativeCommitBattleListRow(idx)) return;
+            if (Float.isNaN(tx) || Float.isNaN(ty)) return;
+            view.post(() -> BattleInput.tap(tx, ty));
+        });
         targetingUntil = now + TARGETING_DURATION_NANOS;
+        targetingSawListClosed = false;
+        targetingLabel = listRowName(row, snap.listKind);
         pendingMenuClose = true;
         pendingCloseIsCommand = false;
         pendingMenuCloseAt = now;
@@ -480,6 +526,8 @@ final class BattleChrome {
         PartySnapshot.CommandTarget t = snap.commandTargets.get(idx);
         BattleInput.tap(t.x, t.y);
         targetingUntil = idx == 0 ? now + TARGETING_DURATION_NANOS : -1L;
+        targetingSawListClosed = !snap.listOpen;
+        targetingLabel = idx == 0 ? "Attack" : null;
         pendingMenuClose = true;
         pendingCloseIsCommand = true;
         pendingMenuCloseAt = now;
@@ -609,10 +657,19 @@ final class BattleChrome {
      * resets, and the results-window message machine.
      */
     void update(PartySnapshot s) {
-        if (targetingUntil > 0 && (!s.inBattle || s.menuOpen)) {
-            // exit targeting early: either the next command menu has opened
-            // (a new command was issued through some other path) or battle
-            // itself ended -- don't wait out the timeout in either case.
+        if (targetingUntil > 0 && !s.listOpen) targetingSawListClosed = true;
+        if (targetingUntil > 0 && snap.targetingActive && !s.targetingActive) {
+            // the game left target selection (confirmed or cancelled): drop
+            // the grace immediately so the band doesn't outlive the phase.
+            targetingUntil = -1L;
+        }
+        if (targetingUntil > 0
+                && (!s.inBattle || s.menuOpen || (s.listOpen && targetingSawListClosed))) {
+            // exit targeting early: the next command menu has opened (a new
+            // command was issued through some other path), the submenu list
+            // came back (B out of target selection -- see
+            // targetingSawListClosed), or battle itself ended -- don't wait
+            // out the timeout in any of these cases.
             targetingUntil = -1L;
         }
         if (pendingMenuClose) {
@@ -702,45 +759,58 @@ final class BattleChrome {
 
     /**
      * Which message {@link #drawResultsWindow} should show for {@code
-     * s.resultsStep}, per the disassembly report's step ranges: 0-1 EXP,
-     * 2-3 TP, 4-7 Gold, 8-9/16-17/24-25 item drop (index = step/8 - 1 into
-     * {@code s.resultsItems}), 10-15/18-23/26-31 level-up. Any other step
-     * (the per-actor bookkeeping steps between those ranges, or -1/32+ idle)
+     * s.resultsStep}, per the comment_out2 decode in gamestate.c: 1 EXP, 3 TP, 7 gold or
+     * item drop (sub-counter tells them apart), 9/17/25 level-up, 11/19/27
+     * tech learned, 13/21/29 dual tech, 15/23/31 triple tech. Any even step
+     * (one-tick setup passes, or -1/32+ idle)
      * returns null so the caller keeps showing the last message. Numeric
      * placeholders come from {@link ChronoAssets#getBattleMessage}, which
      * falls back to a literal template when the battle.txt table isn't
      * loaded.
      */
     private String computeResultsMessage(PartySnapshot s) {
+        // comment_out2 step machine (see gamestate.c nativeGetBattleResults
+        // for the decode): only odd steps show a window; even steps are
+        // one-tick setup passes and return null so the last message holds.
         int step = s.resultsStep;
-        if (step == 0 || step == 1) {
-            return ChronoAssets.getBattleMessage(37, Math.max(0, s.resultsExp));
-        } else if (step == 2 || step == 3) {
-            return ChronoAssets.getBattleMessage(38, Math.max(0, s.resultsTp));
-        } else if (step >= 4 && step <= 7) {
-            return ChronoAssets.getBattleMessage(39, Math.max(0, s.resultsGold));
-        } else if (step == 8 || step == 9 || step == 16 || step == 17 || step == 24 || step == 25) {
-            int idx = step / 8 - 1;
-            String name = (idx >= 0 && idx < s.resultsItems.length)
-                    ? resultsItemName(s.resultsItems[idx]) : null;
-            if (name == null) return null;
-            return "Obtained " + name + ".";
-        } else if ((step >= 10 && step <= 15) || (step >= 18 && step <= 23) || (step >= 26 && step <= 31)) {
-            String member = leveledMemberName(s);
-            return member != null ? (member + " leveled up!") : "Level up!";
+        switch (step) {
+            case 1: return ChronoAssets.getBattleMessage(ChronoAssets.BATTLE_MSG_EXP, Math.max(0, s.resultsExp));
+            case 3: return ChronoAssets.getBattleMessage(ChronoAssets.BATTLE_MSG_TP, Math.max(0, s.resultsTp));
+            case 7: {
+                if (s.resultsSub >= 6 || s.resultsSub < 0) {
+                    return ChronoAssets.getBattleMessage(ChronoAssets.BATTLE_MSG_GOLD, Math.max(0, s.resultsGold));
+                }
+                int slot = 5 - s.resultsSub; // setup step 6 decremented sub after picking slot
+                int id = slot >= 0 && slot < s.resultsItems.length ? s.resultsItems[slot] : 0;
+                if (id <= 0) return null;
+                return ChronoAssets.getBattleMessageText(ChronoAssets.BATTLE_MSG_ITEM, ChronoAssets.getDropItemName(id));
+            }
+            case 9: case 17: case 25:
+                return ChronoAssets.getBattleMessageText(ChronoAssets.BATTLE_MSG_LEVEL_UP, resultsMemberName(s));
+            case 11: case 19: case 27:
+                return ChronoAssets.getBattleMessageText(ChronoAssets.BATTLE_MSG_TECH,
+                        resultsMemberName(s), techName(s.resultsTechId));
+            case 13: case 21: case 29:
+                return ChronoAssets.getBattleMessageText(ChronoAssets.BATTLE_MSG_DUAL_TECH,
+                        techName(s.resultsDualTechId), resultsMemberName(s));
+            case 15: case 23: case 31:
+                return ChronoAssets.getBattleMessageText(ChronoAssets.BATTLE_MSG_TRIPLE_TECH,
+                        techName(s.resultsTripleTechId), resultsMemberName(s));
+            default: return null;
         }
-        return null;
     }
 
-    /** Item name for a battle-results drop id: flat item.txt line index first (these ids come from the flat drop list), then the encoded-id lookup, then "#id" -- mirrors the old drawResultsWindow's per-row lookup. */
-    private String resultsItemName(int id) {
-        String[] itemNames = ChronoAssets.getItemNames();
-        if (itemNames != null && id >= 0 && id < itemNames.length && !itemNames[id].trim().isEmpty()) {
-            return itemNames[id];
-        }
-        String name = ChronoAssets.getItemName(id);
-        if (name == null || name.trim().isEmpty()) name = "#" + id;
-        return name;
+    /** Name of the party member the per-character results block is on (slot cursor == party order), else the level-diff heuristic, else a generic. */
+    private String resultsMemberName(PartySnapshot s) {
+        if (s.resultsSlot >= 0 && s.resultsSlot < s.members.size()) return s.members.get(s.resultsSlot).name;
+        String m = leveledMemberName(s);
+        return m != null ? m : "Party member";
+    }
+
+    private static String techName(int id) {
+        String[] names = ChronoAssets.getTechNames();
+        if (id >= 0 && names != null && id < names.length && !names[id].trim().isEmpty()) return names[id];
+        return id >= 0 ? "#" + id : "a tech";
     }
 
     /** Which party member's level rose since {@link #resultsBaseLevels} was captured (results-screen start), or null if none/unknown (baseline missing, or a leveled member's slot changed). */
@@ -816,13 +886,26 @@ final class BattleChrome {
         float rowH = Math.min(h * 0.075f, (areaBottom - areaTop) / n);
         float barLeft = parchment.left + w * 0.09f;
         float barRight = parchment.right - w * 0.09f;
+        if (live) enemyHitCount = 0;
+        boolean targetingLive = live && isTargetingActive(now);
         for (int i = 0; i < n; i++) {
             float rowTop = areaTop + i * rowH;
             PartySnapshot.Enemy e = s.enemies.get(i);
             float rawFrac = e.maxHp > 0 ? clamp01(e.curHp / (float) e.maxHp) : 0f;
             Float eased = live ? enemyBarFrac.get(i) : null;
-            drawEnemyBar(c, e, i, barLeft, rowTop, barRight - barLeft, rowH * 0.62f,
+            float barH = rowH * 0.62f;
+            // Row extent as drawn by drawEnemyBar: name/HP text sits on
+            // baseline rowTop (ascent above it), the bar below it.
+            RectF row = new RectF(barLeft - w * 0.02f, rowTop - barH * 0.7f,
+                    barRight + w * 0.02f, rowTop + barH * 0.28f + barH * 0.6f + rowH * 0.06f);
+            if (targetingLive && isTargetSlot(s, e.slot)) drawTargetHighlight(c, row);
+            drawEnemyBar(c, e, i, barLeft, rowTop, barRight - barLeft, barH,
                     eased != null ? eased : rawFrac);
+            if (live && i < ENEMY_ROWS_MAX) {
+                enemyHitBoxes[i].set(row);
+                enemyHitSlots[i] = e.slot;
+                enemyHitCount = i + 1;
+            }
         }
     }
 
@@ -903,7 +986,8 @@ final class BattleChrome {
         x += arrowW + gap;
 
         RectF confirm = new RectF(x, bandTop, x + confirmW, bandBottom);
-        drawCommandButton(c, confirm, TARGET_LABELS[1], winTex, false);
+        drawCommandButton(c, confirm, targetingLabel != null ? targetingLabel : TARGET_LABELS[1],
+                winTex, false);
         targetHitBoxes[1].set(confirm);
         x += confirmW + gap;
 
@@ -1014,6 +1098,18 @@ final class BattleChrome {
     }
 
     /** One submenu-list row: name, right-aligned extra readout, optional selected-row highlight -- see {@link #drawSubmenuList}. */
+    /**
+     * Display name for a submenu-list row: item rows go through {@link
+     * ChronoAssets#getItemName} (encoded category/index ids), tech rows are
+     * a plain line-index lookup into the tech name table, "#id" when unknown.
+     */
+    private static String listRowName(PartySnapshot.ListRow row, int kind) {
+        if (kind == 1) return ChronoAssets.getItemName(row.id);
+        String[] names = ChronoAssets.getTechNames();
+        return (names != null && row.id >= 0 && row.id < names.length && !names[row.id].trim().isEmpty())
+                ? names[row.id] : ("#" + row.id);
+    }
+
     private void drawListRow(Canvas c, RectF box, PartySnapshot.ListRow row, String[] names, boolean selected) {
         if (selected) {
             fill.setShader(null);
@@ -1031,13 +1127,7 @@ final class BattleChrome {
         // ChronoAssets.getItemName -- since item.txt's flat line-index table
         // doesn't cover it (Potion arrived as 16385 = 0x4001). Tech rows keep
         // the plain line-index lookup into the tech name table.
-        String name;
-        if (snap.listKind == 1) {
-            name = ChronoAssets.getItemName(row.id);
-        } else {
-            name = (names != null && row.id >= 0 && row.id < names.length && !names[row.id].trim().isEmpty())
-                    ? names[row.id] : ("#" + row.id);
-        }
+        String name = listRowName(row, snap.listKind);
         int color = row.usable ? Color.WHITE : Color.argb(140, 170, 170, 170);
         setText(box.height() * 0.42f, color, false, Paint.Align.LEFT, true);
         c.drawText(name, box.left + box.width() * 0.03f, box.centerY() + box.height() * 0.16f, text);
@@ -1338,6 +1428,46 @@ final class BattleChrome {
         stroke.setStrokeWidth(1.5f);
         stroke.setColor(Color.argb(150, 96, 72, 40));
         c.drawRoundRect(track, barH * 0.4f, barH * 0.4f, stroke);
+    }
+
+    /** True when actor slot {@code slot} is under the game's target cursor in snapshot {@code s}. */
+    static boolean isTargetSlot(PartySnapshot s, int slot) {
+        if (!s.targetingActive) return false;
+        for (int t : s.targetSlots) if (t == slot) return true;
+        return false;
+    }
+
+    /**
+     * Gold selection wash + outline behind a row/box under the target
+     * cursor -- the same treatment {@link #drawListRow} gives the selected
+     * submenu row, so "selected" reads the same everywhere on the panel.
+     */
+    void drawTargetHighlight(Canvas c, RectF box) {
+        fill.setShader(null);
+        fill.setColor(Color.argb(60, Color.red(DEFAULT_HIGHLIGHT_COLOR),
+                Color.green(DEFAULT_HIGHLIGHT_COLOR), Color.blue(DEFAULT_HIGHLIGHT_COLOR)));
+        c.drawRoundRect(box, 6f, 6f, fill);
+        stroke.setStrokeWidth(2.5f);
+        stroke.setColor(Color.argb(220, Color.red(DEFAULT_HIGHLIGHT_COLOR),
+                Color.green(DEFAULT_HIGHLIGHT_COLOR), Color.blue(DEFAULT_HIGHLIGHT_COLOR)));
+        c.drawRoundRect(box, 6f, 6f, stroke);
+    }
+
+    /**
+     * Tap-to-target for actor slot {@code slot} (enemy row or party status
+     * box): moves the game's cursor there when it isn't the target yet,
+     * confirms when it already is. Refused outside targeting or in all-
+     * target mode (nothing to pick). The cursor write runs on the GL
+     * thread; the highlight follows on the next snapshot.
+     */
+    boolean selectTargetSlot(int slot) {
+        if (!isTargetingActive(System.nanoTime()) || snap.targetAll) return false;
+        if (isTargetSlot(snap, slot)) {
+            injectTarget(1);
+            return true;
+        }
+        org.cocos2dx.lib.Cocos2dxHelper.runOnGLThread(() -> GameState.nativeSetBattleTargetSlot(slot));
+        return true;
     }
 
     /**

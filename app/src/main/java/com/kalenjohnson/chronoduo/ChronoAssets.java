@@ -156,7 +156,15 @@ public final class ChronoAssets {
             "Earned <NUMBER> TP.",    // 38
             "Found <NUMBER> G.",      // 39
             "Obtained <NAME_ITM>.",   // 40
+            "<NAME_CHR> leveled up!", // 41
+            "<NAME_CHR> learned <NAME_TEC>!", // 42
+            "Learned <NAME_TEC>!",    // 43 (dual tech)
+            "Learned <NAME_TEC>!",    // 44 (triple tech)
     };
+    public static final int BATTLE_MSG_EXP = 37, BATTLE_MSG_TP = 38, BATTLE_MSG_GOLD = 39,
+            BATTLE_MSG_ITEM = 40, BATTLE_MSG_LEVEL_UP = 41, BATTLE_MSG_TECH = 42,
+            BATTLE_MSG_DUAL_TECH = 43, BATTLE_MSG_TRIPLE_TECH = 44;
+    private static final java.util.regex.Pattern MSG_TAG = java.util.regex.Pattern.compile("<[A-Z_0-9]+>");
     private static final int BATTLE_MESSAGE_FALLBACK_BASE = 37;
 
     /**
@@ -166,6 +174,59 @@ public final class ChronoAssets {
      * real table isn't loaded or doesn't cover {@code id}; if even that
      * fails, returns {@code null} so the caller can keep its last message.
      */
+    /**
+     * Like {@link #getBattleMessage(int, int)} but substitutes the
+     * template's {@code <TAG>} placeholders in order with {@code args}
+     * (any left over are dropped). Null when no template resolves.
+     */
+    public static String getBattleMessageText(int id, String... args) {
+        String template = null;
+        if (battleMessages != null && id >= 0 && id < battleMessages.length) {
+            template = battleMessages[id];
+        }
+        if (template == null || template.trim().isEmpty()) {
+            int fi = id - BATTLE_MESSAGE_FALLBACK_BASE;
+            if (fi >= 0 && fi < BATTLE_MESSAGE_FALLBACK.length) template = BATTLE_MESSAGE_FALLBACK[fi];
+        }
+        if (template == null) return null;
+        java.util.regex.Matcher m = MSG_TAG.matcher(template);
+        StringBuffer out = new StringBuffer();
+        int n = 0;
+        while (m.find()) {
+            String rep = n < args.length && args[n] != null ? args[n] : "";
+            n++;
+            m.appendReplacement(out, java.util.regex.Matcher.quoteReplacement(rep));
+        }
+        m.appendTail(out);
+        return out.toString();
+    }
+
+    // First item.txt line of each drop category (cSfcWork::TopIndex @0xbe0348
+    // in libchrono.so, first six entries: weapon, armor, helmet, accessory,
+    // consumable, key). Battle drop ids (exp_get) are (category << 12) |
+    // index; the name is the flat item.txt line TopIndex[category] + index.
+    private static final int[] DROP_TOP_INDEX = {0, 111, 161, 200, 259, 302};
+
+    /** Display name for a battle-results drop id (see {@link #DROP_TOP_INDEX}); "#id" when the table can't resolve it. */
+    public static String getDropItemName(int dropId) {
+        // A consumable drop (category 4 << 12 | n) is bit-identical to the
+        // battle item list's USEITEM encoding (1 << 14 | n), and that
+        // sfc_item.txt lookup is already verified live (0x4001 = Potion), so
+        // prefer it; the TopIndex line math below covers the other
+        // categories (equipment drops).
+        int cat = dropId >> 12, idx = dropId & 0xfff;
+        if (cat == 4) {
+            String viaList = getItemName(dropId);
+            if (viaList != null && !viaList.trim().isEmpty() && !viaList.startsWith("#")) return viaList;
+        }
+        String[] names = itemNames;
+        if (cat >= 0 && cat < DROP_TOP_INDEX.length && names != null) {
+            int line = DROP_TOP_INDEX[cat] + idx;
+            if (line >= 0 && line < names.length && !names[line].trim().isEmpty()) return names[line];
+        }
+        return "#" + dropId;
+    }
+
     public static String getBattleMessage(int id, int value) {
         String template = null;
         if (battleMessages != null && id >= 0 && id < battleMessages.length) {

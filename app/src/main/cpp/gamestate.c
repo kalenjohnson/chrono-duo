@@ -60,6 +60,10 @@ static void  (*p_node_setOpacity)(void *, uint8_t); // instance: (this, GLubyte)
 // inner container, not exposed via Node::getChildren -- see collect_battle_
 // list). Returns the row's button Node* or NULL if out of range.
 static void  *(*p_list_getElement)(void *, int);
+// nsMenu::nsInput::Manager::sendCallback(EventType, int) -- forwards straight
+// to the owning list menu's input lambda, i.e. exactly what a row click does
+// once the touch machinery is stripped away (see nativeCommitBattleListRow).
+static void  (*p_input_sendCallback)(void *, int, int);
 
 // cocos2d::Size/Vec2 are HFAs (two floats) -- returned in s0/s1 per the arm64
 // AAPCS, so plain C struct-by-value declarations match the real ABI.
@@ -206,6 +210,8 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeAttach(JNIEnv *env, jclass cls) 
     p_node_setOpacity = (void (*)(void *, uint8_t)) dlsym(h, "_ZN7cocos2d4Node10setOpacityEh");
     p_list_getElement = (void *(*)(void *, int))
         dlsym(h, "_ZNK16nsBattleListMenu18BattleListMenuBase10getElementEi");
+    p_input_sendCallback = (void (*)(void *, int, int))
+        dlsym(h, "_ZN6nsMenu7nsInput7Manager12sendCallbackENS0_9EventTypeEi");
     LOGI("attach: getInstance=%p canvas=%p asm_slot=%p director=%p", (void *)p_getInstance,
          p_getInstance ? p_getInstance() : NULL, (void *)g_asm_mem_slot,
          (void *)p_dir_getInstance);
@@ -2967,15 +2973,17 @@ static int resolve_row_container(void *scrollview, int want_count, void ***out_b
 // cache (kind=-1, count=0) when none or more-than-one is open, or on any
 // validation failure -- matches nativeGetBattleList's "NULL when no submenu
 // is open" contract.
-static void collect_battle_list(void *battle_node) {
-    g_battle_list_kind = -1;
-    g_battle_list_count = 0;
-    if (!battle_node || !p_node_getChildren) return;
+// Resolves whichever BattleTechMenu/BattleItemMenu direct child of
+// `battle_node` is currently open (_isOpen byte set) and has a live vtable.
+// Returns the node and sets *kind (0 Tech, 1 Item); NULL when none, both
+// (ambiguous -- spec: exactly one), or on any validation failure. GL thread.
+static void *find_open_battle_list(void *battle_node, int *kind) {
+    if (!battle_node || !p_node_getChildren) return NULL;
     void *vecp = p_node_getChildren(battle_node);
     void *ptrs[2];
-    if (!safe_read(vecp, ptrs, 16)) return;
+    if (!safe_read(vecp, ptrs, 16)) return NULL;
     void **begin = (void **)ptrs[0], **end = (void **)ptrs[1];
-    if (!plausible_any(begin) || !plausible_any(end) || end < begin || (end - begin) > 512) return;
+    if (!plausible_any(begin) || !plausible_any(end) || end < begin || (end - begin) > 512) return NULL;
 
     void *tech_node = NULL, *item_node = NULL;
     for (void **c = begin; c < end; c++) {
@@ -2996,14 +3004,24 @@ static void collect_battle_list(void *battle_node) {
         open_node = tech_node;
     }
     if (item_node && safe_read((uint8_t *)item_node + BATTLELIST_ISOPEN, &isopen, 1) && isopen) {
-        if (open_kind != -1) return; // both open -- ambiguous, bail (spec: exactly one)
+        if (open_kind != -1) return NULL;
         open_kind = 1;
         open_node = item_node;
     }
-    if (open_kind == -1 || !open_node) return;
-    // Row reads below (getElement call included) require a live vtable, not
-    // just a coherent-looking one -- see vtable_in_libchrono's comment.
-    if (!vtable_in_libchrono(open_node)) return;
+    if (open_kind == -1 || !open_node) return NULL;
+    // Row reads (getElement call included) require a live vtable, not just a
+    // coherent-looking one -- see vtable_in_libchrono's comment.
+    if (!vtable_in_libchrono(open_node)) return NULL;
+    *kind = open_kind;
+    return open_node;
+}
+
+static void collect_battle_list(void *battle_node) {
+    g_battle_list_kind = -1;
+    g_battle_list_count = 0;
+    int open_kind = -1;
+    void *open_node = find_open_battle_list(battle_node, &open_kind);
+    if (!open_node) return;
 
     uint64_t vbegin, vend;
     if (!safe_read((uint8_t *)open_node + BATTLELIST_VEC_BEGIN, &vbegin, 8)) return;
@@ -3097,6 +3115,65 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleList(JNIEnv *env, jclas
     }
     (*env)->SetFloatArrayRegion(env, arr, 0, 2 + count * 5, buf);
     return arr;
+}
+
+// ---------------------------------------------------------------------------
+// One-step select-and-commit of an open Tech/Item submenu row, driven through
+// the game's own nsMenu::nsInput::Manager rather than a synthetic tap.
+//
+// Why a tap wasn't enough (RE record, 2026-09-16, from BattleListMenuBase::
+// setup's input lambda @0x6e5f40): a row click reaches that lambda as
+// EventType 0 (Click) with the row's index, and the lambda commits ONLY when
+// the clicked index equals the manager's currently focused row (Manager+
+// 0x364); any other row is merely focused (callback(SelectChanged=2, idx),
+// setStateId, onSelectChanged, scroll) and needs a second click to commit.
+// The focused row on open is the actor's last-used tech, so a tap on any
+// other row -- same combo category or not -- appeared to "hang" on the
+// panel. Combo category (single/dual/triple tabs) never enters the decision;
+// updateComboTabFocus is purely visual.
+//
+// Commit = the menu's +0x370 std::function fired with nsBattleListMenu::
+// EventType 0 (Decide). BattleMenu's receiver ignores the index argument on
+// Decide and uses the row stored by the preceding SelectChanged (per-actor
+// slots in ChronoCanvas), so the select step is mandatory, not cosmetic.
+//
+// Manager::sendCallback(EventType, int) is the exported entry that forwards
+// to the lambda with no touch machinery, so: sendCallback(0, i) once when i
+// isn't the focused row (select, cursor SE), then sendCallback(0, i) again
+// (canSelect check, decide SE, Decide callback). Side effects are identical
+// to two real taps. Manager offsets: +0x364 focused row (int32), +0x31d
+// paused flag (u8, inferred from the click listener's guard). GL thread
+// only. Returns 1 when the two calls were issued, 0 when anything didn't
+// resolve (caller falls back to the tap path).
+// ---------------------------------------------------------------------------
+#define BATTLELIST_INPUT_MGR   0x340
+#define INPUTMGR_FOCUSED_ROW   0x364
+#define INPUTMGR_PAUSED        0x31d
+
+JNIEXPORT jboolean JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeCommitBattleListRow(JNIEnv *env, jclass cls,
+                                                                     jint idx) {
+    if (!p_input_sendCallback || idx < 0) return JNI_FALSE;
+    int kind = -1;
+    void *menu = find_open_battle_list(g_battle_node, &kind);
+    if (!menu) return JNI_FALSE;
+    uint64_t vbegin = 0, vend = 0;
+    if (!safe_read((uint8_t *)menu + BATTLELIST_VEC_BEGIN, &vbegin, 8)) return JNI_FALSE;
+    if (!safe_read((uint8_t *)menu + BATTLELIST_VEC_END, &vend, 8)) return JNI_FALSE;
+    if (vend < vbegin || (uint64_t)idx * BATTLELIST_ROW_STRIDE >= vend - vbegin) return JNI_FALSE;
+    void *mgr = NULL;
+    if (!safe_read((uint8_t *)menu + BATTLELIST_INPUT_MGR, &mgr, 8) || !plausible_ptr(mgr)
+            || !vtable_in_libchrono(mgr)) {
+        return JNI_FALSE;
+    }
+    uint8_t paused = 0;
+    int32_t focused = -1;
+    if (!safe_read((uint8_t *)mgr + INPUTMGR_PAUSED, &paused, 1) || paused) return JNI_FALSE;
+    if (!safe_read((uint8_t *)mgr + INPUTMGR_FOCUSED_ROW, &focused, 4)) return JNI_FALSE;
+    LOGI("battle-list: commit row %d (kind %d, focused %d)", idx, kind, focused);
+    if (focused != idx) p_input_sendCallback(mgr, 0, idx); // focus it first
+    p_input_sendCallback(mgr, 0, idx);                     // now decide
+    return JNI_TRUE;
 }
 
 static int g_walk_count;
@@ -3335,11 +3412,18 @@ static int already_cascade_set(void *node) {
 // Battle top-UI hiding toggle (Java-settable, see nativeSetHideBattleUi).
 // Defaults to enabled.
 static int g_hide_battle_ui = 1;
+// Set when the flag flips 1 -> 0 so enforce_battle_ui_hide runs one restore
+// pass (setOpacity 255 on the same child set) instead of leaving the nodes
+// blanked at whatever the last hiding tick left them at.
+static int g_battle_ui_restore_pending = 0;
 
 JNIEXPORT void JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeSetHideBattleUi(JNIEnv *env, jclass cls,
                                                                  jboolean hide) {
-    g_hide_battle_ui = hide ? 1 : 0;
+    int h = hide ? 1 : 0;
+    if (g_hide_battle_ui && !h) g_battle_ui_restore_pending = 1;
+    if (h != g_hide_battle_ui) LOGI("battle-ui: hide top UI -> %d", h);
+    g_hide_battle_ui = h;
 }
 
 // Dev experiment hook: bit i (0-based) blanks direct child index i of
@@ -3470,13 +3554,14 @@ static int is_battle_results_child(const char *tn) {
            strcmp(tn, "N7cocos2d5LabelE") == 0;
 }
 
+static int is_battle_submenu_child(const char *tn) {
+    return tn && (strcmp(tn, "N16nsBattleListMenu14BattleTechMenuE") == 0 ||
+                  strcmp(tn, "N16nsBattleListMenu14BattleItemMenuE") == 0);
+}
+
 static int should_hide_battle_child(const char *tn) {
     if (!tn) return 0;
-    if (g_hide_battle_submenus &&
-            (strcmp(tn, "N16nsBattleListMenu14BattleTechMenuE") == 0 ||
-             strcmp(tn, "N16nsBattleListMenu14BattleItemMenuE") == 0)) {
-        return 1;
-    }
+    if (g_hide_battle_submenus && is_battle_submenu_child(tn)) return 1;
     if (strstr(tn, "Battle")) return 0;
     if (strstr(tn, "cocos2d") && strstr(tn, "4MenuE")) return 1;
     if (strcmp(tn, "N7cocos2d13RenderTextureE") == 0) return 1;
@@ -3497,10 +3582,16 @@ static void enforce_battle_ui_hide(void) {
     }
     g_battle_results_phase = results_phase;
 
-    if (!g_hide_battle_ui || !g_battle_node || !vtable_in_libchrono(g_battle_node)
-            || !p_node_getChildren) {
+    // One-shot restore pass when hiding was just switched off (dev toggle):
+    // walk the same child set and put opacity back to 255. Restore is
+    // retried every tick until a battle node is actually present, so
+    // toggling outside battle still takes effect at the next fight.
+    int restore = !g_hide_battle_ui && g_battle_ui_restore_pending;
+    if ((!g_hide_battle_ui && !restore) || !g_battle_node
+            || !vtable_in_libchrono(g_battle_node) || !p_node_getChildren) {
         return;
     }
+    if (restore) g_battle_ui_restore_pending = 0;
     void *vecp = p_node_getChildren(g_battle_node);
     void *ptrs[2];
     if (!safe_read(vecp, ptrs, 16)) return;
@@ -3514,7 +3605,10 @@ static void enforce_battle_ui_hide(void) {
         if (!safe_read(c, &child, 8)) continue;
         char tb[96];
         const char *tn = type_name(child, tb, sizeof(tb));
-        int hide_type = should_hide_battle_child(tn);
+        // The restore pass always covers the submenu nodes too, since the
+        // caller may have cleared g_hide_battle_submenus in the same breath.
+        int hide_type = should_hide_battle_child(tn)
+                || (restore && is_battle_submenu_child(tn));
         // Dev hook: also hide direct child index `idx` when its bit is set
         // in g_battle_hide_mask, regardless of type -- see
         // nativeSetBattleHideMask above.
@@ -3543,7 +3637,8 @@ static void enforce_battle_ui_hide(void) {
         // mirrored on the bottom screen from the battle work struct (see
         // nativeGetBattleResults), so the cell layer stays blanked and the
         // party HP box never reappears. Flip g_results_unhide to restore.
-        if (g_results_unhide && g_battle_results_phase && is_battle_results_child(tn)) {
+        if (restore || (g_results_unhide && g_battle_results_phase
+                        && is_battle_results_child(tn))) {
             if (p_node_setOpacity) p_node_setOpacity(child, 255);
             continue;
         }
@@ -4348,6 +4443,112 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeReadBattleActors(JNIEnv *env, jc
 }
 
 // ---------------------------------------------------------------------------
+// Battle target-selection state (RE record 2026-09-16, from SceneBattle::
+// KEY_TASK @0x679950 / CURSOR_TASK @0x679c0c / TARGET @0x67aa00 /
+// target000_00 @0x67c100 / key_task_30 @0x679f5c). All offsets are into the
+// battle work block B = *(SceneBattle+0x68) -- the same allocation whose
+// first 10*0x80 bytes are the actor array nativeReadBattleActors reads.
+//   B+0x434c i32  target-selection phase counter: != 0 while the hand
+//                 cursor is up and dpad cycles targets (KEY_TASK dispatches
+//                 to the target keys on exactly this test, gated on the
+//                 acting-actor byte below).
+//   B+0x42d8 i32  acting actor (0-2); byte bit7 set = nobody acting.
+//   B+0x4358 i32  bit7 = all/area target mode (every candidate selected,
+//                 dpad ignored). TARGET() clears it each tick, handlers set it.
+//   B+0x436c i32  cursor: index into the candidate list. The ONLY persistent
+//                 cursor state; dpad handlers step it, TARGET() re-resolves
+//                 the selection from it every tick.
+//   B+0x45a0 i32[12] candidate list (actor slots 0-10, 0xff = empty),
+//                 rebuilt each tick; acting actor forced to entry 0 when
+//                 eligible.
+//   B+0x5134 i32[12] resolved selection (actor slots, 0xff-terminated):
+//                 [0] = the highlighted target, all of them in area mode.
+//                 Copied into the actor's command packet on confirm.
+// Party = slots 0-2 (in party order), enemies = slots 3-10.
+// ---------------------------------------------------------------------------
+#define BTLTGT_PHASE      0x434c
+#define BTLTGT_ACTOR      0x42d8
+#define BTLTGT_MODE       0x4358
+#define BTLTGT_CURSOR     0x436c
+#define BTLTGT_CANDIDATES 0x45a0
+#define BTLTGT_SELECTED   0x5134
+#define BTLTGT_LIST_LEN   12
+#define BTLTGT_EMPTY      0xff
+
+// Resolves B (the battle work block) from the cached battle node. Plain
+// safe_read on cached pointers, so any thread (like nativeReadBattleActors).
+static uint8_t *battle_work_block(void) {
+    if (!g_battle_node) return NULL;
+    uint8_t *sb = NULL;
+    if (!safe_read((uint8_t *)g_battle_node + 0x320, &sb, sizeof(sb)) || !plausible_any(sb)) return NULL;
+    uint8_t *b = NULL;
+    if (!safe_read(sb + BTLCHARA_OFFSET, &b, sizeof(b)) || !plausible_any(b)) return NULL;
+    return b;
+}
+
+// [active, allMode, count, slot0, slot1, ...] -- the resolved selection as
+// actor slots; count 0 (and active 0) when not selecting. NULL when not in
+// battle / unreadable. Any thread.
+JNIEXPORT jintArray JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeReadBattleTargeting(JNIEnv *env, jclass cls) {
+    uint8_t *b = battle_work_block();
+    if (!b) return NULL;
+    int32_t phase = 0, actor = 0, mode = 0, sel[BTLTGT_LIST_LEN];
+    if (!safe_read(b + BTLTGT_PHASE, &phase, 4) || !safe_read(b + BTLTGT_ACTOR, &actor, 4)
+            || !safe_read(b + BTLTGT_MODE, &mode, 4)
+            || !safe_read(b + BTLTGT_SELECTED, sel, sizeof(sel))) {
+        return NULL;
+    }
+    int active = phase != 0 && !(actor & 0x80);
+    jint out[3 + BTLTGT_LIST_LEN];
+    int n = 0;
+    if (active) {
+        for (int i = 0; i < BTLTGT_LIST_LEN; i++) {
+            if (sel[i] == BTLTGT_EMPTY || sel[i] < 0 || sel[i] > 10) break;
+            out[3 + n++] = sel[i];
+        }
+    }
+    out[0] = active;
+    out[1] = (mode & 0x80) ? 1 : 0;
+    out[2] = n;
+    jintArray arr = (*env)->NewIntArray(env, 3 + n);
+    if (!arr) return NULL;
+    (*env)->SetIntArrayRegion(env, arr, 0, 3 + n, out);
+    return arr;
+}
+
+// Moves the target cursor to actor slot `slot` by pointing B+0x436c at the
+// candidate-list entry holding it; TARGET() re-resolves the selection and
+// cur_task_30 moves the hand on the next battle tick, and confirm then
+// reads that selection -- so this is honored exactly like dpad presses
+// would be. Refused (0) outside target selection, in all/area mode (no
+// cursor to move), or when `slot` isn't a current candidate. GL thread
+// (the game's tick reads the cursor there).
+JNIEXPORT jboolean JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeSetBattleTargetSlot(JNIEnv *env, jclass cls,
+                                                                     jint slot) {
+    uint8_t *b = battle_work_block();
+    if (!b) return JNI_FALSE;
+    int32_t phase = 0, actor = 0, mode = 0, cand[BTLTGT_LIST_LEN];
+    if (!safe_read(b + BTLTGT_PHASE, &phase, 4) || !safe_read(b + BTLTGT_ACTOR, &actor, 4)
+            || !safe_read(b + BTLTGT_MODE, &mode, 4)
+            || !safe_read(b + BTLTGT_CANDIDATES, cand, sizeof(cand))) {
+        return JNI_FALSE;
+    }
+    if (phase == 0 || (actor & 0x80) || (mode & 0x80)) return JNI_FALSE;
+    for (int i = 0; i < BTLTGT_LIST_LEN; i++) {
+        if (cand[i] == BTLTGT_EMPTY) break;
+        if (cand[i] == slot) {
+            int32_t idx = i;
+            memcpy(b + BTLTGT_CURSOR, &idx, 4);
+            LOGI("battle-target: cursor -> candidate %d (slot %d)", i, slot);
+            return JNI_TRUE;
+        }
+    }
+    return JNI_FALSE;
+}
+
+// ---------------------------------------------------------------------------
 // Battle results accumulator (EXP/Gold/TP/item drops), read from the native
 // "battlework" struct at *(SceneBattle+0x60) -- a separate allocation from
 // both the SNES-emulated Asm memory (*(sb+0x8)) and the actor array
@@ -4413,6 +4614,30 @@ static int results_try_base(uint8_t *base, uint32_t *exp, uint32_t *gold, uint32
 // like nativeReadBattleActors/battle_results_phase.
 JNIEXPORT jintArray JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleResults(JNIEnv *env, jclass cls) {
+    // Layout (RE record 2026-09-16, SceneBattle::comment_out2 @0x69d47c --
+    // see the block comment above and NOTES.md "Battle results step
+    // machine"): comment_out2 is a 33-entry jump table on sb+0x22f4. Even
+    // steps are one-tick setup handlers, odd steps a shared wait handler;
+    // steps 0-7 party-wide rewards, then three 8-step per-character blocks
+    // (8-15 slot 0, 16-23 slot 1, 24-31 slot 2), 32 = done. Companion state:
+    // sb+0x22f8 = character slot cursor, sb+0x22fc = sub-counter (items /
+    // techs / level-ups left), sb+0x2300 = window timer.
+    //   1  EXP window (msg 37)          3  TP window (msg 38)
+    //   7  Gold window (msg 39) when sub == 6, else an ITEM window (msg 40)
+    //      showing drop slot (5 - sub): setup step 6 scans the six i32 drop
+    //      slots at bw+0x1698..0x16ac (NOT 0x16b0, which is only the scan
+    //      base), sets the window, then decrements sub -- so step 7 with
+    //      sub == s is slot 5-s. Gold jumps 4 -> 7 with sub = 6.
+    //   9/17/25 level-up (msg 41), character = bw[0x5a0 + idx*4]
+    //   11/19/27 tech learned (msg 42), id = bw[0x1abc + (idx*8 + 7 - sub)*4]
+    //   13/21/29 dual tech learned (msg 43), id = bw[0x17cc + (bw[0x17f4]-1)*4]
+    //   15/23/31 triple tech learned (msg 44), id = bw[0x17f8]
+    // Even steps carry no message and pass in one tick each (a poll can
+    // land on 18/22/... between blocks). Drop id encoding: category =
+    // id >> 12, index = id & 0xfff, name line = TopIndex[category] + index
+    // (see ChronoAssets.getDropItemName).
+    // Returned int[]: [step, exp, gold, tp, flags, sub, idx, charId, techId,
+    //                  dualId, tripleId, 6, slot0..slot5]
     if (!g_battle_node) return NULL;
 
     uint8_t *sb = NULL;
@@ -4420,18 +4645,20 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleResults(JNIEnv *env, jc
         return NULL;
     }
 
-    int32_t step = 0;
+    int32_t step = 0, sub = 0, idx = 0;
     if (!safe_read(sb + 0x22f4, &step, sizeof(step))) return NULL;
+    safe_read(sb + 0x22f8, &idx, sizeof(idx));
+    safe_read(sb + 0x22fc, &sub, sizeof(sub));
 
+    // Logged on every (step, sub) change: the gold -> item transition is
+    // 7 -> 6 -> 7 with only sub differing, which a step-only log misses.
     static int32_t g_last_logged_results_step = INT32_MIN;
-    int step_changed = (step != g_last_logged_results_step);
+    static int32_t g_last_logged_results_sub = INT32_MIN;
+    int step_changed = (step != g_last_logged_results_step || sub != g_last_logged_results_sub);
+    g_last_logged_results_sub = sub;
 
     uint64_t raw_bw = 0;
     safe_read(sb + 0x60, &raw_bw, sizeof(raw_bw));
-    if (step_changed) {
-        LOGI("battle-results: step=%d raw(sb+0x60)=0x%016llx", step,
-             (unsigned long long) raw_bw);
-    }
 
     uint64_t asm_ptr = 0;
     safe_read(sb + 0x8, &asm_ptr, sizeof(asm_ptr));
@@ -4456,44 +4683,54 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleResults(JNIEnv *env, jc
         }
     }
 
+    enum { RES_N = 12 + 6 };
+    jint buf[RES_N];
+    memset(buf, 0, sizeof(buf));
+    buf[0] = step;
+    buf[5] = sub;
+    buf[6] = idx;
+    buf[7] = buf[8] = buf[9] = buf[10] = -1;
+    buf[11] = 6;
     if (!bwp) {
-        jint fallback[6] = {step, -1, -1, -1, 0, 0};
-        jintArray arr = (*env)->NewIntArray(env, 6);
-        if (!arr) return NULL;
-        (*env)->SetIntArrayRegion(env, arr, 0, 6, fallback);
+        buf[1] = buf[2] = buf[3] = -1;
         if (step_changed) {
             LOGI("battle-results: step=%d (no candidate base sane)", step);
             g_last_logged_results_step = step;
         }
-        return arr;
+    } else {
+        buf[1] = (jint) exp;
+        buf[2] = (jint) gold;
+        buf[3] = (jint) tp;
+        buf[4] = flags;
+        int32_t items[6] = {0};
+        safe_read(bwp + 0x1698, items, sizeof(items));
+        for (int i = 0; i < 6; i++) buf[12 + i] = (items[i] > 0 && items[i] <= 0xFFFF) ? items[i] : 0;
+        if (idx >= 0 && idx < 3) {
+            int32_t v = -1;
+            if (safe_read(bwp + 0x5a0 + (size_t)idx * 4, &v, 4)) buf[7] = v;
+            int tpos = idx * 8 + 7 - sub;
+            if (tpos >= 0 && tpos < 24 && safe_read(bwp + 0x1abc + (size_t)tpos * 4, &v, 4)) buf[8] = v;
+        }
+        int32_t dcur = 0;
+        if (safe_read(bwp + 0x17f4, &dcur, 4) && dcur >= 1 && dcur <= 10) {
+            int32_t v = -1;
+            if (safe_read(bwp + 0x17cc + (size_t)(dcur - 1) * 4, &v, 4)) buf[9] = v;
+        }
+        int32_t tri = -1;
+        if (safe_read(bwp + 0x17f8, &tri, 4)) buf[10] = tri;
+        if (step_changed) {
+            LOGI("battle-results: step=%d sub=%d idx=%d base=%c exp=%u gold=%u tp=%u flags=0x%02x "
+                 "drops=[%d %d %d %d %d %d] chr=%d tech=%d dual=%d tri=%d",
+                 step, sub, idx, used, exp, gold, tp, flags,
+                 buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
+                 buf[7], buf[8], buf[9], buf[10]);
+            g_last_logged_results_step = step;
+        }
     }
 
-    int32_t items[8];
-    int itemCount = 0;
-    for (int i = 0; i < 8; i++) {
-        int32_t v;
-        if (!safe_read(bwp + 0x16b0 + (size_t)i * 4, &v, sizeof(v))) break;
-        if (v <= 0 || v > 0xFFFF) break;
-        items[itemCount++] = v;
-    }
-
-    if (step_changed) {
-        LOGI("battle-results: base=%c exp=%u gold=%u tp=%u", used, exp, gold, tp);
-        g_last_logged_results_step = step;
-    }
-
-    jint buf[6 + 8];
-    buf[0] = step;
-    buf[1] = (jint) exp;
-    buf[2] = (jint) gold;
-    buf[3] = (jint) tp;
-    buf[4] = flags;
-    buf[5] = itemCount;
-    for (int i = 0; i < itemCount; i++) buf[6 + i] = items[i];
-
-    jintArray arr = (*env)->NewIntArray(env, 6 + itemCount);
+    jintArray arr = (*env)->NewIntArray(env, RES_N);
     if (!arr) return NULL;
-    (*env)->SetIntArrayRegion(env, arr, 0, 6 + itemCount, buf);
+    (*env)->SetIntArrayRegion(env, arr, 0, RES_N, buf);
     return arr;
 }
 
