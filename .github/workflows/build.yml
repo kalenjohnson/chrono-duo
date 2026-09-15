@@ -70,11 +70,23 @@ jobs:
             Installs over any previous build (versionCode ${{ github.run_number }}).
           files: ChronoDuo-*.apk
 
-      # Tags like v0.2 get a proper versioned release.
+      # Tags like v0.2 get a proper versioned release. The description comes
+      # from docs/releases/v<version>.md at the tagged commit (written by
+      # hand before tagging); GitHub's generated changelog is appended
+      # below it. A missing file just leaves the generated part.
+      - name: Collect release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          f="docs/releases/v${{ steps.ver.outputs.name }}.md"
+          [ -f "$f" ] || printf '' > "$RUNNER_TEMP/empty.md"
+          echo "path=$([ -f "$f" ] && echo "$f" || echo "$RUNNER_TEMP/empty.md")" >> "$GITHUB_OUTPUT"
+        id: notes
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
           name: ChronoDuo ${{ steps.ver.outputs.name }}
+          body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: true
+          append_body: true
           files: ChronoDuo-*.apk
