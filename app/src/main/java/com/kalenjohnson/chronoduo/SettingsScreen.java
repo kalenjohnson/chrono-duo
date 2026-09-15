@@ -1226,7 +1226,7 @@ final class SettingsScreen {
         origArtButtonHitBox.setEmpty();
         ffSpeedHitBox.setEmpty();
         ffModeHitBox.setEmpty();
-        view.ffHitBox.setEmpty(); // the badge is not tappable under the sheet
+        view.battle.ffHitBox.setEmpty(); // the badge is not tappable under the sheet
         modImportButtonHitBox.setEmpty();
         for (int i = 0; i < MAX_MOD_ROWS; i++) {
             modRowHitBoxes[i].setEmpty();
