@@ -84,6 +84,14 @@ public final class ModCatalog {
         l.add(new Entry("snes-overworld-sprites", "SNES Overworld Sprites Restoration", null,
                 "Original SNES overworld walking sprites",
                 "https://www.nexusmods.com/chronotrigger/mods/9", null, "SNESOverworld", null));
+        l.add(new Entry("pixel-demaster", "Chrono Trigger Pixel Demaster", null,
+                "SNES-style UI, icons, sprites, and the ChronoType SNES font",
+                "https://www.nexusmods.com/chronotrigger/mods/8", null, "Pixel Demaster",
+                "Installs as many sub-mods: enable Main plus the Font, UI colour, icon, and button-prompt "
+                        + "variants you want. Text button prompt (.xdelta) patches are Steam-only and ignored."));
+        l.add(new Entry("snes-wood-menu", "SNES Wood Menu", null,
+                "Wooden SNES-style menu windows",
+                "https://www.nexusmods.com/chronotrigger/mods/26", null, "Wood", null));
         l.add(new Entry("crono-snes-palette", "Crono SNES Sprite Replacement", null,
                 "Crono's SNES palette (removes the yellow skin tone)",
                 "https://www.nexusmods.com/chronotrigger/mods/3", null, null, null));
@@ -100,6 +108,15 @@ public final class ModCatalog {
                 "Reworked title, menus, shop UI and font",
                 "https://www.nexusmods.com/chronotrigger/mods/43", null, null,
                 "Built for the PC CTExt loader; UI parts may not apply on Android"));
+        l.add(new Entry("orchestral-wonders", "Chrono Trigger - Orchestral Wonders", null,
+                "Orchestral re-recordings of the soundtrack",
+                "https://www.nexusmods.com/chronotrigger/mods/23", null, "Orchestral",
+                "Large download; audio is Sound/BGM/*.sab -- untested whether the game reads BGM through the hooked path"));
+        l.add(new Entry("fmv-remastered", "Chrono Trigger FMV's Remastered", null,
+                "4K AI-upscaled anime cutscenes",
+                "https://www.nexusmods.com/chronotrigger/mods/28", null, "FMV",
+                "Very large; FMVs are loose APK assets (001-008.dat), not archive entries -- needs a Java-side "
+                        + "override in the video path and FMV display in ChronoDuo is still an open issue"));
         return Collections.unmodifiableList(l);
     }
 

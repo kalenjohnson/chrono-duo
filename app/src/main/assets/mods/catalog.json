@@ -10,13 +10,23 @@
     "notes": null
   },
   {
-    "id": "crono-snes-palette",
-    "name": "Crono SNES Sprite Replacement",
+    "id": "pixel-demaster",
+    "name": "Chrono Trigger Pixel Demaster",
     "author": null,
-    "summary": "Crono's SNES palette (removes the yellow skin tone)",
-    "page": "https://www.nexusmods.com/chronotrigger/mods/3",
+    "summary": "SNES-style UI, icons, sprites, and the ChronoType SNES font",
+    "page": "https://www.nexusmods.com/chronotrigger/mods/8",
     "download": null,
-    "fileHint": null,
+    "fileHint": "Pixel Demaster",
+    "notes": "Installs as many sub-mods: enable Main plus the Font, UI colour, icon, and button-prompt variants you want. Text button prompt (.xdelta) patches are Steam-only and ignored."
+  },
+  {
+    "id": "snes-wood-menu",
+    "name": "SNES Wood Menu",
+    "author": null,
+    "summary": "Wooden SNES-style menu windows",
+    "page": "https://www.nexusmods.com/chronotrigger/mods/26",
+    "download": null,
+    "fileHint": "Wood",
     "notes": null
   },
   {
@@ -58,5 +68,25 @@
     "download": null,
     "fileHint": null,
     "notes": "Built for the PC CTExt loader; UI parts may not apply on Android"
+  },
+  {
+    "id": "orchestral-wonders",
+    "name": "Chrono Trigger - Orchestral Wonders",
+    "author": null,
+    "summary": "Orchestral re-recordings of the soundtrack",
+    "page": "https://www.nexusmods.com/chronotrigger/mods/23",
+    "download": null,
+    "fileHint": "Orchestral",
+    "notes": "Large download; audio is Sound/BGM/*.sab -- untested whether the game reads BGM through the hooked path"
+  },
+  {
+    "id": "fmv-remastered",
+    "name": "Chrono Trigger FMV's Remastered",
+    "author": null,
+    "summary": "4K AI-upscaled anime cutscenes",
+    "page": "https://www.nexusmods.com/chronotrigger/mods/28",
+    "download": null,
+    "fileHint": "FMV",
+    "notes": "Very large; FMVs are loose APK assets (001-008.dat), not archive entries -- needs a Java-side override in the video path and FMV display in ChronoDuo is still an open issue"
   }
 ]
