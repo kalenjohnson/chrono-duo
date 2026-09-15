@@ -165,6 +165,44 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private static final float EYE_GLYPH_RADIUS = 12f; // ~24px diameter
     private static final float EYE_HIT_HALF = 24f;     // ~48px hit box
 
+    /**
+     * Wall-clock 0..1 visibility tween for one top-strip chip, so the gear
+     * (outside battle) and the eye/AUTO chips (battle) fade in and out
+     * across the battle boundary instead of popping -- the same
+     * self-scheduled onDraw timing as the mode crossfade ({@link
+     * #MODE_FADE_NANOS}), no ValueAnimator. {@link #setVisible} retargets
+     * from wherever the value currently is, so a quick in-and-out (an
+     * ambush that ends in one hit) reverses smoothly. Hit boxes are NOT
+     * driven by this -- they follow the target state directly (see the
+     * {@link #onDraw} chip block), so a chip becomes tappable the moment
+     * it starts fading in and stops being tappable the moment it starts
+     * fading out.
+     */
+    private static final class ChipFade {
+        private boolean target;
+        private float from;
+        private long start = -1L;
+        ChipFade(boolean visible) { target = visible; from = visible ? 1f : 0f; }
+        void setVisible(boolean visible) {
+            if (visible == target) return;
+            from = value();
+            target = visible;
+            start = System.nanoTime();
+        }
+        /** Current 0..1 opacity. */
+        float value() {
+            float to = target ? 1f : 0f;
+            if (start < 0) return to;
+            float t = Math.min(1f, (System.nanoTime() - start) / (float) MODE_FADE_NANOS);
+            if (t >= 1f) { start = -1L; return to; }
+            return from + (to - from) * t;
+        }
+        boolean animating() { return start >= 0; }
+    }
+    private final ChipFade gearFade = new ChipFade(true);
+    private final ChipFade eyeFade = new ChipFade(false);
+    private final ChipFade autoFade = new ChipFade(false);
+
     // Hit box (screen px) for the battle-mode "AUTO" chip, updated each
     // frame it's drawn; cleared (and therefore never touch-hit) whenever
     // snap.autoBattleAvailable is false -- see drawAutoToggle / onTouchEvent.
@@ -266,8 +304,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     };
     private int listVisibleCount;
     private int listWindowStart;
-    // Small "back" chip (top-left corner, mirroring the eye toggle's
-    // top-right position), shown only while the submenu-list band is up --
+    // Small "back" chip (top strip, right of the AUTO chip and eye glyph
+    // slots -- see drawListBackToggle), shown only while the submenu-list band is up --
     // taps it like the game's own B/cancel would. Not part of the row list
     // spec itself, but without it a touch-only player has no way out of the
     // submenu (the game's real B button is deliberately left unconsumed --
@@ -1874,13 +1912,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         // it by roughly rowH*0.62, up to ~5% of the view height), so the
         // clearance must cover that ascent plus a small gap, not just the
         // row's nominal top.
-        if (s.autoBattleAvailable) {
-            areaTop = Math.max(areaTop, autoChipRect(parchment).bottom + h * 0.065f);
-        }
-        // The fast-forward badge (see drawFastForwardBadge) is drawn
-        // top-left in every battle, unconditionally (unlike the AUTO chip
-        // above) -- clear it the same way regardless of autoBattleAvailable.
-        areaTop = Math.max(areaTop, parchment.top + 14f + dp(MOD_ROW_BUTTON_H_DP) + h * 0.065f);
+        // The AUTO chip shares the fast-forward badge's row (see
+        // autoChipRect / ffBadgeRect) and the badge is drawn in every
+        // battle unconditionally, so one clearance covers both.
+        areaTop = Math.max(areaTop, ffBadgeRect(parchment).bottom + h * 0.065f);
         // Leave room for the command-button band (see drawCommandButtons)
         // when it's showing, so a long enemy list compresses instead of
         // drawing through the buttons.
@@ -2328,16 +2363,21 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
     /**
      * Small "back" chip (rounded square + left-triangle glyph), drawn in the
-     * parchment's top-left corner -- mirroring {@link #drawEyeToggle}'s
-     * top-right placement -- only while the submenu-list band is showing.
+     * parchment's top strip right of the AUTO chip and eye glyph slots
+     * ({@link #eyeHitRect}) only while the submenu-list band is showing.
      * Tapping within its ~48px hit box ({@link #listBackHitBox}, see {@link
      * #onTouchEvent}) calls {@link #backList}. Updates {@link
      * #listBackHitBox} every call so the hit-test always matches the glyph's
      * current on-screen position.
      */
     private void drawListBackToggle(Canvas c, RectF parchment) {
-        float cx = parchment.left + BACK_GLYPH_RADIUS + 14f;
-        float cy = parchment.top + BACK_GLYPH_RADIUS + 14f;
+        // Right of the eye glyph's slot (see eyeHitRect, itself right of
+        // the AUTO chip; both slots are reserved whether or not shown, so
+        // this never shifts), centred on the chip row -- the corner itself
+        // belongs to the gear/AUTO crossfade.
+        RectF eye = eyeHitRect(parchment);
+        float cx = eye.right + dp(6f) + BACK_HIT_HALF;
+        float cy = eye.centerY();
         listBackHitBox.set(cx - BACK_HIT_HALF, cy - BACK_HIT_HALF, cx + BACK_HIT_HALF, cy + BACK_HIT_HALF);
 
         int inkA = Color.argb(210, Color.red(INK), Color.green(INK), Color.blue(INK));
@@ -2416,10 +2456,27 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      * FULL mode, or a missing/out-of-range flag table, always returns false.
      */
     private boolean isHiddenInfo(PartySnapshot.Enemy e) {
-        if (!honorHiddenHp) return false;
+        return honorHiddenHp && isFlaggedHidden(e);
+    }
+
+    /** The game's own hidden-info flag for this enemy (see {@link #isHiddenInfo}), regardless of the current display setting. */
+    private static boolean isFlaggedHidden(PartySnapshot.Enemy e) {
         byte[] flags = ChronoAssets.getMonsterFlags();
         if (flags == null || e.id < 0 || e.id >= flags.length) return false;
         return (flags[e.id] & 0xff) == 255;
+    }
+
+    /**
+     * True when any enemy in {@code s} is flagged hidden-info by the game
+     * (a boss/event enemy). Gates the eye toggle: outside such fights the
+     * setting has nothing to act on, so the glyph stays hidden rather than
+     * offering a switch that visibly does nothing. Deliberately ignores
+     * {@link #honorHiddenHp} -- the toggle must stay reachable in FULL
+     * mode too, or there'd be no way back to HONOR.
+     */
+    private static boolean anyFlaggedHidden(PartySnapshot s) {
+        for (PartySnapshot.Enemy e : s.enemies) if (isFlaggedHidden(e)) return true;
+        return false;
     }
 
     /**
@@ -2468,46 +2525,68 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
     /**
      * Small "eye" toggle glyph (circle + dot, INK color, ~24px) in the
-     * parchment's top-right corner, drawn only while in battle mode. Tapping
+     * parchment's top strip, immediately RIGHT of the AUTO chip's slot
+     * (see {@link #eyeHitRect}; the slot is reserved whether or not AUTO
+     * is showing, so the glyph never shifts), drawn only in battle and
+     * only while some enemy is flagged hidden-info (see {@link
+     * #anyFlaggedHidden} -- a boss or event enemy; in an ordinary fight
+     * the toggle would do nothing visible), faded via {@link #eyeFade}. Tapping
      * within its ~48px hit box (see {@link #onTouchEvent}) toggles the
      * hidden-HP display setting. Updates {@link #eyeHitBox} every call so
      * the hit-test always matches the glyph's current on-screen position.
      */
     private void drawEyeToggle(Canvas c, RectF parchment) {
-        float cx = parchment.right - EYE_GLYPH_RADIUS - 14f;
-        float cy = parchment.top + EYE_GLYPH_RADIUS + 14f;
-        eyeHitBox.set(cx - EYE_HIT_HALF, cy - EYE_HIT_HALF, cx + EYE_HIT_HALF, cy + EYE_HIT_HALF);
+        RectF hit = eyeHitRect(parchment);
+        float cx = hit.centerX(), cy = hit.centerY();
+        eyeHitBox.set(hit);
 
+        // An actual eye, not a ring: almond outline (two quadratic arcs
+        // meeting at the corners), iris ring, pupil dot. Wider than tall
+        // (~1.7:1) so it reads as an eye at 24px. When hidden HP is being
+        // overridden (real numbers forced on) a diagonal slash crosses it,
+        // the usual "eye-off" idiom, so the toggle shows its own state.
+        float rx = EYE_GLYPH_RADIUS * 1.35f, ry = EYE_GLYPH_RADIUS * 0.8f;
         int inkA = Color.argb(210, Color.red(INK), Color.green(INK), Color.blue(INK));
         stroke.setStrokeWidth(2f);
         stroke.setColor(inkA);
-        c.drawCircle(cx, cy, EYE_GLYPH_RADIUS, stroke);
+        stroke.setStrokeJoin(Paint.Join.ROUND);
+        Path eye = new Path();
+        eye.moveTo(cx - rx, cy);
+        eye.quadTo(cx, cy - ry * 2.1f, cx + rx, cy);
+        eye.quadTo(cx, cy + ry * 2.1f, cx - rx, cy);
+        eye.close();
+        c.drawPath(eye, stroke);
+        c.drawCircle(cx, cy, ry * 0.62f, stroke);
         fill.setShader(null);
         fill.setColor(inkA);
-        c.drawCircle(cx, cy, EYE_GLYPH_RADIUS * 0.35f, fill);
+        c.drawCircle(cx, cy, ry * 0.28f, fill);
+        if (!honorHiddenHp) {
+            stroke.setStrokeWidth(2.5f);
+            c.drawLine(cx - rx * 0.9f, cy + ry * 1.25f, cx + rx * 0.9f, cy - ry * 1.25f, stroke);
+        }
+        stroke.setStrokeJoin(Paint.Join.MITER); // shared paint: back to its default
     }
 
     /**
      * "AUTO" chip toggling the game's own Auto Battle mode (repeated Attack
      * + 2x battle speed) by tapping the real on-screen toggle's game-screen
      * position -- see {@link #injectAutoBattleToggle}. Drawn only in battle
-     * and only while {@code snap.autoBattleAvailable} (see the {@link
-     * #onDraw} call site, which clears {@link #autoHitBox} otherwise).
-     * Reuses {@link #drawCommandButton}'s exact chrome so it matches the
-     * Attack/Tech/Item row, with {@code highlighted} doing double duty as
-     * the ON/OFF indicator: filled/tinted with a brighter border when Auto
-     * Battle is on, plain when off -- state comes straight from {@code
-     * snap.autoBattleOn} (the next poll), never guessed locally except for
-     * the brief {@link #pressedAuto} press flash. Placed in the same top
-     * strip as {@link #drawEyeToggle}'s glyph (must be called after it, so
-     * {@link #eyeHitBox} is already positioned this frame), immediately to
-     * its LEFT with a small gap -- not below it, which would run into the
-     * enemy HP rows that start at {@link #drawBattleContent}'s areaTop
-     * (parchment.top + ~13% of the view height); staying in the top strip
-     * keeps it clear of both that and the command-button band near the
-     * bottom of the parchment. Sized to a {@link #MOD_ROW_BUTTON_H_DP}-tall
-     * (>=48dp) touch target. Updates {@link #autoHitBox} every call so the
-     * hit-test always matches the chip's current on-screen position.
+     * and only while {@code snap.autoBattleAvailable}, faded via {@link
+     * #autoFade} (see the {@link #onDraw} chip block, which also owns
+     * clearing {@link #autoHitBox}). Reuses {@link #drawCommandButton}'s
+     * exact chrome so it matches the Attack/Tech/Item row, with {@code
+     * highlighted} doing double duty as the ON/OFF indicator: filled/tinted
+     * with a brighter border when Auto Battle is on, plain when off --
+     * state comes straight from {@code snap.autoBattleOn} (the next poll),
+     * never guessed locally except for the brief {@link #pressedAuto} press
+     * flash. Sits in the gear chip's top-left slot (see {@link
+     * #autoChipRect}) -- the gear is hidden in battle, so the two crossfade
+     * in place; the fast-forward badge keeps the top-right. Not below the
+     * strip, which would run into the enemy HP rows that start at {@link
+     * #drawBattleContent}'s areaTop. Sized to a
+     * {@link #MOD_ROW_BUTTON_H_DP}-tall (>=48dp) touch target. Updates
+     * {@link #autoHitBox} every call so the hit-test always matches the
+     * chip's current on-screen position.
      */
     private void drawAutoToggle(Canvas c, RectF parchment) {
         RectF box = autoChipRect(parchment);
@@ -2521,54 +2600,56 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
     /**
      * The AUTO chip's rect for this parchment: {@link #MOD_ROW_BUTTON_H_DP}
-     * tall, 88dp wide, in the top strip immediately left of the eye glyph
-     * (derived from the same constants {@link #drawEyeToggle} uses, so it
-     * needs no draw-order dependency). Shared by {@link #drawAutoToggle}
-     * and {@link #drawBattleContent}, which pushes the enemy HP rows below
-     * it -- the chip is taller than the top strip the eye glyph fits in.
+     * tall, 88dp wide, in the parchment's top-LEFT corner at the same 24px
+     * inset and on the same row as the fast-forward badge ({@link
+     * #ffBadgeRect}) -- i.e. exactly where the gear chip sits outside
+     * battle, so the two crossfade in place across the battle boundary
+     * (gear out, AUTO in) rather than a chip appearing somewhere new.
+     * Shared by {@link #drawAutoToggle}, {@link #eyeHitRect} (the eye
+     * glyph sits right of it, and the submenu back chip right of that)
+     * and {@link #drawBattleContent}, which pushes the enemy HP rows
+     * below it.
      */
     private RectF autoChipRect(RectF parchment) {
-        float chipH = dp(MOD_ROW_BUTTON_H_DP);
+        RectF ff = ffBadgeRect(parchment);
         float chipW = dp(88f);
-        float eyeLeft = parchment.right - EYE_GLYPH_RADIUS - 14f - EYE_HIT_HALF;
-        float right = eyeLeft - dp(6f);
-        float top = parchment.top + 14f;
-        return new RectF(right - chipW, top, right, top + chipH);
+        float left = parchment.left + 24f;
+        return new RectF(left, ff.top, left + chipW, ff.bottom);
+    }
+
+    /**
+     * The eye glyph's ~48px hit square: immediately RIGHT of the AUTO
+     * chip's slot ({@link #autoChipRect}) with a small gap, centred on its
+     * row -- the two are battle-only and fade in together, so they sit
+     * together on the left; the fast-forward badge has the right to
+     * itself. Shared by {@link #drawEyeToggle}, {@link
+     * #drawListBackToggle} (which sits right of it) and the {@link #onDraw}
+     * chip block (as the fade layer's bounds).
+     */
+    private RectF eyeHitRect(RectF parchment) {
+        RectF auto = autoChipRect(parchment);
+        float cx = auto.right + dp(6f) + EYE_HIT_HALF;
+        float cy = auto.centerY();
+        return new RectF(cx - EYE_HIT_HALF, cy - EYE_HIT_HALF, cx + EYE_HIT_HALF, cy + EYE_HIT_HALF);
     }
 
     /**
      * On-panel fast-forward badge, drawn both in and out of battle (see the
-     * {@link #onDraw} call sites) -- reuses {@link #drawCommandButton}'s
+     * {@link #onDraw} chip block) -- reuses {@link #drawCommandButton}'s
      * chrome like {@link #drawAutoToggle} does. Shows ">> Nx" (highlighted)
      * while {@link GameSpeed#isActive} is true; otherwise a dimmed/hollow
      * ">>" so it stays discoverable and tappable to turn fast-forward on.
-     * Tapping it always toggles, regardless of {@link GameSpeed.Mode}. Out
-     * of battle it sits immediately right of the gear chip (which occupies
-     * the top-left corner then); in battle the gear chip is hidden, so the
-     * badge takes that same top-left spot instead -- either way it stays
-     * clear of the top-right eye glyph/AUTO chip and the enemy HP rows
-     * below. Sized to a {@link #MOD_ROW_BUTTON_H_DP}-tall (>=48dp) touch
-     * target, like the AUTO chip. Sets {@link #ffHitBox}.
+     * Tapping it always toggles, regardless of {@link GameSpeed.Mode}.
+     * Owns the parchment's top-RIGHT corner in every mode (see {@link
+     * #ffBadgeRect}) and never moves or fades: it's the one chip that is
+     * always present, so it anchors the strip -- the battle-only AUTO chip
+     * and eye glyph line up to its left, and the gear chip has the
+     * top-left to itself outside battle. Sized to a {@link
+     * #MOD_ROW_BUTTON_H_DP}-tall (>=48dp) touch target, like the AUTO
+     * chip. Sets {@link #ffHitBox}.
      */
-    private void drawFastForwardBadge(Canvas c, RectF parchment, boolean inBattle) {
-        float chipH = dp(MOD_ROW_BUTTON_H_DP);
-        float chipW = dp(84f);
-        float left, top;
-        if (inBattle) {
-            left = parchment.left + 24f;
-            top = parchment.top + 14f;
-        } else {
-            left = parchment.left + 24f + GEAR_CHIP_SIZE + dp(10f);
-            top = parchment.top + 24f + (GEAR_CHIP_SIZE - chipH) / 2f;
-        }
-        if (inBattle) {
-            // Clamp against the AUTO chip (top-right) on a narrow panel so
-            // the two never meet -- autoChipRect is only meaningful when the
-            // AUTO chip is actually shown, but it's a safe upper bound either way.
-            float maxRight = autoChipRect(parchment).left - dp(8f);
-            chipW = Math.min(chipW, Math.max(dp(32f), maxRight - left));
-        }
-        RectF box = new RectF(left, top, left + chipW, top + chipH);
+    private void drawFastForwardBadge(Canvas c, RectF parchment) {
+        RectF box = ffBadgeRect(parchment);
         ffHitBox.set(box);
 
         boolean active = GameSpeed.isActive();
@@ -2582,6 +2663,46 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             fill.setColor(Color.argb(140, 0, 0, 0));
             c.drawRect(box, fill);
         }
+    }
+
+    /**
+     * The fast-forward badge's rect for this parchment, mode-independent:
+     * {@link #MOD_ROW_BUTTON_H_DP} tall, 84dp wide, flush with the
+     * parchment's top-right corner at the same 24px inset the gear chip
+     * uses top-left, and vertically centred on the gear chip's slot so the
+     * two read as one row outside battle. Shared by {@link
+     * #drawFastForwardBadge}, {@link #autoChipRect} (which hangs off its
+     * left edge) and {@link #drawBattleContent} (which pushes the enemy HP
+     * rows below it).
+     */
+    private RectF ffBadgeRect(RectF parchment) {
+        float chipH = dp(MOD_ROW_BUTTON_H_DP);
+        float chipW = dp(84f);
+        float right = parchment.right - 24f;
+        float top = parchment.top + 24f + (GEAR_CHIP_SIZE - chipH) / 2f;
+        return new RectF(right - chipW, top, right, top + chipH);
+    }
+
+    /**
+     * Draws one fading top-strip chip: {@code fade}'s current opacity is
+     * applied via a layer over {@code bounds} (a little padded so the
+     * window chrome's edge isn't clipped), {@code draw} paints the chip at
+     * full opacity inside it. Skipped entirely at 0. Returns true while
+     * the fade is still running so {@link #onDraw} keeps scheduling frames.
+     */
+    private boolean drawFadedChip(Canvas c, ChipFade fade, RectF bounds, Runnable draw) {
+        float a = fade.value();
+        if (a <= 0f) return fade.animating();
+        if (a >= 1f) {
+            draw.run();
+        } else {
+            RectF r = new RectF(bounds);
+            r.inset(-4f, -4f);
+            int layer = c.saveLayerAlpha(r, (int) (255 * a));
+            draw.run();
+            c.restoreToCount(layer);
+        }
+        return fade.animating();
     }
 
     /**
@@ -3733,17 +3854,30 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         boolean resultsMode = snap.inBattle && resultsVisible(snap);
         boolean targeting = !resultsMode && snap.inBattle && isTargetingActive(bandNow);
         boolean listMode = !resultsMode && snap.inBattle && snap.listOpen && !snap.listRows.isEmpty();
+        // Top-strip chips. The fast-forward badge owns the top-right corner
+        // in every mode and never fades; the gear (outside battle) and the
+        // eye/AUTO chips (battle) crossfade across the battle boundary --
+        // see ChipFade. Drawn here, on top of the aged-paper overlay, for
+        // the same reason as the command buttons above. Hit boxes follow
+        // the TARGET state, not the fade: cleared below for whichever mode
+        // we're not in, so a chip that's still fading out can't be tapped.
+        boolean showGear = !snap.inBattle;
+        boolean showAuto = snap.inBattle && snap.autoBattleAvailable;
+        // eye only when there's a hidden-info enemy for it to act on
+        boolean showEye = snap.inBattle && anyFlaggedHidden(snap);
+        gearFade.setVisible(showGear);
+        eyeFade.setVisible(showEye);
+        autoFade.setVisible(showAuto);
+        drawFastForwardBadge(c, parchment);
+        RectF gearRect = new RectF(parchment.left + 24f, parchment.top + 24f,
+                parchment.left + 24f + GEAR_CHIP_SIZE, parchment.top + 24f + GEAR_CHIP_SIZE);
+        if (drawFadedChip(c, gearFade, gearRect, () -> drawGearChip(c, parchment))) animating = true;
+        if (drawFadedChip(c, eyeFade, eyeHitRect(parchment), () -> drawEyeToggle(c, parchment))) animating = true;
+        if (drawFadedChip(c, autoFade, autoChipRect(parchment), () -> drawAutoToggle(c, parchment))) animating = true;
+        if (!showGear) gearHitBox.setEmpty();
+        if (!showEye) eyeHitBox.setEmpty();
+        if (!showAuto) autoHitBox.setEmpty();
         if (snap.inBattle) {
-            gearHitBox.setEmpty();
-            // Top-left is free in battle (the gear chip is hidden), so the
-            // badge takes its spot -- see drawFastForwardBadge.
-            drawFastForwardBadge(c, parchment, true);
-            drawEyeToggle(c, parchment);
-            if (snap.autoBattleAvailable) {
-                drawAutoToggle(c, parchment);
-            } else {
-                autoHitBox.setEmpty();
-            }
             if (resultsMode) {
                 drawResultsWindow(c, parchment);
                 commandCount = 0;
@@ -3767,16 +3901,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 listBackHitBox.setEmpty();
             }
         } else {
-            eyeHitBox.setEmpty();
-            autoHitBox.setEmpty();
             commandCount = 0;
             targetCount = 0;
             listVisibleCount = 0;
             listBackHitBox.setEmpty();
-            drawGearChip(c, parchment);
-            // Outside battle the gear chip occupies the top-left corner, so
-            // the badge sits immediately to its right instead.
-            drawFastForwardBadge(c, parchment, false);
         }
         // targeting mode has its own wall-clock timeout (see
         // isTargetingActive) that isn't tied to a snapshot change, so the
