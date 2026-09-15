@@ -293,21 +293,23 @@ public final class PartySnapshot {
         //  3. the record field +0x11c, a JOIN COUNTER (Crono 1, Marle 2,
         //     Lucca 3, Frog 4 ... -1 = never joined / left), NOT a 1..3
         //     slot: filtering on 1..3 dropped Frog the moment he joined.
+        // Each copy goes stale in the other's territory: the C++ slots are
+        // FieldImpl's, only re-synced while a field scene runs, so a menu
+        // swap made ON THE OVERWORLD doesn't reach them until the next
+        // location loads; the Asm copy is what the overworld itself runs on
+        // (re-synced on overworld entry and by the menu there), but stale
+        // inside a field until the party walks back out. So: Asm first on
+        // the overworld (WorldScene live, or the menu open over it -- the
+        // game reports one of the 0x1F0..0x1F7 overworld ids then), C++
+        // slots first everywhere else, each falling back to the other.
         int[] order = new int[7];
         java.util.Arrays.fill(order, -1);
-        boolean haveList = readCanvasPartyList(order);
+        boolean onOverworld = snap.worldScenePresent
+                || PartyPanelView.isWorldMapLocation(snap.fieldMapId);
+        boolean haveList = onOverworld ? readAsmPartyList(order) : readCanvasPartyList(order);
         if (!haveList) {
-            // Fallback 1: the Asm-memory copy (stale inside field maps until
-            // the next overworld entry, but right on the overworld itself).
             java.util.Arrays.fill(order, -1);
-            byte[] plist = GameState.nativeReadAsmMem(PARTY_LIST_OFFSET, PARTY_LIST_SLOTS);
-            if (plist != null && plist.length >= PARTY_LIST_SLOTS) {
-                for (int k = 0; k < PARTY_LIST_SLOTS; k++) {
-                    int id = plist[k] & 0xff;
-                    if (id < 7 && order[id] < 0) { order[id] = k + 1; haveList = true; }
-                    else if (id != PARTY_LIST_EMPTY) { haveList = false; break; } // garbage: fall back
-                }
-            }
+            haveList = onOverworld ? readCanvasPartyList(order) : readAsmPartyList(order);
         }
         for (int i = 0; i < 7; i++) {
             byte[] b = GameState.nativeReadSfc(CHARA_BASE + i * CHARA_STRIDE, 0x120);
@@ -492,6 +494,24 @@ public final class PartySnapshot {
         if (count == 0) return false; // an empty party is never real; don't trust it
         for (int k = 0; k < PARTY_LIST_SLOTS; k++) if (ids[k] >= 0) order[ids[k]] = k + 1;
         return true;
+    }
+
+    /**
+     * Fills {@code order[id]} from the Asm-memory party list (see {@link
+     * #PARTY_LIST_OFFSET}): three PC-id bytes, 0x80 = empty. Returns false,
+     * leaving {@code order} possibly partially filled (callers re-clear it),
+     * when the bytes are unreadable, hold no member, or don't decode.
+     */
+    private static boolean readAsmPartyList(int[] order) {
+        byte[] plist = GameState.nativeReadAsmMem(PARTY_LIST_OFFSET, PARTY_LIST_SLOTS);
+        if (plist == null || plist.length < PARTY_LIST_SLOTS) return false;
+        boolean any = false;
+        for (int k = 0; k < PARTY_LIST_SLOTS; k++) {
+            int id = plist[k] & 0xff;
+            if (id < 7 && order[id] < 0) { order[id] = k + 1; any = true; }
+            else if (id != PARTY_LIST_EMPTY) return false; // garbage / duplicate
+        }
+        return any;
     }
 
     /**
