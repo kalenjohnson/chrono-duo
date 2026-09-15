@@ -53,9 +53,23 @@ android {
         // vendored cocos2d-x 3.14.1 sources trip many modern lint checks
         abortOnError false
     }
+
+    testOptions {
+        unitTests {
+            // ModManager's Log.w/Log.i calls (font decrypt warnings, .group/
+            // .source write failures, etc.) would otherwise throw against
+            // the unmocked android.jar stub every JVM unit test runs
+            // against -- have them return their default (no-op) instead.
+            returnDefaultValues = true
+        }
+    }
 }
 
 dependencies {
     // required by vendored Cocos2dxDownloader (the engine FindClass()es it at nativeInit)
     implementation 'com.loopj.android:android-async-http:1.4.9'
+    // JVM unit tests (app/src/test/java) -- pure-Java classes like ModManager
+    // are deliberately Android-dependency-free so they can run here without
+    // an emulator/instrumentation.
+    testImplementation 'junit:junit:4.13.2'
 }

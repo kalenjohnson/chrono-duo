@@ -782,13 +782,46 @@ public class AppActivity extends Cocos2dxActivity {
         final com.kalenjohnson.chronoduo.mods.ModManager mm = modManager;
         new Thread(() -> {
             try {
-                mm.importArchive(uri, getContentResolver());
-                updateModsStatus(false, null);
+                com.kalenjohnson.chronoduo.mods.ModManager.ImportResult result = mm.importArchive(uri, getContentResolver());
+                logImportResult(result);
+                updateModsStatus(false, describeImportResult(result), null);
+                refreshCompanionAssetsForModChange();
             } catch (Throwable t) {
                 Log.e(TAG, "mod import failed", t);
                 updateModsStatus(false, t.getMessage() != null ? t.getMessage() : t.toString());
             }
         }, "ChronoModImport").start();
+    }
+
+    /**
+     * Logs a one-line summary of a completed import (e.g. "Imported 33 mods
+     * from Chrono Trigger Pixel Demaster (1 enabled)" for a split
+     * multi-archive download -- see {@link
+     * com.kalenjohnson.chronoduo.mods.ModManager#extractZip} -- or nothing
+     * for the common single-mod case). {@link PartyPanelView}'s Mods page
+     * already reflects the result via its mod list, so this is
+     * informational only, not surfaced as a status/error message.
+     */
+    private static void logImportResult(com.kalenjohnson.chronoduo.mods.ModManager.ImportResult result) {
+        if (result == null || result.modNames.size() <= 1) return;
+        Log.i(TAG, "mods: imported " + result.modNames.size() + " mods from " + result.downloadName
+                + " (" + result.enabledCount + " enabled)");
+    }
+
+    /**
+     * One-line human summary of a completed import (e.g. "Imported 2 mods (1
+     * enabled)"), for the settings panel's status line -- unlike {@link
+     * #logImportResult}, which only logs the multi-archive case, this always
+     * returns a line so the common single-mod import stops finishing
+     * silently on the Mods page. Passed through {@link #updateModsStatus}'s
+     * neutral {@code message} parameter (never {@code error}), so it renders
+     * in the panel's normal body color with no "error:" prefix -- see {@link
+     * PartyPanelView#setModsStatus}.
+     */
+    private static String describeImportResult(com.kalenjohnson.chronoduo.mods.ModManager.ImportResult result) {
+        if (result == null) return null;
+        int n = result.modNames.size();
+        return "Imported " + n + (n == 1 ? " mod" : " mods") + " (" + result.enabledCount + " enabled)";
     }
 
     /** Flips a mod's enabled state via {@link com.kalenjohnson.chronoduo.mods.ModManager#setEnabled} on a background thread, then pushes the result. Called from the settings screen's per-row toggle button. */
@@ -798,19 +831,46 @@ public class AppActivity extends Cocos2dxActivity {
         new Thread(() -> {
             mm.setEnabled(name, enabled);
             updateModsStatus(false, null);
+            refreshCompanionAssetsForModChange();
         }, "ChronoModToggle").start();
     }
 
-    /** Posts the current mod list and an optional status/error message to the bottom-screen panel's settings view, if one is currently showing -- a no-op otherwise. Safe from any thread. Mirrors {@link #updateOrigArtStatus}. */
+    /** Same as the 3-arg overload with no success message -- the common idle/importing/error case. */
     private void updateModsStatus(boolean importing, String error) {
+        updateModsStatus(importing, null, error);
+    }
+
+    /** Posts the current mod list and an optional neutral status/error message to the bottom-screen panel's settings view, if one is currently showing -- a no-op otherwise. Safe from any thread. Mirrors {@link #updateOrigArtStatus}. {@code message} is shown in the panel's normal body color (no prefix); {@code error} is shown red with an "error: " prefix -- see {@link PartyPanelView#setModsStatus}. */
+    private void updateModsStatus(boolean importing, String message, String error) {
         final java.util.List<com.kalenjohnson.chronoduo.mods.ModManager.ModInfo> mods =
                 modManager != null ? modManager.lastMods() : java.util.Collections.emptyList();
         new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
             PartyPanelView panel = secondScreen != null ? secondScreen.getPanel() : null;
             if (panel == null) return;
             panel.setModsList(mods);
-            panel.setModsStatus(importing, error);
+            panel.setModsStatus(importing, message, error);
         });
+    }
+
+    /**
+     * {@link SecondScreenManager.PanelListener} callback: runs whenever
+     * {@link SecondScreenManager} builds a fresh {@link PartyPanelView} (the
+     * initial one, and any later one a system-initiated Presentation
+     * teardown/recreate produces -- see that class's doc). Re-pushes the
+     * Mods page's list/catalog state, which is otherwise only pushed at
+     * scan/import/toggle or catalog-load time and would sit at its
+     * construction-time empty default (and clears any stale importing/error
+     * flag from before the recreate, which can't still be meaningful for a
+     * panel that didn't exist while it was set) -- see the {@code
+     * setPanelListener} call site in {@link #onCreate} for what's
+     * deliberately NOT replayed. Always runs on the main thread (called
+     * synchronously from {@link SecondScreenManager#show}, itself only ever
+     * invoked from {@code onResume}/its own main-thread handler posts).
+     */
+    private void onSecondScreenPanelAttached(PartyPanelView panel) {
+        panel.setModCatalog(modCatalog);
+        panel.setModsList(modManager != null ? modManager.lastMods() : java.util.Collections.emptyList());
+        panel.setModsStatus(false, null, null);
     }
 
     // --- curated mod catalog (see com.kalenjohnson.chronoduo.mods.ModCatalog) ----------
@@ -831,7 +891,6 @@ public class AppActivity extends Cocos2dxActivity {
             if (e.id.equals(id)) return e;
         }
         return null;
-            refreshCompanionAssetsForModChange();
     }
 
     /**
@@ -941,11 +1000,19 @@ public class AppActivity extends Cocos2dxActivity {
                     if (!looksLikeModArchive(name)) {
                         Log.w(TAG, "mods: '" + name + "' doesn't look like a .ctp/.zip -- importing anyway");
                     }
+                    com.kalenjohnson.chronoduo.mods.ModManager.ImportResult result;
                     try (java.io.InputStream in = new java.io.FileInputStream(tmp)) {
-                        mm.importCatalogMod(in, entry.id, entry.page != null ? entry.page : url);
+                        result = mm.importCatalogMod(in, entry.id, entry.page != null ? entry.page : url);
                     }
-                    mm.setEnabled(entry.id, true);
-                    updateModsStatus(false, null);
+                    // extractZip already picks the right default-enabled
+                    // sub-mod(s) fresh on every import (see its class doc) --
+                    // no need to force-enable entry.id, which for a
+                    // multi-archive download (e.g. Pixel Demaster) isn't
+                    // even a real mod directory any more, just the shared
+                    // "<id> - <option>" name prefix.
+                    logImportResult(result);
+                    updateModsStatus(false, describeImportResult(result), null);
+                    refreshCompanionAssetsForModChange();
                 } catch (Throwable t) {
                     failure = t;
                 }
@@ -1022,16 +1089,20 @@ public class AppActivity extends Cocos2dxActivity {
         updateModsStatus(true, null);
         new Thread(() -> {
             try {
+                com.kalenjohnson.chronoduo.mods.ModManager.ImportResult result;
                 if (finalMatch != null) {
                     try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
                         if (in == null) throw new java.io.IOException("could not open " + uri);
-                        mm.importCatalogMod(in, finalMatch.id, "local:" + uri);
+                        result = mm.importCatalogMod(in, finalMatch.id, "local:" + uri);
                     }
-                    mm.setEnabled(finalMatch.id, true);
+                    // See downloadAndImportMod's matching comment: extractZip
+                    // already establishes the right enabled state per import.
                 } else {
-                    mm.importArchive(uri, getContentResolver());
+                    result = mm.importArchive(uri, getContentResolver());
                 }
-                updateModsStatus(false, null);
+                logImportResult(result);
+                updateModsStatus(false, describeImportResult(result), null);
+                refreshCompanionAssetsForModChange();
             } catch (Throwable t) {
                 Log.e(TAG, ".ctp import failed for " + uri, t);
                 updateModsStatus(false, t.getMessage() != null ? t.getMessage() : t.toString());
@@ -1046,6 +1117,15 @@ public class AppActivity extends Cocos2dxActivity {
     // each edge — sits at (198,134)-(500,304) in sheet pixels; that region
     // is cropped out here so ChronoAssets/PartyPanelView can 9-slice it
     // directly (bitmap origin becomes the panel's own top-left).
+    //
+    // All of the crop rects below (this one and minimap_mark.png's tiles)
+    // are pixel coordinates measured against the ORIGINAL sheet size. A mod
+    // can ship a differently-sized replacement (e.g. a higher-res face.png
+    // or menu_win.png) that keeps the same relative layout, so every rect is
+    // scaled by (actual sheet size / original sheet size) before use rather
+    // than applied as literal pixels -- see PartyPanelView#faceTileRect for
+    // the same treatment of the portrait grid.
+    private static final int WIN_TEX_SHEET_W = 512, WIN_TEX_SHEET_H = 512;
     private static final int WIN_TEX_L = 198, WIN_TEX_T = 134, WIN_TEX_R = 500, WIN_TEX_B = 304;
 
     /** {@link #cropWindowTexture}'s result: the cropped 9-slice source plus the corner/edge inset scaled to match (see {@link com.kalenjohnson.chronoduo.ChronoAssets#WINDOW_TEX_INSET_DEFAULT}). */
@@ -1095,6 +1175,8 @@ public class AppActivity extends Cocos2dxActivity {
     // "you are here" marker, so that's the one tile we draw — the old code
     // drew the whole 48x16 sheet in one rect, which showed up on-screen as
     // three stray circles side by side.
+    private static final int MARK_SHEET_W = 48, MARK_SHEET_H = 16;
+
     private static android.graphics.Bitmap cropMarkerTile(File f) {
         android.graphics.Bitmap sheet = decodeBitmap(f);
         if (sheet == null) return null;
@@ -1148,15 +1230,6 @@ public class AppActivity extends Cocos2dxActivity {
             Log.w(TAG, "battle snapshot copy failed: " + src + " -> " + dst, e);
         }
     }
-    //
-    // All of the crop rects below (this one and minimap_mark.png's tiles)
-    // are pixel coordinates measured against the ORIGINAL sheet size. A mod
-    // can ship a differently-sized replacement (e.g. a higher-res face.png
-    // or menu_win.png) that keeps the same relative layout, so every rect is
-    // scaled by (actual sheet size / original sheet size) before use rather
-    // than applied as literal pixels -- see PartyPanelView#faceTileRect for
-    // the same treatment of the portrait grid.
-    private static final int WIN_TEX_SHEET_W = 512, WIN_TEX_SHEET_H = 512;
 
     private static android.graphics.Bitmap decodeBitmap(File f) {
         if (f == null) return null;
@@ -1183,8 +1256,6 @@ public class AppActivity extends Cocos2dxActivity {
             Log.w(TAG, "failed to read name table: " + f, e);
             return null;
         }
-    private static final int MARK_SHEET_W = 48, MARK_SHEET_H = 16;
-
     }
 
     /**

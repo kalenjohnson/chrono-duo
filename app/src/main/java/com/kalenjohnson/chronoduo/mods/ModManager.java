@@ -73,6 +73,42 @@ public final class ModManager {
     private static final Set<String> ASSET_ROOTS = new HashSet<>(Arrays.asList(
             "game", "localize", "extension", "sound"));
 
+    // A Steam font patch's payload file (e.g. string_2.bin), decrypted by
+    // processFonts() into font.ttf/font_N.ttf -- see extractZip's class doc.
+    private static final java.util.regex.Pattern STRING_BIN =
+            java.util.regex.Pattern.compile("string_(\\d+)\\.bin", java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    // Loose files a Nexus download can contain that are never usable assets
+    // on this platform -- .xdelta patches are Steam-exe-only (see
+    // extractZip's class doc) -- deleted outright so they never get swept
+    // into a mod's archive-substitution set by collect()/walk().
+    private static final Set<String> NON_ASSET_EXTENSIONS = new HashSet<>(Collections.singletonList("xdelta"));
+
+    /**
+     * Result of {@link #extractZip}/{@link #importArchive}/{@link
+     * #importArchiveNamed}/{@link #importCatalogMod}: a download can expand
+     * into more than one mod directory now (see {@link #extractZip}'s class
+     * doc paragraph on multi-archive downloads), so callers need the full
+     * list, not just one {@link File}.
+     */
+    public static final class ImportResult {
+        /** The first mod directory created (single-archive downloads: the only one; multi-archive: the earliest by {@link #modNames} order) -- kept for callers that only need "a" resulting directory. */
+        public final File finalDir;
+        /** Every mod directory name created by this import, in creation order (== {@link #modNames}'s iteration order over {@code nested archives} for a split download). */
+        public final List<String> modNames;
+        /** How many of {@link #modNames} started enabled (no {@code .disabled} marker written) -- always 1 for a single-archive download, 0 or more for a split one. */
+        public final int enabledCount;
+        /** The download's display name, as passed to {@link #extractZip} -- echoed back so a status message can name it (e.g. "Imported 33 mods from Pixel Demaster"). */
+        public final String downloadName;
+
+        ImportResult(File finalDir, List<String> modNames, int enabledCount, String downloadName) {
+            this.finalDir = finalDir;
+            this.modNames = modNames;
+            this.enabledCount = enabledCount;
+            this.downloadName = downloadName;
+        }
+    }
+
     /** One mod's summary, as returned by {@link #collect}/{@link #scan}. */
     public static final class ModInfo {
         public final String name;
@@ -93,42 +129,6 @@ public final class ModManager {
         public final List<ModInfo> mods;
         public final String[] archivePaths;
         public final String[] diskPaths;
-
-        public ScanResult(List<ModInfo> mods, String[] archivePaths, String[] diskPaths) {
-            this.mods = mods;
-            this.archivePaths = archivePaths;
-            this.diskPaths = diskPaths;
-        }
-    }
-
-    private final File root;
-    private volatile ScanResult lastResult;
-
-    /** {@code externalFilesDir} is the app's external files directory (see AppActivity's {@code getExternalFilesDir(null)}); the mod root is {@code <externalFilesDir>/mods}. */
-    public ModManager(File externalFilesDir) {
-        this.root = new File(externalFilesDir, MODS_DIR_NAME);
-    }
-
-    public File getRoot() {
-        return root;
-    }
-
-    /** The mods found by the most recent {@link #scan}, or an empty list before the first scan. */
-    public List<ModInfo> lastMods() {
-        ScanResult r = lastResult;
-        return r != null ? r.mods : Collections.emptyList();
-    }
-
-    // --- pure scan/collect (no Android, no native calls) --------------------
-
-    /**
-     * Walks {@code modsRoot}'s immediate subdirectories in case-insensitive
-     * alphabetical order; each is one mod, skipped entirely (fileCount=0,
-     * conflictCount=0) if it contains a {@code .disabled} marker file.
-     * Within an enabled mod, every regular file is visited depth-first
-     * (dotfiles/dot-directories skipped everywhere; {@code readme*} and
-     * {@code *.txt} skipped only directly at the mod's root, since real
-     * assets like {@code Localize/en/msg/tech.txt} live under subdirs and
         // Same winning (archivePath -> diskPath) pairs as archivePaths/
         // diskPaths above, keyed by the SAME normalized form gamestate.c's
         // normalize_archive_path uses (strip one leading "./" then any
@@ -136,19 +136,19 @@ public final class ModManager {
         // resolve() below instead of a linear scan. Case-sensitive, matching
         // the native side's strcmp.
         public final Map<String, String> archiveToDiskPath;
-     * must not be swept up by that rule). The archive path is the file's
-     * path relative to the mod directory with {@code '/'} separators.
-     *
-     * <p>The first mod (in the walk order above) to claim a given archive
-     * path wins; every later mod that names the same path has that file
+
+        public ScanResult(List<ModInfo> mods, String[] archivePaths, String[] diskPaths) {
+            this.mods = mods;
+            this.archivePaths = archivePaths;
+            this.diskPaths = diskPaths;
             Map<String, String> map = new java.util.HashMap<>(archivePaths.length * 2);
             for (int i = 0; i < archivePaths.length; i++) {
                 map.put(normalizeArchivePath(archivePaths[i]), diskPaths[i]);
             }
             this.archiveToDiskPath = map;
-     * counted as a conflict against IT (the loser), and that file is
-     * excluded from the returned registration arrays -- the winning mod's
-     * claim is unaffected.
+        }
+    }
+
     /**
      * Strips a single leading "./" and then any number of leading "/" from an
      * archive path, exactly mirroring gamestate.c's {@code
@@ -172,12 +172,12 @@ public final class ModManager {
     // error; see ChronoResources#extractModAware.
     private static volatile ModManager instance;
 
-     *
-     * <p>Pure and Android-free: touches only {@code java.io}, so it can run
-     * on a plain JVM.
-     */
-    public static ScanResult collect(File modsRoot) {
-        List<File> modDirs = new ArrayList<>();
+    private final File root;
+    private volatile ScanResult lastResult;
+
+    /** {@code externalFilesDir} is the app's external files directory (see AppActivity's {@code getExternalFilesDir(null)}); the mod root is {@code <externalFilesDir>/mods}. */
+    public ModManager(File externalFilesDir) {
+        this.root = new File(externalFilesDir, MODS_DIR_NAME);
         instance = this;
     }
 
@@ -219,6 +219,42 @@ public final class ModManager {
     public static File resolveStatic(String archivePath) {
         ModManager m = instance;
         return m != null ? m.resolve(archivePath) : null;
+    }
+
+    public File getRoot() {
+        return root;
+    }
+
+    /** The mods found by the most recent {@link #scan}, or an empty list before the first scan. */
+    public List<ModInfo> lastMods() {
+        ScanResult r = lastResult;
+        return r != null ? r.mods : Collections.emptyList();
+    }
+
+    // --- pure scan/collect (no Android, no native calls) --------------------
+
+    /**
+     * Walks {@code modsRoot}'s immediate subdirectories in case-insensitive
+     * alphabetical order; each is one mod, skipped entirely (fileCount=0,
+     * conflictCount=0) if it contains a {@code .disabled} marker file.
+     * Within an enabled mod, every regular file is visited depth-first
+     * (dotfiles/dot-directories skipped everywhere; {@code readme*} and
+     * {@code *.txt} skipped only directly at the mod's root, since real
+     * assets like {@code Localize/en/msg/tech.txt} live under subdirs and
+     * must not be swept up by that rule). The archive path is the file's
+     * path relative to the mod directory with {@code '/'} separators.
+     *
+     * <p>The first mod (in the walk order above) to claim a given archive
+     * path wins; every later mod that names the same path has that file
+     * counted as a conflict against IT (the loser), and that file is
+     * excluded from the returned registration arrays -- the winning mod's
+     * claim is unaffected.
+     *
+     * <p>Pure and Android-free: touches only {@code java.io}, so it can run
+     * on a plain JVM.
+     */
+    public static ScanResult collect(File modsRoot) {
+        List<File> modDirs = new ArrayList<>();
         File[] children = modsRoot.isDirectory() ? modsRoot.listFiles() : null;
         if (children != null) {
             for (File f : children) {
@@ -277,13 +313,124 @@ public final class ModManager {
             if (entry.isDirectory()) {
                 walk(entry, rel, out);
             } else if (entry.isFile()) {
-                if (atRoot) {
-                    String lower = name.toLowerCase(Locale.ROOT);
-                    if (lower.startsWith("readme") || lower.endsWith(".txt")) continue;
-                }
+                String lower = name.toLowerCase(Locale.ROOT);
+                if (atRoot && (lower.startsWith("readme") || lower.endsWith(".txt"))) continue;
+                // Font assets (a raw .ttf/.otf, or a not-yet-decrypted
+                // string_N.bin -- see extractZip/processFonts) are never
+                // archive substitutions, at any depth.
+                if (lower.endsWith(".ttf") || lower.endsWith(".otf") || STRING_BIN.matcher(name).matches()) continue;
                 out.add(new String[]{rel, entry.getAbsolutePath()});
             }
         }
+    }
+
+    /**
+     * Returns the font file of the first enabled mod (same alphabetical
+     * order {@link #collect} walks) that has one, or {@code null} if none
+     * do. A mod's font is {@code font.ttf} at its root if present (the
+     * lowest-numbered {@code string_N.bin} decrypted by {@link
+     * #processFonts} during import, or a raw {@code .ttf}/{@code .otf}
+     * dropped in under that exact name); failing that, the alphabetically
+     * first raw {@code .ttf}/{@code .otf} file at the mod's root. Pure --
+     * touches only {@code java.io}, so it's JVM-testable; {@link #scan()}
+     * calls this and publishes the result to {@code Cocos2dxBitmap}.
+     */
+    public static File findFont(File modsRoot) {
+        File[] children = modsRoot.isDirectory() ? modsRoot.listFiles() : null;
+        if (children == null) return null;
+        List<File> modDirs = new ArrayList<>();
+        for (File f : children) {
+            if (f.isDirectory()) modDirs.add(f);
+        }
+        modDirs.sort(Comparator.comparing(f -> f.getName().toLowerCase(Locale.ROOT)));
+        for (File modDir : modDirs) {
+            if (new File(modDir, DISABLED_MARKER).isFile()) continue;
+            File primary = new File(modDir, "font.ttf");
+            if (primary.isFile()) return primary;
+            File[] entries = modDir.listFiles();
+            if (entries == null) continue;
+            Arrays.sort(entries, Comparator.comparing(File::getName));
+            for (File e : entries) {
+                if (!e.isFile()) continue;
+                String lower = e.getName().toLowerCase(Locale.ROOT);
+                if (lower.endsWith(".ttf") || lower.endsWith(".otf")) return e;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Parses {@code ttf}'s sfnt table directory looking for an {@code EBLC}
+     * table (embedded bitmap location -- present on bitmap-strike fonts
+     * like pixel-art fonts baked at a fixed size) and returns the first
+     * strike's {@code ppemX}, or {@code 0} if the font has no embedded
+     * bitmap strikes (a normal scalable font) or on any parse error.
+     * Pure -- only {@code java.io}, so it's JVM-testable.
+     *
+     * <p>sfnt header: 4-byte version/magic ({@code 0x00010000}, {@code
+     * 'true'}, or {@code 'OTTO'} -- {@code 'ttcf'} TrueType collections are
+     * not handled and return 0), uint16 numTables, then 8 bytes of
+     * search-range fields we skip, followed by {@code numTables} 16-byte
+     * table records: 4-byte tag, uint32 checksum, uint32 offset, uint32
+     * length.
+     *
+     * <p>EBLC table: uint32 version, uint32 numSizes, then {@code
+     * numSizes} 48-byte {@code bitmapSizeTable} records; {@code ppemX} is
+     * the uint8 at offset 44 within a record, {@code ppemY} at 45.
+     */
+    static int fontNativePpem(File ttf) {
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(ttf, "r")) {
+            byte[] header = new byte[12];
+            if (raf.read(header) != 12) return 0;
+            int magic = readInt32(header, 0);
+            if (magic != 0x00010000 && magic != 0x74727565 /* 'true' */
+                    && magic != 0x4F54544F /* 'OTTO' */) {
+                return 0;
+            }
+            int numTables = readUInt16(header, 4);
+            if (numTables <= 0 || numTables > 4096) return 0;
+
+            long eblcOffset = -1;
+            long eblcLength = -1;
+            byte[] record = new byte[16];
+            for (int i = 0; i < numTables; i++) {
+                if (raf.read(record) != 16) return 0;
+                String tag = new String(record, 0, 4, java.nio.charset.StandardCharsets.US_ASCII);
+                if ("EBLC".equals(tag)) {
+                    eblcOffset = readUInt32(record, 8);
+                    eblcLength = readUInt32(record, 12);
+                    break;
+                }
+            }
+            if (eblcOffset < 0) return 0;
+            if (eblcLength < 8) return 0;
+
+            raf.seek(eblcOffset);
+            byte[] eblcHeader = new byte[8];
+            if (raf.read(eblcHeader) != 8) return 0;
+            long numSizes = readUInt32(eblcHeader, 4);
+            if (numSizes <= 0) return 0;
+
+            byte[] sizeRecord = new byte[48];
+            if (raf.read(sizeRecord) != 48) return 0;
+            return sizeRecord[44] & 0xFF;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private static int readInt32(byte[] b, int off) {
+        return ((b[off] & 0xFF) << 24) | ((b[off + 1] & 0xFF) << 16)
+                | ((b[off + 2] & 0xFF) << 8) | (b[off + 3] & 0xFF);
+    }
+
+    private static int readUInt16(byte[] b, int off) {
+        return ((b[off] & 0xFF) << 8) | (b[off + 1] & 0xFF);
+    }
+
+    private static long readUInt32(byte[] b, int off) {
+        return ((long) (b[off] & 0xFF) << 24) | ((b[off + 1] & 0xFF) << 16)
+                | ((b[off + 2] & 0xFF) << 8) | (b[off + 3] & 0xFF);
     }
 
     // --- Android-facing scan -------------------------------------------------
@@ -305,7 +452,40 @@ public final class ModManager {
         for (ModInfo m : result.mods) conflicts += m.conflictCount;
         Log.i(TAG, "mods: scan found " + result.mods.size() + " mod dir(s), " + registered
                 + " file substitution(s) registered" + (conflicts > 0 ? ", " + conflicts + " conflict(s)" : ""));
+
+        File font = findFont(root);
+        if (font != null) {
+            try {
+                android.graphics.Typeface tf = android.graphics.Typeface.createFromFile(font);
+                int ppem = fontNativePpem(font);
+                org.cocos2dx.lib.Cocos2dxBitmap.setModTypeface(tf, ppem);
+                modTypeface = tf;
+                modTypefacePpem = ppem;
+            } catch (Exception e) {
+                Log.w(TAG, "mods: could not load mod font " + font, e);
+                org.cocos2dx.lib.Cocos2dxBitmap.setModTypeface(null, 0);
+                modTypeface = null;
+                modTypefacePpem = 0;
+            }
+        } else {
+            org.cocos2dx.lib.Cocos2dxBitmap.setModTypeface(null, 0);
+            modTypeface = null;
+            modTypefacePpem = 0;
+        }
         return registered;
+    }
+
+    private static volatile android.graphics.Typeface modTypeface;
+    private static volatile int modTypefacePpem;
+
+    /** The active mod font, if one is currently loaded and registered via {@link #scan()}; {@code null} otherwise. Used by {@link com.kalenjohnson.chronoduo.PartyPanelView} so the second-screen panel's own text mirrors the field/menu font. */
+    public static android.graphics.Typeface activeTypeface() {
+        return modTypeface;
+    }
+
+    /** The active mod font's native bitmap-strike ppem (see {@link #fontNativePpem}), or {@code 0} if unknown/not a bitmap-strike font. */
+    public static int activeTypefacePpem() {
+        return modTypefacePpem;
     }
 
     // --- import ---------------------------------------------------------------
@@ -339,33 +519,320 @@ public final class ModManager {
      * {@code MyMod/Game/...} behaves the same as one built as {@code
      * Game/...} directly.
      *
+     * <p><b>Multi-archive downloads.</b> A Nexus "collection" download (e.g.
+     * Pixel Demaster) unpacks into a tree of numbered option folders (
+     * {@code 1 - Main File}, {@code 2 - Font/2.1 - SNES Font}, {@code 3 -
+     * Interface/3.1 - UI/3.1.2 - Blue UI/3.1.2.1 - Battle Gauges}, ...),
+     * each a mutually-exclusive variant packaged as its own nested {@code
+     * .ctp}/{@code .zip}. Blindly expanding every one in place (as this
+     * method used to) makes the variants overwrite each other file-by-file,
+     * which is silently wrong -- so: if the tree under a single logical
+     * root (peeling any chain of single-child wrapper folders, e.g. the
+     * outer "Chrono Trigger Pixel Demaster/" folder) contains more than one
+     * nested archive, each is expanded into its OWN mod directory instead,
+     * named {@code "<name> - <option folder path>"} (each path segment's
+     * leading numeric prefix, e.g. {@code "3.1.2.1 - "}, stripped; an
+     * archive sitting directly at the logical root uses its own base name
+     * instead of a folder path). Only the sub-mod whose name contains
+     * "main" (case-insensitive) starts enabled; if none does, the
+     * alphabetically first one does; the rest get a {@code .disabled}
+     * marker. Every sub-mod also gets a {@code .group} file naming the
+     * download, for future UI grouping. A single nested archive (the common
+     * case -- one author, one {@code .ctp}) keeps today's one-mod-in-place
+     * behavior exactly.
+     *
+     * <p>Loose files with no possible use on this platform ({@code
+     * .xdelta} -- Steam-exe-only binary patches) are deleted from every mod
+     * directory this produces, so they never get swept into a mod's
+     * archive-substitution set by {@link #collect}. Any {@code
+     * string_N.bin} sitting at a mod's root is decrypted to a font (see
+     * {@link #processFonts}) rather than left as a loose file.
+     *
      * <p>Pure Java I/O -- no Android dependency -- so this can run on a
      * plain JVM.
      *
-     * @return the mod's final directory ({@code <modsRoot>/<name>})
+     * @return the created mod director{y,ies}, see {@link ImportResult}
      */
-    public static File extractZip(InputStream in, File modsRoot, String name) throws IOException {
-        File finalDir = new File(modsRoot, name);
+    public static ImportResult extractZip(InputStream in, File modsRoot, String name) throws IOException {
         File stagingDir = new File(modsRoot, name + ".tmp");
         deleteRecursive(stagingDir);
         if (!stagingDir.mkdirs() && !stagingDir.isDirectory()) {
             throw new IOException("cannot create staging directory " + stagingDir);
         }
-        boolean ok = false;
         try {
             try (ZipInputStream zis = new ZipInputStream(in)) {
                 unzipInto(zis, stagingDir);
             }
-            expandNestedArchives(stagingDir, 0);
             stripSingleTopFolder(stagingDir);
-            deleteRecursive(finalDir);
-            if (!stagingDir.renameTo(finalDir)) {
-                throw new IOException("could not move staged mod into place: " + finalDir);
+            File logicalRoot = findLogicalRoot(stagingDir);
+            List<File> nested = findNestedArchives(logicalRoot);
+
+            List<File> createdDirs = new ArrayList<>();
+            List<String> modNames = new ArrayList<>();
+            int enabledCount = 0;
+
+            if (nested.size() <= 1) {
+                expandNestedArchives(stagingDir, 0);
+                // Re-strip: expanding the sole nested archive can turn what
+                // was a non-wrapper-looking folder (e.g. "SNESOverworld-9-1-1/
+                // SNESOverworld.ctp", no asset root among its pre-expansion
+                // children) into one that now directly wraps Game/Localize/
+                // Extension/Sound -- exactly the case this strips.
+                stripSingleTopFolder(stagingDir);
+                deleteNonAssetLooseFiles(stagingDir);
+                processFonts(stagingDir);
+                File finalDir = new File(modsRoot, name);
+                deleteRecursive(finalDir);
+                if (!stagingDir.renameTo(finalDir)) {
+                    throw new IOException("could not move staged mod into place: " + finalDir);
+                }
+                createdDirs.add(finalDir);
+                modNames.add(finalDir.getName());
+                enabledCount = 1;
+            } else {
+                List<String> subNames = new ArrayList<>(nested.size());
+                for (File archive : nested) subNames.add(subModName(name, logicalRoot, archive));
+                int enabledIdx = pickEnabledSubMod(subNames);
+
+                for (int i = 0; i < nested.size(); i++) {
+                    File archive = nested.get(i);
+                    String subName = subNames.get(i);
+                    File finalSub = extractSubMod(modsRoot, archive, subName);
+                    writeGroup(finalSub, name);
+                    if (i == enabledIdx) {
+                        enabledCount++;
+                    } else {
+                        new File(finalSub, DISABLED_MARKER).createNewFile();
+                    }
+                    createdDirs.add(finalSub);
+                    modNames.add(subName);
+                }
+            }
+            return new ImportResult(createdDirs.get(0), modNames, enabledCount, name);
+        } finally {
+            deleteRecursive(stagingDir); // no-op if the single-mod branch already renamed it away
+        }
+    }
+
+    /** Extracts one nested archive (a sub-mod's {@code .ctp}/{@code .zip}) into {@code <modsRoot>/<subName>}, applying the same wrapper-strip/loose-file/font handling a top-level import gets. */
+    private static File extractSubMod(File modsRoot, File archive, String subName) throws IOException {
+        File subStaging = new File(modsRoot, subName + ".tmp");
+        deleteRecursive(subStaging);
+        if (!subStaging.mkdirs() && !subStaging.isDirectory()) {
+            throw new IOException("cannot create staging directory " + subStaging);
+        }
+        boolean ok = false;
+        try {
+            try (ZipInputStream zis = new ZipInputStream(new java.io.BufferedInputStream(new java.io.FileInputStream(archive)))) {
+                unzipInto(zis, subStaging);
+            }
+            stripSingleTopFolder(subStaging);
+            deleteNonAssetLooseFiles(subStaging);
+            processFonts(subStaging);
+            File finalSub = new File(modsRoot, subName);
+            deleteRecursive(finalSub);
+            if (!subStaging.renameTo(finalSub)) {
+                throw new IOException("could not move staged mod into place: " + finalSub);
             }
             ok = true;
-            return finalDir;
+            return finalSub;
         } finally {
-            if (!ok) deleteRecursive(stagingDir);
+            if (!ok) deleteRecursive(subStaging);
+        }
+    }
+
+    /** Peels a chain of single-child wrapper directories (e.g. the outer "Chrono Trigger Pixel Demaster/" folder around a multi-option Nexus download) to find the effective root against which nested-archive folder paths are computed. Does not move anything on disk -- purely for path computation. */
+    private static File findLogicalRoot(File dir) {
+        File root = dir;
+        while (true) {
+            File[] children = root.listFiles();
+            if (children != null && children.length == 1 && children[0].isDirectory()) {
+                root = children[0];
+            } else {
+                break;
+            }
+        }
+        return root;
+    }
+
+    /** Collects every {@code .ctp}/{@code .zip} anywhere under {@code dir} (dotfiles/dirs and {@code __MACOSX} skipped), sorted by path for deterministic sub-mod ordering. */
+    private static List<File> findNestedArchives(File dir) {
+        List<File> out = new ArrayList<>();
+        collectNestedArchives(dir, out);
+        out.sort(Comparator.comparing(File::getAbsolutePath));
+        return out;
+    }
+
+    private static void collectNestedArchives(File dir, List<File> out) {
+        File[] children = dir.listFiles();
+        if (children == null) return;
+        for (File c : children) {
+            String n = c.getName();
+            if (n.startsWith(".") || n.equals("__MACOSX")) continue;
+            if (c.isDirectory()) {
+                collectNestedArchives(c, out);
+                continue;
+            }
+            String lower = n.toLowerCase(Locale.ROOT);
+            if (lower.endsWith(".ctp") || lower.endsWith(".zip")) out.add(c);
+        }
+    }
+
+    /**
+     * Builds a sub-mod's directory name: {@code "<downloadName> - <folder
+     * segment> - <folder segment> - ..."}, each segment being one of {@code
+     * archive}'s parent folders relative to {@code logicalRoot} with its
+     * leading numeric prefix (e.g. {@code "3.1.2.1 - "}) stripped; if {@code
+     * archive} sits directly at {@code logicalRoot} (no parent folders),
+     * its own base name (extension stripped) is used as the sole segment
+     * instead. "/" is our conceptual separator but isn't legal in a
+     * filename, so on disk (which is also the display name -- see the
+     * class doc) every level, including the leading download name, is
+     * joined with {@code " - "}.
+     */
+    private static String subModName(String downloadName, File logicalRoot, File archive) {
+        List<String> segs = new ArrayList<>();
+        File cur = archive.getParentFile();
+        while (cur != null && !cur.equals(logicalRoot)) {
+            segs.add(0, cur.getName());
+            cur = cur.getParentFile();
+        }
+        List<String> parts = new ArrayList<>();
+        parts.add(downloadName);
+        if (segs.isEmpty()) {
+            String base = archive.getName();
+            int dot = base.lastIndexOf('.');
+            parts.add(cleanSegment(dot > 0 ? base.substring(0, dot) : base));
+        } else {
+            for (String s : segs) parts.add(cleanSegment(s));
+        }
+        return sanitizeFileNamePart(String.join(" - ", parts));
+    }
+
+    // Strips a leading "N", "N.N", "N.N.N - " ... numeric outline prefix
+    // (Nexus's FOMOD-style option-folder naming) before the sanitize pass.
+    private static final java.util.regex.Pattern NUMERIC_PREFIX =
+            java.util.regex.Pattern.compile("^\\d+(?:\\.\\d+)*\\s*-\\s*");
+
+    private static String cleanSegment(String s) {
+        String stripped = NUMERIC_PREFIX.matcher(s.trim()).replaceFirst("");
+        return sanitizeFileNamePart(stripped.isEmpty() ? s : stripped);
+    }
+
+    /** Replaces characters illegal in an Android/Linux file name; unlike {@link #sanitizeName} this does NOT strip a trailing ".ext" -- callers here are already building one path segment, not passing through a raw file name. */
+    private static String sanitizeFileNamePart(String s) {
+        String cleaned = s.replaceAll("[\\\\/:*?\"<>|]", "_").trim();
+        return cleaned.isEmpty() ? "part" : cleaned;
+    }
+
+    /** Picks the sub-mod to start enabled: the first (in {@code subNames} order) whose name contains "main" case-insensitively, else the alphabetically first. */
+    private static int pickEnabledSubMod(List<String> subNames) {
+        for (int i = 0; i < subNames.size(); i++) {
+            if (subNames.get(i).toLowerCase(Locale.ROOT).contains("main")) return i;
+        }
+        int best = 0;
+        for (int i = 1; i < subNames.size(); i++) {
+            if (subNames.get(i).compareToIgnoreCase(subNames.get(best)) < 0) best = i;
+        }
+        return best;
+    }
+
+    /** Best-effort {@code .group} write recording {@code downloadName}, mirroring how {@link #importCatalogMod} writes {@code .source} -- a failure doesn't fail the import. */
+    private static void writeGroup(File modDir, String downloadName) {
+        try (OutputStream out = new FileOutputStream(new File(modDir, ".group"))) {
+            out.write(downloadName.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            Log.w(TAG, "mods: could not write .group for " + modDir, e);
+        }
+    }
+
+    /** Recursively deletes every file under {@code dir} whose extension is in {@link #NON_ASSET_EXTENSIONS} (currently just {@code .xdelta} -- Steam-exe-only patches; see the class doc). */
+    private static void deleteNonAssetLooseFiles(File dir) {
+        File[] children = dir.listFiles();
+        if (children == null) return;
+        for (File c : children) {
+            if (c.isDirectory()) {
+                deleteNonAssetLooseFiles(c);
+                continue;
+            }
+            String n = c.getName();
+            int dot = n.lastIndexOf('.');
+            if (dot < 0) continue;
+            if (NON_ASSET_EXTENSIONS.contains(n.substring(dot + 1).toLowerCase(Locale.ROOT))) c.delete();
+        }
+    }
+
+    /**
+     * Decrypts every {@code string_N.bin} at {@code modDir}'s root (a Steam
+     * font patch payload -- see {@link
+     * com.kalenjohnson.chronoduo.saveimport.CtContainer}, which uses the
+     * same container scheme as a save file) into a font file, then deletes
+     * the {@code .bin}: the lowest-numbered one becomes {@code font.ttf}
+     * (the mod's default font -- see {@link #findFont}), any others become
+     * {@code font_N.ttf} (named after their own N, kept for a future "pick
+     * a variant" UI but not otherwise used yet). A {@code .bin} that
+     * doesn't decrypt to a recognizable TTF/OTF (bad key guess, corrupt
+     * download, wrong file) is logged and dropped -- nothing is written for
+     * it, per the class doc's "on failure, keep nothing".
+     */
+    private static void processFonts(File modDir) {
+        File[] children = modDir.listFiles();
+        if (children == null) return;
+        List<File> binFiles = new ArrayList<>();
+        for (File f : children) {
+            if (f.isFile() && STRING_BIN.matcher(f.getName()).matches()) binFiles.add(f);
+        }
+        if (binFiles.isEmpty()) return;
+        binFiles.sort(Comparator.comparingInt(ModManager::binIndex));
+
+        boolean wroteDefault = false;
+        for (File bin : binFiles) {
+            try {
+                byte[] data = readAllBytes(bin);
+                // decryptToPlaintext, NOT decrypt(): the latter also strips
+                // a trailing u32 LE length word that only save-container
+                // payloads carry (nsCrypt::Manager's encrypt() trailer) --
+                // a font patch's string_N.bin is just the raw TTF bytes
+                // Blowfish-CBC'd with no such trailer (verified against
+                // tools/saves/ctcrypto.py's decrypt(), which does the same
+                // plain CBC-decrypt-and-return with no length unwrap).
+                byte[] decrypted = com.kalenjohnson.chronoduo.saveimport.CtContainer.decryptToPlaintext(data);
+                if (looksLikeFont(decrypted)) {
+                    String outName = !wroteDefault ? "font.ttf" : "font_" + binIndex(bin) + ".ttf";
+                    try (OutputStream out = new FileOutputStream(new File(modDir, outName))) {
+                        out.write(decrypted);
+                    }
+                    wroteDefault = true;
+                } else {
+                    Log.w(TAG, "mods: " + bin.getName() + " did not decrypt to a recognizable font, skipping");
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "mods: could not decrypt " + bin.getName(), e);
+            }
+            bin.delete();
+        }
+    }
+
+    private static int binIndex(File bin) {
+        java.util.regex.Matcher m = STRING_BIN.matcher(bin.getName());
+        return m.matches() ? Integer.parseInt(m.group(1)) : Integer.MAX_VALUE;
+    }
+
+    /** TTF (0x00010000) / older-Mac-TTF ("true") / OTF ("OTTO") magic check on decrypted font bytes. */
+    private static boolean looksLikeFont(byte[] data) {
+        if (data.length < 4) return false;
+        if (data[0] == 0x00 && data[1] == 0x01 && data[2] == 0x00 && data[3] == 0x00) return true;
+        if (data[0] == 't' && data[1] == 'r' && data[2] == 'u' && data[3] == 'e') return true;
+        return data[0] == 'O' && data[1] == 'T' && data[2] == 'T' && data[3] == 'O';
+    }
+
+    private static byte[] readAllBytes(File f) throws IOException {
+        try (InputStream in = new java.io.FileInputStream(f)) {
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream((int) f.length());
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            return bos.toByteArray();
         }
     }
 
@@ -400,10 +867,11 @@ public final class ModManager {
      * containing {@code SNESOverworld.ctp}). A {@code .ctp} is itself a zip
      * of archive-relative paths, so any {@code .ctp}/{@code .zip} left on
      * disk after extraction is expanded in place (next to where it sat) and
-     * deleted, up to two levels deep. Several {@code .ctp} variants in one
-     * download (e.g. "with Consistent Magus" / "without") all get expanded;
-     * later ones overwrite earlier ones file-by-file, which is the best a
-     * blind importer can do -- the status line reports the file count.
+     * deleted, up to two levels deep. Only called by {@link #extractZip}
+     * when there's a single nested archive to begin with -- a download with
+     * several (e.g. Pixel Demaster's per-option {@code .ctp}s) is split
+     * into one mod directory per archive instead; see that method's class
+     * doc.
      */
     private static void expandNestedArchives(File dir, int depth) throws IOException {
         if (depth > 2) return;
@@ -481,7 +949,7 @@ public final class ModManager {
      * {@link #scan} via a lambda from the Android call site, or null to skip
      * rescanning -- e.g. from a JVM test). No Android dependency.
      */
-    public static File importArchive(InputStream in, String displayName, File modsRoot) throws IOException {
+    public static ImportResult importArchive(InputStream in, String displayName, File modsRoot) throws IOException {
         String name = sanitizeName(displayName);
         if (!modsRoot.isDirectory() && !modsRoot.mkdirs() && !modsRoot.isDirectory()) {
             throw new IOException("cannot create mods directory " + modsRoot);
@@ -497,21 +965,21 @@ public final class ModManager {
      * callers should invoke this off the main thread, mirroring {@code
      * AppActivity#importRomFromUri}/{@code #importSaveFromUri}.
      *
-     * @return the mod's final directory
+     * @return the import result (mod directories created)
      */
-    public File importArchive(Uri uri, ContentResolver resolver) throws IOException {
+    public ImportResult importArchive(Uri uri, ContentResolver resolver) throws IOException {
         String displayName = queryDisplayName(resolver, uri);
         if (displayName == null || displayName.isEmpty()) {
             String seg = uri.getLastPathSegment();
             displayName = seg != null ? seg : "mod";
         }
-        File modDir;
+        ImportResult result;
         try (InputStream in = resolver.openInputStream(uri)) {
             if (in == null) throw new IOException("could not open " + uri);
-            modDir = importArchive(in, displayName, root);
+            result = importArchive(in, displayName, root);
         }
         scan();
-        return modDir;
+        return result;
     }
 
     /**
@@ -523,7 +991,7 @@ public final class ModManager {
      * user-supplied display name. Same overwrite-existing/staging-directory
      * semantics as the sibling overload. Pure Java I/O.
      */
-    public static File importArchiveNamed(InputStream in, File modsRoot, String forcedName) throws IOException {
+    public static ImportResult importArchiveNamed(InputStream in, File modsRoot, String forcedName) throws IOException {
         if (!modsRoot.isDirectory() && !modsRoot.mkdirs() && !modsRoot.isDirectory()) {
             throw new IOException("cannot create mods directory " + modsRoot);
         }
@@ -537,23 +1005,27 @@ public final class ModManager {
      * {@code in} under this instance's mod root using the exact directory
      * name {@code id} (a catalog slug -- see {@link #importArchiveNamed}),
      * writes a {@code .source} provenance file recording {@code sourceUrl}
-     * (best-effort; a failure to write it doesn't fail the import -- {@code
-     * scan()}'s dotfile skip at the mod root already ignores it either way),
-     * then rescans.
+     * into EVERY mod directory this produces (best-effort; a failure to
+     * write it doesn't fail the import -- {@code scan()}'s dotfile skip at
+     * the mod root already ignores it either way; a multi-archive download
+     * -- see {@link #extractZip} -- can produce more than one), then
+     * rescans.
      *
-     * @return the mod's final directory
+     * @return the import result (mod directories created)
      */
-    public File importCatalogMod(InputStream in, String id, String sourceUrl) throws IOException {
-        File modDir = importArchiveNamed(in, root, id);
+    public ImportResult importCatalogMod(InputStream in, String id, String sourceUrl) throws IOException {
+        ImportResult result = importArchiveNamed(in, root, id);
         if (sourceUrl != null) {
-            try (OutputStream out = new FileOutputStream(new File(modDir, ".source"))) {
-                out.write(sourceUrl.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            } catch (IOException e) {
-                Log.w(TAG, "mods: could not write .source for " + id, e);
+            for (String modName : result.modNames) {
+                try (OutputStream out = new FileOutputStream(new File(new File(root, modName), ".source"))) {
+                    out.write(sourceUrl.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                } catch (IOException e) {
+                    Log.w(TAG, "mods: could not write .source for " + modName, e);
+                }
             }
         }
         scan();
-        return modDir;
+        return result;
     }
 
     /** Package-visible for {@code AppActivity}'s {@code .ctp} intent-filter handler, which needs the same display-name lookup this class already does for {@link #importArchive(Uri, ContentResolver)}. */

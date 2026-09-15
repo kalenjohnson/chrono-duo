@@ -254,10 +254,60 @@ public final class Cocos2dxBitmap {
         return true;
     }
 
+    // Set by com.kalenjohnson.chronoduo.mods.ModManager#scan() from the
+    // first enabled mod's font (see ModManager#findFont) -- null clears it,
+    // falling back to the game's own font selection below. Checked ahead of
+    // fontName so a font mod overrides every text style, not just the ones
+    // that would otherwise resolve to a .ttf.
+    private static volatile Typeface modTypeface;
+
+    // Native ppem of modTypeface's embedded bitmap strike (see
+    // com.kalenjohnson.chronoduo.mods.ModManager#fontNativePpem), or 0 if
+    // modTypeface is a normal scalable font (or unset). A pixel-art font
+    // baked at a fixed strike size only lands on the pixel grid when the
+    // requested size is an exact multiple of that strike's ppem; see
+    // newPaint below.
+    private static volatile int modTypefaceNativePpem;
+
+    // Sizes we've already logged, so the one-line-per-distinct-size log
+    // below doesn't spam logcat -- read once per boot to see the game's
+    // actual requested-size distribution.
+    private static final java.util.Set<Integer> loggedSizes =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<Integer>());
+
+    public static void setModTypeface(final Typeface typeface, final int nativePpem) {
+        Cocos2dxBitmap.modTypeface = typeface;
+        Cocos2dxBitmap.modTypefaceNativePpem = nativePpem;
+    }
+
     private static TextPaint newPaint(final String fontName, final int fontSize) {
         final TextPaint paint = new TextPaint();
         paint.setTextSize(fontSize);
         paint.setAntiAlias(true);
+
+        final Typeface mod = Cocos2dxBitmap.modTypeface;
+        if (mod != null) {
+            final int nativePpem = Cocos2dxBitmap.modTypefaceNativePpem;
+            int appliedSize = fontSize;
+            if (nativePpem > 0) {
+                // Bitmap-strike pixel font: outlines only land on the pixel
+                // grid at exact multiples of the strike's native ppem, so
+                // round the requested size to the nearest multiple (never
+                // below one strike) and disable anti-aliasing/subpixel
+                // positioning so the strike renders hard-edged instead of
+                // blurred.
+                appliedSize = Math.max(nativePpem, Math.round((float) fontSize / nativePpem) * nativePpem);
+                paint.setAntiAlias(false);
+                paint.setSubpixelText(false);
+            }
+            if (Cocos2dxBitmap.loggedSizes.add(fontSize)) {
+                Log.d("Cocos2dxBitmap", "newPaint mod font=" + fontName
+                        + " requestedSize=" + fontSize + " appliedSize=" + appliedSize);
+            }
+            paint.setTextSize(appliedSize);
+            paint.setTypeface(mod);
+            return paint;
+        }
 
         // Set type face for paint, now it support .ttf file.
         if (fontName.endsWith(".ttf")) {
