@@ -332,6 +332,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // reopening lands where the user left off. The prev/next hit boxes are
     // set only while drawSettingsScreen draws the corresponding arrow.
     private static final String[] SETTINGS_PAGES = {"Imports", "Graphics", "Maps", "Mods"};
+    // Mods is always the last page -- derived so nothing else needs updating
+    // if another page is ever inserted before it.
+    private static final int MODS_PAGE = SETTINGS_PAGES.length - 1;
     private int settingsPage;
     private final RectF settingsPrevHitBox = new RectF();
     private final RectF settingsNextHitBox = new RectF();
@@ -386,10 +389,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // Neutral (non-error) one-line status, e.g. "Imported 2 mods (1
     // enabled)" -- drawn in the normal body color with no prefix, unlike
     // modsError's red "error: " styling. Mirrors saveImportMessage/
-    // saveImportError's message+flag split above. Cleared whenever a new
-    // import/get starts (see setModsStatus) so a stale success line can't
-    // linger under a "working..." row and then reappear after the next
-    // attempt fails.
+    // saveImportError's message+flag split above. Kept (not cleared) while a
+    // new import/get is in flight, so a caller can push a live progress line
+    // (e.g. "Downloading... 2/5") through the same field while modsImporting
+    // is true -- see setModsStatus and drawSettingsScreen's Mods case, which
+    // draws modsMessage in place of the previous flow's fixed "working..."
+    // whenever it's non-null.
     private String modsMessage;
     private java.util.List<com.kalenjohnson.chronoduo.mods.ModManager.ModInfo> modsList =
             java.util.Collections.emptyList();
@@ -413,6 +418,11 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // requestModGet) or an installed mod's On/Off toggle (modRowDirName set
     // instead, tapping it calls onModToggled) -- never both.
     private static final int MAX_MOD_ROWS = 10;
+    // Real minimum touch-target height for a row's Get/On/Off button (dp,
+    // converted to px via dp() at draw time) -- see drawSettingsScreen's Mods
+    // case, which centers the button vertically in its (correspondingly
+    // taller) row.
+    private static final float MOD_ROW_BUTTON_H_DP = 48f;
     private final RectF[] modRowHitBoxes = new RectF[MAX_MOD_ROWS];
     private final String[] modRowDirName = new String[MAX_MOD_ROWS];
     private final String[] modRowCatalogId = new String[MAX_MOD_ROWS];
@@ -457,20 +467,20 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      * Pushes mod import progress/result to the settings screen; called from
      * AppActivity on the main thread. Mirrors {@link #setSaveImportStatus}'s
      * message+error split: {@code importing} true means a background
-     * import/get is in flight (and clears any previous {@code message}, so a
-     * stale success line can't sit under "working..." and then resurface
-     * under a later failure); false with a non-null {@code error} means the
-     * last attempt failed (shown red, "error: " prefixed); false with a
-     * non-null {@code message} and null {@code error} means it succeeded and
-     * has something worth saying (e.g. "Imported 2 mods (1 enabled)" --
-     * shown in the normal body color, no prefix; the mod list itself, via
-     * {@link #setModsList}, already shows a plain single-mod success, so
-     * {@code message} is typically null for that common case); both null
-     * means idle with nothing to report.
+     * import/get is in flight -- {@code message}, if non-null, is drawn as a
+     * live progress line in place of the generic "working..." fallback (see
+     * drawSettingsScreen's Mods case); false with a non-null {@code error}
+     * means the last attempt failed (shown red, "error: " prefixed); false
+     * with a non-null {@code message} and null {@code error} means it
+     * succeeded and has something worth saying (e.g. "Imported 2 mods (1
+     * enabled)" -- shown in the normal body color, no prefix; the mod list
+     * itself, via {@link #setModsList}, already shows a plain single-mod
+     * success, so {@code message} is typically null for that common case);
+     * both null means idle with nothing to report.
      */
     public void setModsStatus(boolean importing, String message, String error) {
         this.modsImporting = importing;
-        this.modsMessage = importing ? null : message;
+        this.modsMessage = message;
         this.modsError = error;
         invalidate();
     }
@@ -558,6 +568,54 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             shown = shown.substring(0, shown.length() - 1);
         }
         return shown + "…";
+    }
+
+    /**
+     * Greedy word-wraps {@code s} onto up to {@code maxLines} lines that
+     * each fit {@code maxW} under the {@link #text} paint's CURRENT size/
+     * typeface (caller must {@link #setText} first, exactly like {@link
+     * #ellipsize}) -- used by the Mods page's row title/summary text (see
+     * the Mods case in {@link #drawSettingsScreen}). Breaks on spaces via
+     * {@link Paint#breakText}/{@link Paint#measureText} so words are never
+     * split mid-word; a lone word wider than {@code maxW} is hard-broken
+     * (breakText's char count) since there's no space to back up to. If the
+     * text still doesn't fit in {@code maxLines} lines, the last line is
+     * {@link #ellipsize}d against the remaining (unwrapped) text so nothing
+     * drawn is silently dropped without a "…". Returns an empty array for
+     * null/blank input (the caller reserves no row space for it), otherwise
+     * 1..{@code maxLines} lines.
+     */
+    private String[] wrapLines(String s, float maxW, int maxLines) {
+        if (s == null) return new String[0];
+        String remaining = s.trim();
+        if (remaining.isEmpty()) return new String[0];
+        java.util.List<String> lines = new java.util.ArrayList<>();
+        while (lines.size() < maxLines && !remaining.isEmpty()) {
+            if (text.measureText(remaining) <= maxW) {
+                lines.add(remaining);
+                remaining = "";
+                break;
+            }
+            int fitCount = (int) text.breakText(remaining, true, maxW, null);
+            int breakAt = fitCount;
+            if (fitCount < remaining.length()) {
+                int lastSpace = remaining.lastIndexOf(' ', Math.max(0, fitCount - 1));
+                if (lastSpace > 0) breakAt = lastSpace;
+            }
+            if (breakAt <= 0) breakAt = Math.max(1, fitCount);
+            lines.add(remaining.substring(0, breakAt).trim());
+            remaining = remaining.substring(Math.min(breakAt, remaining.length())).trim();
+        }
+        if (!remaining.isEmpty()) {
+            // Ran out of lines with text left over -- fold it back onto the
+            // last line and let ellipsize crop it to fit, so truncation is
+            // always visibly marked with "…" rather than silently cut.
+            int last = lines.size() - 1;
+            String combined = lines.isEmpty() ? remaining : lines.get(last) + " " + remaining;
+            String ellipsized = ellipsize(combined, maxW);
+            if (lines.isEmpty()) lines.add(ellipsized); else lines.set(last, ellipsized);
+        }
+        return lines.toArray(new String[0]);
     }
 
     // Pixel-graphics toggle row (GOT-patches libchrono.so's Texture2D default
@@ -716,7 +774,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     public boolean onTouchEvent(MotionEvent event) {
         int action = event.getActionMasked();
         boolean modsPageActive = settingsMode
-                && Math.floorMod(settingsPage, SETTINGS_PAGES.length) == 3;
+                && Math.floorMod(settingsPage, SETTINGS_PAGES.length) == MODS_PAGE;
 
         // Mods list drag-to-scroll: a small state machine ahead of the
         // generic "DOWN-only" dispatch below since it needs MOVE and UP too.
@@ -1363,6 +1421,19 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     @Override
     public void onChronoAssetsChanged() {
         invalidate();
+    }
+
+    /**
+     * Converts a dp value to px using this view's current display density.
+     * The rest of this file sizes everything as a fraction of {@code
+     * getWidth()}/{@code getHeight()} (the panel is one fixed-aspect canvas,
+     * not a normal dp-laid-out layout), but the Mods page's row buttons are
+     * specified in absolute dp (a real minimum touch-target size, independent
+     * of how tall the panel happens to render) -- see drawSettingsScreen's
+     * Mods case.
+     */
+    private float dp(float v) {
+        return v * getResources().getDisplayMetrics().density;
     }
 
     private void setText(float size, int color, boolean bold, Paint.Align align, boolean shadow) {
@@ -2603,9 +2674,26 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 y = drawSettingsHeading(c, "Mods", left, y, h);
 
                 java.util.List<ModRow> rows = buildModRows();
-                float rowBaseH = h * 0.044f;
-                float rowNotesExtra = h * 0.014f;
-                float toggleW = w * 0.15f;
+                // Row name/summary/notes text and the row Get/On/Off button
+                // were both bumped up for legibility/touch-target size (see
+                // MOD_ROW_BUTTON_H_DP and the ~1.3x text sizes below). Each
+                // row's height is now the taller of the button's real
+                // minimum touch height (minRowH) and the actual wrapped text
+                // stack (textStackH, computed per row below from the real
+                // number of title/summary/notes lines) -- so a row with a
+                // long title/summary that wraps to 2 lines grows to fit
+                // instead of clipping or overlapping the row below it, while
+                // a short row still gets at least a full touch target.
+                float boxH = dp(MOD_ROW_BUTTON_H_DP);
+                // Minimum row height so the (also-enlarged) button always has
+                // real clearance even on a 1-line title + 1-line summary row
+                // with no notes -- the text stack can now push a row taller
+                // than this (see the wrap-driven textStackH below), but never
+                // shorter.
+                float minRowH = h * 0.02f + boxH;
+                // Wider than before so the bigger button gets real horizontal
+                // padding around its label instead of being label-width-tight.
+                float toggleW = w * 0.22f;
                 float modsBtnH = h * 0.055f;
                 // The list viewport is a FIXED rect (listTop..maxY) regardless
                 // of row count, so the status line/Import button/restart note
@@ -2613,20 +2701,63 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 // (see modScrollY). navTop/footerReserve size that fixed
                 // reserve exactly as before (status line, Import-file button,
                 // restart note, then the prev/Back/next nav row drawn after
-                // this switch).
+                // this switch). The status-line term is scaled up to match
+                // STATUS_LINE_SIZE_FRAC below.
                 float listTop = y;
                 float navTop = parchment.bottom - h * 0.09f;
-                float footerReserve = h * 0.03f /* status line */ + modsBtnH
+                float footerReserve = h * 0.03f * 1.3f /* status line, enlarged */ + modsBtnH
                         + h * 0.02f /* gaps */ + h * 0.022f /* one-line restart note */;
                 float maxY = navTop - h * 0.02f - footerReserve;
                 float viewportH = Math.max(0f, maxY - listTop);
 
+                // Row title/summary column width -- the wrap width for both
+                // title and summary text, and the max width notes still gets
+                // ellipsized against (unchanged, single line).
+                float rowTextMaxW = textW - toggleW - w * 0.02f;
+
+                // Title/summary font sizes (~1.3x the original single-line
+                // sizes, per the earlier legibility pass) -- set once here so
+                // titleLineH/summaryLineH below (Paint.ascent()/descent() at
+                // THIS size) match what the draw loop below re-applies per
+                // row via setText. Small vertical gaps between blocks
+                // (titleGap/summaryGap) are fixed regardless of line count.
+                setText(h * 0.026f, INK, true, Paint.Align.LEFT, false);
+                applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+                float titleLineH = text.descent() - text.ascent();
+                setText(h * 0.021f, inkDim, false, Paint.Align.LEFT, false);
+                float summaryLineH = text.descent() - text.ascent();
+                setText(h * 0.017f, inkDim, false, Paint.Align.LEFT, false);
+                float notesLineH = text.descent() - text.ascent();
+                float rowTopPad = h * 0.006f;
+                float titleGap = h * 0.006f;   // title block -> summary block
+                float summaryGap = h * 0.006f; // summary block -> notes line
+                float rowBottomPad = h * 0.006f;
+
+                // Word-wrap title (up to 2 lines) and summary (up to 2 lines)
+                // against rowTextMaxW now, up front, so both the row-height
+                // pass below and the draw loop further down use the exact
+                // same wrapped text -- computed once per row, not per frame
+                // twice, and guaranteed consistent between the two passes.
                 int rowCount = Math.min(rows.size(), MAX_MOD_ROWS);
+                String[][] titleLines = new String[rowCount][];
+                String[][] summaryLines = new String[rowCount][];
                 float[] rowHeights = new float[rowCount];
                 float contentH = 0f;
                 for (int i = 0; i < rowCount; i++) {
-                    boolean hasNotes = rows.get(i).notes != null && !rows.get(i).notes.isEmpty();
-                    rowHeights[i] = rowBaseH + (hasNotes ? rowNotesExtra : 0f);
+                    ModRow row = rows.get(i);
+                    setText(h * 0.026f, INK, true, Paint.Align.LEFT, false);
+                    applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+                    titleLines[i] = wrapLines(row.title, rowTextMaxW, 2);
+                    setText(h * 0.021f, inkDim, false, Paint.Align.LEFT, false);
+                    summaryLines[i] = wrapLines(row.summary, rowTextMaxW, 2);
+                    boolean hasNotes = row.notes != null && !row.notes.isEmpty();
+
+                    float textStackH = rowTopPad
+                            + titleLines[i].length * titleLineH
+                            + (summaryLines[i].length > 0 ? titleGap + summaryLines[i].length * summaryLineH : 0f)
+                            + (hasNotes ? summaryGap + notesLineH : 0f)
+                            + rowBottomPad;
+                    rowHeights[i] = Math.max(textStackH, minRowH);
                     contentH += rowHeights[i];
                 }
                 float maxScroll = Math.max(0f, contentH - viewportH);
@@ -2639,7 +2770,6 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 modViewportHeight = viewportH;
                 modListViewport.set(parchment.left, listTop, parchment.right, maxY);
 
-                float rowTextMaxW = textW - toggleW - w * 0.02f;
                 c.save();
                 c.clipRect(modListViewport);
                 float rowY = listTop - modScrollY;
@@ -2652,24 +2782,41 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                     ModRow row = rows.get(i);
                     boolean hasNotes = row.notes != null && !row.notes.isEmpty();
 
-                    setText(h * 0.020f, row.installed && !row.enabled ? inkDim : INK, true, Paint.Align.LEFT, false);
+                    // Row name/summary/notes text -- title and summary wrap
+                    // onto up to 2 lines each (see titleLines/summaryLines
+                    // above, computed once and reused here so the drawn text
+                    // always matches the row height computed from it). Each
+                    // block is laid out from its own top (blockTop, not a
+                    // baseline) so switching fonts/sizes between blocks never
+                    // carries over the wrong ascent -- baseline of a block's
+                    // first line is blockTop - ascent, same as textStackH's
+                    // computation above.
+                    float blockTop = rowTop + rowTopPad;
+
+                    setText(h * 0.026f, row.installed && !row.enabled ? inkDim : INK, true, Paint.Align.LEFT, false);
                     applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
-                    c.drawText(ellipsize(row.title, rowTextMaxW), left, rowTop + h * 0.018f, text);
+                    float baseline = blockTop - text.ascent();
+                    for (String line : titleLines[i]) {
+                        c.drawText(line, left, baseline, text);
+                        baseline += titleLineH;
+                    }
+                    blockTop += titleLines[i].length * titleLineH;
 
-                    setText(h * 0.016f, inkDim, false, Paint.Align.LEFT, false);
-                    c.drawText(ellipsize(row.summary, rowTextMaxW), left, rowTop + h * 0.033f, text);
-
-                    if (hasNotes) {
-                        setText(h * 0.013f, inkDim, false, Paint.Align.LEFT, false);
-                        c.drawText(ellipsize(row.notes, rowTextMaxW), left, rowTop + h * 0.045f, text);
+                    if (summaryLines[i].length > 0) {
+                        blockTop += titleGap;
+                        setText(h * 0.021f, inkDim, false, Paint.Align.LEFT, false);
+                        baseline = blockTop - text.ascent();
+                        for (String line : summaryLines[i]) {
+                            c.drawText(line, left, baseline, text);
+                            baseline += summaryLineH;
+                        }
+                        blockTop += summaryLines[i].length * summaryLineH;
                     }
 
-                    if (row.suffix != null) {
-                        float boxH = h * 0.028f;
-                        float suffixBoxBottom = rowTop + h * 0.003f + boxH;
-                        setText(h * 0.012f, inkDim, false, Paint.Align.CENTER, false);
-                        c.drawText(row.suffix, parchment.right - w * 0.03f - toggleW / 2f,
-                                suffixBoxBottom + h * 0.013f, text);
+                    if (hasNotes) {
+                        blockTop += summaryGap;
+                        setText(h * 0.017f, inkDim, false, Paint.Align.LEFT, false);
+                        c.drawText(ellipsize(row.notes, rowTextMaxW), left, blockTop - text.ascent(), text);
                     }
 
                     // The button texture is drawn here (inside the clip, on
@@ -2681,11 +2828,22 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                     // mid-scroll can never fire a half-seen button -- and
                     // never while modsImporting (busy scrim below, same as
                     // drawSettingsButton's own dimming elsewhere on this
-                    // page).
-                    float boxH = h * 0.028f;
+                    // page). boxH (the real ~48dp touch height) is computed
+                    // once above the loop, alongside rowBaseH. box is
+                    // centered vertically in the row so it stays clear of the
+                    // (also-enlarged) text stack on the left regardless of
+                    // whether this particular row has a notes line.
                     RectF box = modRowHitBoxes[i];
-                    box.set(parchment.right - w * 0.03f - toggleW, rowTop + h * 0.003f,
-                            parchment.right - w * 0.03f, rowTop + h * 0.003f + boxH);
+                    float boxTop = rowTop + (rowH - boxH) / 2f;
+                    box.set(parchment.right - w * 0.03f - toggleW, boxTop,
+                            parchment.right - w * 0.03f, boxTop + boxH);
+
+                    if (row.suffix != null) {
+                        setText(h * 0.012f, inkDim, false, Paint.Align.CENTER, false);
+                        c.drawText(row.suffix, parchment.right - w * 0.03f - toggleW / 2f,
+                                boxTop - h * 0.008f, text);
+                    }
+
                     String rowLabel = row.catalogId != null ? "Get" : (row.enabled ? "On" : "Off");
                     drawCommandButton(c, box, rowLabel, winTex, false);
                     if (modsImporting) {
@@ -2741,11 +2899,13 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 // exactly what made the row budget above unsafe to compute
                 // once, up front.
                 if (modsImporting) {
-                    drawSettingsBody(c, "working...", left, y, textW, h, INK);
+                    drawSettingsBody(c, modsMessage != null ? modsMessage : "working...",
+                            left, y, textW, h, INK, STATUS_LINE_SIZE_FRAC);
                 } else if (modsError != null) {
-                    drawSettingsBody(c, "error: " + modsError, left, y, textW, h, Color.rgb(150, 30, 30));
+                    drawSettingsBody(c, "error: " + modsError, left, y, textW, h,
+                            Color.rgb(150, 30, 30), STATUS_LINE_SIZE_FRAC);
                 } else if (modsMessage != null) {
-                    drawSettingsBody(c, modsMessage, left, y, textW, h, INK);
+                    drawSettingsBody(c, modsMessage, left, y, textW, h, INK, STATUS_LINE_SIZE_FRAC);
                 }
                 y += h * 0.03f;
 
@@ -2817,11 +2977,32 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     /**
      * Settings body text, word-wrapped to {@code maxW} at a small size in
      * {@code color}, starting with a baseline at {@code y}; returns the y
-     * just below the last line plus a small gap.
+     * just below the last line plus a small gap. Uses the default body text
+     * size ({@link #BODY_TEXT_SIZE_FRAC}) -- see the sized overload below for
+     * callers (e.g. the Mods page status line) that need something bigger.
      */
     private float drawSettingsBody(Canvas c, String s, float left, float y, float maxW, int h, int color) {
-        setText(h * 0.022f, color, false, Paint.Align.LEFT, false);
-        float lineH = h * 0.027f;
+        return drawSettingsBody(c, s, left, y, maxW, h, color, BODY_TEXT_SIZE_FRAC);
+    }
+
+    // drawSettingsBody's original fixed text-size fraction (of view height).
+    private static final float BODY_TEXT_SIZE_FRAC = 0.022f;
+    // Mods page status line (working.../error/success) -- ~1.3x the normal
+    // body size per the Mods-page text-size pass (row name/summary/notes and
+    // this line all got the same bump; see the row-drawing loop below).
+    private static final float STATUS_LINE_SIZE_FRAC = BODY_TEXT_SIZE_FRAC * 1.3f;
+    // drawSettingsBody's line-height was always 0.027/0.022 ~= 1.227x its
+    // text size; kept as a ratio so a bigger sizeFrac still gets proportional
+    // line spacing.
+    private static final float BODY_LINE_H_RATIO = 0.027f / BODY_TEXT_SIZE_FRAC;
+
+    /**
+     * Same as the 6-arg overload, with an explicit {@code sizeFrac} (of view
+     * height) instead of the fixed default -- see {@link #STATUS_LINE_SIZE_FRAC}.
+     */
+    private float drawSettingsBody(Canvas c, String s, float left, float y, float maxW, int h, int color, float sizeFrac) {
+        setText(h * sizeFrac, color, false, Paint.Align.LEFT, false);
+        float lineH = h * sizeFrac * BODY_LINE_H_RATIO;
         StringBuilder line = new StringBuilder();
         for (String word : s.split(" ")) {
             String candidate = line.length() == 0 ? word : line + " " + word;
