@@ -69,6 +69,14 @@ static int safe_read(const void *addr, void *out, size_t len);
 // Live overworld-map capture tick (definition at the end of this file);
 // called from nativeEnforceUiTick with the scene it already resolved.
 static void world_map_tick(void *scene);
+// WorldScene -> WorldImpl -> WorldMap resolver (defined near world_map_tick,
+// at the end of this file); forward-declared so the design-zoom re-center
+// fix (dz_fix_world_root, design zoom part 2) can use it well before its definition.
+static void *wm_resolve(void *scene);
+// Direct heap float write (defined in the fast-forward section, end of this
+// file); forward-declared so the design-zoom re-center fix can use it too --
+// see plain_write_f32's own comment for why a plain store is safe here.
+static void plain_write_f32(void *addr, float val);
 // libc++ std::string reader (defined later in the file); forward-declared so
 // the addImage/createTexture hooks below (which run well before the
 // definition) can use it, same as safe_read above.
@@ -1557,6 +1565,212 @@ static void pixel_patch_slot(uintptr_t *slot, uintptr_t *orig_value, int *orig_s
     }
 }
 
+// ---------------------------------------------------------------------------
+// Design zoom ("true widescreen"), part 1 of 2: the GLView vtable trampoline,
+// the zoom globals and the JNI entry points. Part 2 -- everything that needs
+// the scene-graph helpers defined later in this file (per-scene canvas
+// switching, the scene-factory hooks, the world-root re-centre, the field
+// scroll-limit fix) -- sits just above
+// nativeEnforceUiTick; search for "Design zoom, part 2".
+//
+// How the port lays the game out (libchrono v2.1.5, from disassembly):
+//  * AppDelegate::applicationDidFinishLaunching picks a design canvas per
+//    device aspect (568x320 points on 16:9) and derives three layout globals
+//    from it, once, at boot (0x641a68..0x641ae0):
+//      float ctr::x_offset      = (visibleW - 480)/2 + visibleOrigin.x  (44)
+//      int   ctr::x_base_offset = 156 - x_offset                        (112)
+//      Rect  ctr::gameArea      = (x_offset - 44, ., 568, .)   the 568x320 game rect
+//  * The field root node "fieldmap" (FieldMap::makeField @0x57520c, end of
+//    the function) and the world root "worldmap" (WorldMap::Init2 @0x6073b0,
+//    0x607c98..0x607ce4) are scaled (1.875, 1.6667): ONE UNIT IS ONE SNES
+//    PIXEL (not 2x), so a 568x320 canvas shows 303x192 SNES px -- the SNES
+//    frame's bottom 32 rows are simply cut off, and the party stands below
+//    the screen centre. Both roots sit at x = x_offset; the field root at
+//    y = 0, the world root at y = visibleH - 224.
+//  * FieldMap::init @0x56d6ec stores the visible height in SNES rows at
+//    FieldMap+0x34c (visibleH*192/320: 192 stock); FieldMap::Scroll,
+//    setScrollLimit and makeField derive the vertical layout from it, and
+//    FieldImpl::CheckInScreen, MsgWindow, BattleMenu, VirtualPad, ctr::
+//    SideMask all read x_offset live. The 432x224 RenderTexture windows of
+//    makeField sit centred at (128,112) under the field root: they cover
+//    root x in [-88, 344] and y in [0, 224].
+// So the port is ALREADY parameterised for a wider and taller canvas, on
+// two conditions: the canvas must be switched BEFORE a scene is built (a
+// scene laid out under one canvas must never be moved to another -- the
+// title slid to the top-right when that was tried), and the three layout
+// globals must follow the canvas. That is what part 2 does.
+//
+// Zoom values: the field zoom is capped at 7/6 -- 568*7/6 x 320*7/6 =
+// 662.7x373.3 points shows exactly 353x224 SNES px, i.e. the full SNES
+// frame plus 16:9's extra width, with the RenderTexture window covering the
+// visible area exactly (x [-48.7, 304.7] within [-88, 344], y [0, 224]).
+// Anything larger exposes rows below the 224-row window (a black band) and
+// is refused by GameState.applyDesignZoomPref. The world map is a scrolling
+// window with plenty of margin and takes any zoom; 7/6 there shows 224 rows
+// too. Zoom 1.0 for a scene type means "stock canvas" for it.
+// ---------------------------------------------------------------------------
+
+#define DESIGNZOOM_SYM_VTABLE "_ZTVN7cocos2d10GLViewImplE"
+// vptr = vtable-symbol + 0x10 (skip offset-to-top + RTTI ptr, Itanium ABI);
+// setDesignResolutionSize sits at vptr + 0xb8 (verified against both
+// GLView's and GLViewImpl's .rela.dyn R_AARCH64_ABS64 entries: GLViewImpl
+// doesn't override it, both slots hold 0x8b77b4).
+#define DESIGNZOOM_VPTR_HEADER 0x10
+#define DESIGNZOOM_SLOT_OFFSET 0xb8
+// GLView::getDesignResolutionSize() @0x8b77f8 is `add x0,x0,#0x2c; ret`:
+// the live design size (two floats) lives at GLView+0x2c.
+#define DESIGNZOOM_DESIGNSIZE_OFFSET 0x2c
+
+typedef void (*designzoom_fn)(void *thiz, float w, float h, int policy);
+
+static uintptr_t     *g_designzoom_slot;        // resolved vtable slot address
+static uintptr_t      g_designzoom_orig_value;
+static int             g_designzoom_orig_saved;
+static designzoom_fn   p_designzoom_real;       // the real setDesignResolutionSize
+
+// Zoom multipliers per scene type (1.0 == stock canvas for that type).
+static volatile float g_dz_zoom_world = 1.0f;
+static volatile float g_dz_zoom_field = 1.0f;
+
+// Captured from the game's own single boot-time setDesignResolutionSize
+// call: the live GLViewImpl and the base (stock) size/policy.
+static void   *g_designzoom_thiz;
+static float   g_designzoom_base_w;
+static float   g_designzoom_base_h;
+static int     g_designzoom_base_policy;
+static int     g_designzoom_base_captured;
+
+// Current canvas mode: DZ_STOCK / DZ_WORLD / DZ_FIELD (enum in part 2).
+// Boot is always stock.
+static volatile int g_designzoom_mode = 0;
+
+// Tunable (debug file design_zoom_field.txt, see GameState.applyDesignZoomPref):
+// field vertical scroll-limit tweak in SNES rows, added to min.y / max.y
+//   after FieldMap::setScrollLimit (part 2) -- default 0.
+static volatile float g_dz_field_ylim_lo = 0.0f;
+static volatile float g_dz_field_ylim_hi = 0.0f;
+
+static inline int designzoom_enabled(void) {
+    return g_dz_zoom_world != 1.0f || g_dz_zoom_field != 1.0f;
+}
+
+// Live design size (points) as the GLView holds it; falls back to the base.
+static void designzoom_live_size(float *w, float *h) {
+    if (g_designzoom_thiz) {
+        const float *ds = (const float *) ((const uint8_t *) g_designzoom_thiz
+                                           + DESIGNZOOM_DESIGNSIZE_OFFSET);
+        *w = ds[0];
+        *h = ds[1];
+    } else {
+        *w = g_designzoom_base_w;
+        *h = g_designzoom_base_h;
+    }
+}
+
+// Part 2 entry points, forward-declared for the JNI functions below and for
+// the battle-toggle scan (designzoom_screen_px) that sits between the two
+// parts in this file.
+static int  designzoom_hooks_install(void);
+static void designzoom_set_mode(int mode, const char *why);
+static int  designzoom_screen_px(void *node, float *px, float *py);
+
+// Trampoline installed in the vtable slot. cocos2d calls it exactly once,
+// at boot, before any scene exists: forward the game's request UNCHANGED
+// (boot is always stock) and capture thiz/base/policy for part 2's
+// designzoom_set_mode, which re-calls p_designzoom_real directly (never via
+// the slot) with a different size.
+static void hooked_setDesignResolutionSize(void *thiz, float w, float h, int policy) {
+    if (!g_designzoom_base_captured) {
+        g_designzoom_thiz = thiz;
+        g_designzoom_base_w = w;
+        g_designzoom_base_h = h;
+        g_designzoom_base_policy = policy;
+        g_designzoom_base_captured = 1;
+        g_designzoom_mode = 0;
+        LOGI("design-zoom: captured base size %.1fx%.1f policy=%d thiz=%p (boot canvas: stock; "
+             "world zoom %.4f, field zoom %.4f)",
+             (double) w, (double) h, policy, thiz, (double) g_dz_zoom_world,
+             (double) g_dz_zoom_field);
+    }
+    if (p_designzoom_real) p_designzoom_real(thiz, w, h, policy);
+}
+
+// Resolves the GLViewImpl vtable slot (once) and installs the trampoline.
+static int designzoom_install(void) {
+    if (g_designzoom_slot) return 1; // already installed
+    void *h = dlopen("libchrono.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!h) {
+        LOGE("design-zoom: libchrono.so not loaded yet");
+        return 0;
+    }
+    void *vtable_sym = dlsym(h, DESIGNZOOM_SYM_VTABLE);
+    if (!vtable_sym) {
+        LOGE("design-zoom: %s not found", DESIGNZOOM_SYM_VTABLE);
+        return 0;
+    }
+    uintptr_t *slot = (uintptr_t *) ((uint8_t *) vtable_sym
+            + DESIGNZOOM_VPTR_HEADER + DESIGNZOOM_SLOT_OFFSET);
+    uintptr_t current = *slot;
+    if (!current) {
+        LOGE("design-zoom: vtable slot at %p reads NULL, refusing to patch", (void *) slot);
+        return 0;
+    }
+    if (current == (uintptr_t) hooked_setDesignResolutionSize) {
+        LOGE("design-zoom: slot already points at our trampoline, refusing to re-patch");
+        return 0;
+    }
+    g_designzoom_slot = slot;
+    p_designzoom_real = (designzoom_fn) current;
+    pixel_patch_slot(g_designzoom_slot, &g_designzoom_orig_value, &g_designzoom_orig_saved,
+                      (uintptr_t) hooked_setDesignResolutionSize, 1);
+    LOGI("design-zoom: installed at slot %p (real fn %p)", (void *) slot, (void *) current);
+    return 1;
+}
+
+// See GameState.nativeSetDesignZoom's Javadoc: called once at boot, before
+// AppDelegate's single design-size call, from AppActivity.
+// onLoadNativeLibraries. Non-positive values are rejected without installing
+// anything; (1.0, 1.0) installs the trampoline only (a strict no-op).
+JNIEXPORT jboolean JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeSetDesignZoom(JNIEnv *env, jclass cls,
+                                                                jfloat worldZoom,
+                                                                jfloat fieldZoom) {
+    if (worldZoom <= 0.0f || fieldZoom <= 0.0f) {
+        LOGE("design-zoom: ignoring non-positive zoom (world %.3f, field %.3f)",
+             (double) worldZoom, (double) fieldZoom);
+        return JNI_FALSE;
+    }
+    g_dz_zoom_world = worldZoom;
+    g_dz_zoom_field = fieldZoom;
+    if (!designzoom_install()) return JNI_FALSE;
+    if (designzoom_enabled() && !designzoom_hooks_install()) {
+        LOGE("design-zoom: one or more scene hooks failed to install -- see the lines above; "
+             "scenes built under the wrong canvas will be laid out wrong");
+    }
+    LOGI("design-zoom: world zoom %.4f, field zoom %.4f (takes effect on next app launch)",
+         (double) worldZoom, (double) fieldZoom);
+    return JNI_TRUE;
+}
+
+// Debug tuning for the field's vertical scroll limits (part 2's
+// hooked_FieldMap_setScrollLimit): SNES rows added to min.y and max.y.
+// Applies to the next map load. Default 0/0.
+JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeSetDesignZoomFieldTune(JNIEnv *env, jclass cls,
+                                                                         jfloat ylo, jfloat yhi) {
+    g_dz_field_ylim_lo = ylo;
+    g_dz_field_ylim_hi = yhi;
+    LOGI("design-zoom: field y-limit tune lo=%.2f hi=%.2f", (double) ylo, (double) yhi);
+}
+
+// 1 when the battle toggle / list-row coordinates handed to Java are already
+// 1920x1080 game-view screen pixels (design zoom active: computed exactly
+// from the live canvas by designzoom_screen_px), 0 for the legacy summed-
+// position "worldspace" that PartySnapshot's calibrated affine expects.
+JNIEXPORT jint JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeGetBattleToggleSpace(JNIEnv *env, jclass cls) {
+    return designzoom_enabled() ? 1 : 0;
+}
 // Enables (GL_NEAREST, "pixel graphics") or disables (restores GL_LINEAR,
 // the engine's stock default) both redirects: the setAntiAliasTexParameters
 // GOT slot (Texture2D helper path) and the glTexParameteri/f GOT slots
@@ -2464,7 +2678,10 @@ static void collect_toggles_rec(void *node, int depth, int max_depth, int ancest
     int this_visible = ancestors_visible && vis;
     if (strstr(tn, "MenuItemToggle")) {
         float wx, wy;
-        if (node_world_center(node, &wx, &wy)) {
+        // Design zoom active: exact 1920x1080 screen px (see
+        // designzoom_screen_px / nativeGetBattleToggleSpace); otherwise the
+        // legacy summed-position walk PartySnapshot's affine is calibrated to.
+        if (designzoom_screen_px(node, &wx, &wy) || node_world_center(node, &wx, &wy)) {
             uint8_t selb = 0;
             uint32_t selIdx = 0;
             safe_read((uint8_t *)node + TOGGLE_SELECTED_OFFSET, &selb, 1);
@@ -2699,12 +2916,14 @@ static void battle_list_row_pos(int use_getElement, void *submenu_node,
         if (!plausible_ptr(rownode)) return;
         char tb[96];
         if (!type_name(rownode, tb, sizeof(tb))) return; // incoherent RTTI -> not a live object
+        if (designzoom_screen_px(rownode, ox, oy)) return; // zoom active: exact screen px
         node_world_center(rownode, ox, oy); // leaves *ox/*oy untouched (still NaN) on failure
         return;
     }
     if (!rc_begin || (rc_begin + i) >= rc_end) return;
     void *rownode;
     if (!safe_read(rc_begin + i, &rownode, 8) || !plausible_ptr(rownode)) return;
+    if (designzoom_screen_px(rownode, ox, oy)) return; // zoom active: exact screen px
     node_world_center(rownode, ox, oy); // leaves *ox/*oy untouched (still NaN) on failure
 }
 
@@ -3332,6 +3551,623 @@ static void enforce_battle_ui_hide(void) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Design zoom, part 2: per-scene canvas modes. See part 1 (above
+// nativeSetPixelGraphics) for the layout facts this relies on.
+//
+// Mechanism:
+//  1. SceneManager::create(int,int) @0x644498 is the one factory every game
+//     scene goes through (title, menus, field, world, shop, ...); it is
+//     called via a JUMP_SLOT, so a GOT hook on it switches the canvas to
+//     STOCK before any scene is built. FieldScene::createScene @0x755b58
+//     and WorldScene::createScene @0x782e5c (both called from inside
+//     SceneManager::create through their own JUMP_SLOTs) then switch to the
+//     FIELD / WORLD canvas before their scene is built. Every scene is
+//     therefore constructed under the canvas it will be shown on, and the
+//     layout globals (ctr::x_offset & co.) are updated with each switch, so
+//     FieldMap::init reads the right visible height, makeField/BattleMenu/
+//     MsgWindow read the right x_offset, and so on.
+//  2. Director::setNextScene (post-swap) and the per-frame tick classify the
+//     running scene by the class of its layer (WorldScene / FieldScene /
+//     other) and switch the canvas to match -- this is what handles a pop
+//     back to an existing field/world scene from a pushed menu scene.
+//  3. World root re-centre: WorldMap::Init2 places the "worldmap" root at
+//     y = visibleH - 224, i.e. anchored to the TOP of the canvas, with the
+//     party at a fixed root position -- so under a taller canvas all the
+//     extra rows appear below the party. Right after WorldScene::createScene
+//     the root is moved down by (H - baseH)/2, which centres map, sprites
+//     and everything else hanging off it together. (The field root is at
+//     y = 0 and FieldMap places the SNES frame's top row at the top of the
+//     canvas: at the 7/6 field zoom that is exactly the full 224-row frame,
+//     so no shift is needed there.)
+//  4. FieldMap::setScrollLimit(const MapInfo&) @0x570c90 (JUMP_SLOT, called
+//     from FieldMap::load) computes the horizontal clamp from a literal 44
+//     (the stock x_offset) instead of ctr::x_offset, so under a wider canvas
+//     the camera could show 25 SNES px of black past a map's left/right
+//     edge; the hook tightens min.x/max.x by (x_offset - 44)*256/480 after
+//     the real call. The vertical limits already derive from the visible
+//     size; a debug tune (g_dz_field_ylim_*) is provided in case they need
+//     a nudge on device. (An earlier WorldMap::setScroll camera nudge is
+//     gone: shifting the camera moves the map under the fixed party sprite;
+//     the root move above is the right lever.)
+// ---------------------------------------------------------------------------
+
+enum { DZ_STOCK = 0, DZ_WORLD = 1, DZ_FIELD = 2 };
+
+// Node member offsets used here (from the setters' disassembly, v2.1.5).
+#define NODE_SCALEX       0x44
+#define NODE_SCALEY       0x48
+#define NODE_IGNOREANCHOR 0x1fa
+
+static const char *dz_mode_name(int m) {
+    return m == DZ_WORLD ? "world" : m == DZ_FIELD ? "field" : "stock";
+}
+
+static float dz_mode_zoom(int m) {
+    if (m == DZ_WORLD) return g_dz_zoom_world;
+    if (m == DZ_FIELD) return g_dz_zoom_field;
+    return 1.0f;
+}
+
+// libchrono's boot-derived layout globals (part 1's comment), resolved by
+// name; their boot values are captured on the first canvas switch, which
+// always happens after AppDelegate wrote them and before anything else does
+// (AppDelegate is their only writer).
+static float   *g_dz_x_offset;        // ctr::x_offset
+static int32_t *g_dz_x_base_offset;   // ctr::x_base_offset
+static float   *g_dz_gameArea;        // ctr::gameArea (Rect: x, y, w, h)
+static float    g_dz_boot_x_offset;
+static float    g_dz_boot_gameArea[4];
+static int      g_dz_boot_captured;
+
+static int dz_resolve_layout_globals(void) {
+    if (g_dz_x_offset && g_dz_x_base_offset && g_dz_gameArea) return 1;
+    void *h = dlopen("libchrono.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!h) return 0;
+    g_dz_x_offset = (float *) dlsym(h, "_ZN3ctr8x_offsetE");
+    g_dz_x_base_offset = (int32_t *) dlsym(h, "_ZN3ctr13x_base_offsetE");
+    g_dz_gameArea = (float *) dlsym(h, "_ZN3ctr8gameAreaE");
+    if (!g_dz_x_offset || !g_dz_x_base_offset || !g_dz_gameArea) {
+        LOGE("design-zoom: layout globals unresolved (x_offset=%p x_base_offset=%p gameArea=%p)",
+             (void *) g_dz_x_offset, (void *) g_dz_x_base_offset, (void *) g_dz_gameArea);
+        return 0;
+    }
+    return 1;
+}
+
+// Re-derives the three layout globals for a w x h canvas the way AppDelegate
+// derived them for the base canvas: x_offset grows by half the width delta,
+// gameArea's origin by half of both deltas (it stays 568x320 and centred),
+// x_base_offset = 156 - x_offset as in the original (fcvtzs).
+static void dz_apply_layout_globals(float w, float h) {
+    if (!dz_resolve_layout_globals()) return;
+    if (!g_dz_boot_captured) {
+        g_dz_boot_x_offset = *g_dz_x_offset;
+        memcpy(g_dz_boot_gameArea, g_dz_gameArea, sizeof(g_dz_boot_gameArea));
+        g_dz_boot_captured = 1;
+        LOGI("design-zoom: boot layout globals: x_offset=%.2f x_base_offset=%d gameArea=(%.1f,%.1f,%.1f,%.1f)",
+             (double) g_dz_boot_x_offset, (int) *g_dz_x_base_offset,
+             (double) g_dz_boot_gameArea[0], (double) g_dz_boot_gameArea[1],
+             (double) g_dz_boot_gameArea[2], (double) g_dz_boot_gameArea[3]);
+    }
+    float dx = (w - g_designzoom_base_w) * 0.5f;
+    float dy = (h - g_designzoom_base_h) * 0.5f;
+    float xo = g_dz_boot_x_offset + dx;
+    *g_dz_x_offset = xo;
+    *g_dz_x_base_offset = (int32_t) (156.0f - xo);
+    g_dz_gameArea[0] = g_dz_boot_gameArea[0] + dx;
+    g_dz_gameArea[1] = g_dz_boot_gameArea[1] + dy;
+    LOGI("design-zoom: layout globals for %.1fx%.1f: x_offset=%.2f x_base_offset=%d gameArea.xy=(%.1f,%.1f)",
+         (double) w, (double) h, (double) xo, (int) *g_dz_x_base_offset,
+         (double) g_dz_gameArea[0], (double) g_dz_gameArea[1]);
+}
+
+// Switches the live canvas to `mode`'s size (base * that mode's zoom) and
+// updates the layout globals. GL thread only. No-op when the feature is off,
+// before the boot capture, or when already in that mode. A mode whose zoom
+// is 1.0 is the stock canvas.
+static void designzoom_set_mode(int mode, const char *why) {
+    if (!designzoom_enabled()) return;
+    if (!g_designzoom_base_captured || !p_designzoom_real || !g_designzoom_thiz) return;
+    if (dz_mode_zoom(mode) == 1.0f) mode = DZ_STOCK;
+    if (mode == g_designzoom_mode) return;
+    float zoom = dz_mode_zoom(mode);
+    float w = g_designzoom_base_w * zoom;
+    float h = g_designzoom_base_h * zoom;
+    p_designzoom_real(g_designzoom_thiz, w, h, g_designzoom_base_policy);
+    g_designzoom_mode = mode;
+    dz_apply_layout_globals(w, h);
+    float lw, lh;
+    designzoom_live_size(&lw, &lh);
+    LOGI("design-zoom: mode %s (%s): canvas %.1fx%.1f (GLView now %.1fx%.1f)",
+         dz_mode_name(mode), why ? why : "?", (double) w, (double) h, (double) lw, (double) lh);
+}
+
+// Which canvas a running Scene wants: WorldScene layer -> world, FieldScene
+// layer -> field, anything else -> stock. A cocos2d TransitionScene (none
+// seen in this game, SceneManager uses Director::pushScene directly, but
+// be safe) keeps the current mode. Depth-2 RTTI search: Scene -> layer.
+static int designzoom_classify_scene(void *scene) {
+    char tb[96];
+    if (!scene) return g_designzoom_mode;
+    const char *tn = type_name(scene, tb, sizeof(tb));
+    if (tn && strstr(tn, "Transition")) return g_designzoom_mode;
+    if (find_node_by_type(scene, "WorldScene", 2)) return DZ_WORLD;
+    if (find_node_by_type(scene, "FieldScene", 2)) return DZ_FIELD;
+    return DZ_STOCK;
+}
+
+// Direct child of `node` whose cocos2d name equals `name`, or NULL.
+static void *dz_find_child_named(void *node, const char *name) {
+    if (!node || !p_node_getChildren || !p_node_getName) return NULL;
+    void *vecp = p_node_getChildren(node);
+    void *ptrs[2];
+    if (!safe_read(vecp, ptrs, 16)) return NULL;
+    void **begin = (void **) ptrs[0], **end = (void **) ptrs[1];
+    if (!plausible_any(begin) || !plausible_any(end) || end < begin
+            || (end - begin) > 512) return NULL;
+    for (void **c = begin; c < end; c++) {
+        void *child;
+        char nb[64];
+        if (!safe_read(c, &child, 8) || !plausible_ptr(child)) continue;
+        if (!vtable_in_libchrono(child)) continue;
+        const char *nm = sso_cstr(p_node_getName(child), nb, sizeof(nb));
+        if (nm[0] && strcmp(nm, name) == 0) return child;
+    }
+    return NULL;
+}
+
+// Node::setPosition(float,float) through the object's own vtable (slot
+// 0xc8, see the Node vtable map in NOTES.md).
+static void dz_node_set_position(void *node, float x, float y) {
+    void **vt;
+    if (!safe_read(node, &vt, 8) || !plausible_ptr(vt)) return;
+    void (*setpos)(void *, float, float);
+    if (!safe_read(vt + (0xc8 / 8), &setpos, 8) || !setpos) return;
+    setpos(node, x, y);
+}
+
+// Both FieldScene::init (0x755e40) and WorldScene::init (0x7830d8) add a
+// black cocos2d::LayerColor of 1136x360 pt at (-x_base_offset, 0) -- the
+// fade-to-black layer. 360 pt covers the stock 320 pt canvas with margin
+// but not a taller one (the fade left a strip at the top). Stretch every
+// LayerColor child of the scene's layer that is exactly 360 pt tall to the
+// live canvas height (Node::setContentSize, vtable+0x160, LayerColor
+// overrides it and rebuilds its quad).
+static void dz_fix_fade_layers(void *scene, const char *layer_type, const char *why) {
+    if (!scene || !p_node_getChildren) return;
+    void *layer = find_node_by_type(scene, layer_type, 2);
+    if (!layer) return;
+    float w, h;
+    designzoom_live_size(&w, &h);
+    if (h <= g_designzoom_base_h) return;
+    void *vecp = p_node_getChildren(layer);
+    void *ptrs[2];
+    if (!safe_read(vecp, ptrs, 16)) return;
+    void **begin = (void **) ptrs[0], **end = (void **) ptrs[1];
+    if (!plausible_any(begin) || !plausible_any(end) || end < begin
+            || (end - begin) > 512) return;
+    for (void **c = begin; c < end; c++) {
+        void *child;
+        char tb[96];
+        if (!safe_read(c, &child, 8) || !plausible_ptr(child)) continue;
+        if (!vtable_in_libchrono(child)) continue;
+        const char *tn = type_name(child, tb, sizeof(tb));
+        if (!tn || !strstr(tn, "LayerColor")) continue;
+        float cs[2];
+        if (!safe_read((uint8_t *) child + NODE_CONTENT, cs, 8)) continue;
+        if (cs[1] != 360.0f) continue;
+        void **vt;
+        if (!safe_read(child, &vt, 8) || !plausible_ptr(vt)) continue;
+        void (*setContentSize)(void *, const CCSize *);
+        if (!safe_read(vt + (0x160 / 8), &setContentSize, 8) || !setContentSize) continue;
+        CCSize ns = { cs[0] + 16.0f, h + 40.0f };
+        setContentSize(child, &ns);
+        float lp[2];
+        if (safe_read((uint8_t *) child + NODE_POSITION, lp, 8)) dz_node_set_position(child, lp[0] - 8.0f, lp[1]);
+        LOGI("design-zoom: %s fade layer %p (%s) %.0fx%.0f -> %.0fx%.0f", layer_type, child, why,
+             (double) cs[0], (double) cs[1], (double) ns.w, (double) ns.h);
+    }
+}
+
+// Mechanism 3: move the freshly built world root down by half the canvas
+// height delta so the party (at a fixed root position) is centred.
+static void dz_fix_world_root(void *scene, const char *why) {
+    if (g_designzoom_mode != DZ_WORLD || !scene) return;
+    float w, h;
+    designzoom_live_size(&w, &h);
+    float dy = (h - g_designzoom_base_h) * 0.5f;
+    if (dy == 0.0f) return;
+    void *wm = wm_resolve(scene);
+    if (!wm) {
+        LOGE("design-zoom: world root re-centre (%s): WorldMap not found under scene %p", why, scene);
+        return;
+    }
+    void *root = dz_find_child_named(wm, "worldmap");
+    if (!root) {
+        LOGE("design-zoom: world root re-centre (%s): no child named 'worldmap' under WorldMap %p",
+             why, wm);
+        return;
+    }
+    float pos[2];
+    if (!safe_read((uint8_t *) root + NODE_POSITION, pos, 8)) return;
+    dz_node_set_position(root, pos[0], pos[1] - dy);
+    LOGI("design-zoom: world root %p (%s) moved (%.2f,%.2f) -> (%.2f,%.2f) (dy=%.2f, canvas %.1fx%.1f)",
+         root, why, (double) pos[0], (double) pos[1], (double) pos[0], (double) (pos[1] - dy),
+         (double) dy, (double) w, (double) h);
+    // The haze: WorldMap::initWeatherMap @0x60804c builds a 256-row tile
+    // grid in a node named "weather"/"weather2" under WorldMap itself (not
+    // the root), at (0,0) scaled (1.875 or 2.34, 1.6667) -- 427 pt tall, so
+    // a canvas taller than that shows a clear band at the top. Stretch its Y
+    // scale to cover the canvas (nodes are children of WorldMap, so this
+    // is screen-space and independent of the root move).
+    static const char *const weather_names[] = { "weather", "weather2" };
+    for (size_t i = 0; i < sizeof(weather_names) / sizeof(weather_names[0]); i++) {
+        void *wn = dz_find_child_named(wm, weather_names[i]);
+        if (!wn) continue;
+        float sc[2];
+        if (!safe_read((uint8_t *) wn + NODE_SCALEX, sc, 8)) continue;
+        // Measured 2026-09-16: the tile band's top sits at ~207 node rows
+        // (WorldMap::update wraps the 2-row tiles inside a fixed window), so
+        // scale so that 200 rows reach the top of the canvas.
+        float need = h / 200.0f;
+        if (need <= sc[1]) continue;
+        void **vt;
+        if (!safe_read(wn, &vt, 8) || !plausible_ptr(vt)) continue;
+        void (*setScaleY)(void *, float);
+        if (!safe_read(vt + (0x60 / 8), &setScaleY, 8) || !setScaleY) continue; // Node::setScaleY
+        setScaleY(wn, need);
+        LOGI("design-zoom: weather node '%s' %p scaleY %.4f -> %.4f", weather_names[i], wn,
+             (double) sc[1], (double) need);
+    }
+}
+
+// ---- GOT hooks ------------------------------------------------------------
+
+// Generic JUMP_SLOT hook installer (same pattern as the pixel-gfx hooks:
+// resolve the real function, find libchrono's GOT slot for it, verify the
+// slot still holds the linker-relocated address, swap in the hook).
+static int dz_install_got_hook(const char *sym, void *hook, void **real_out,
+                               uintptr_t **slot_out, uintptr_t *orig_val, int *orig_saved) {
+    if (*slot_out) return 1;
+    void *h = dlopen("libchrono.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!h) {
+        LOGE("design-zoom: hook %s: libchrono.so not loaded yet", sym);
+        return 0;
+    }
+    void *real = dlsym(h, sym);
+    if (!real) {
+        LOGE("design-zoom: hook %s: symbol not found", sym);
+        return 0;
+    }
+    Dl_info info;
+    if (!dladdr(real, &info) || !info.dli_fbase) {
+        LOGE("design-zoom: hook %s: dladdr failed", sym);
+        return 0;
+    }
+    uintptr_t *slot = pixel_find_jump_slot((uint8_t *) info.dli_fbase, sym);
+    if (!slot) {
+        LOGE("design-zoom: hook %s: no GOT slot", sym);
+        return 0;
+    }
+    if (*slot != (uintptr_t) real) {
+        LOGE("design-zoom: hook %s: GOT slot %p holds %p, expected %p -- skipping",
+             sym, (void *) slot, (void *) *slot, real);
+        return 0;
+    }
+    *real_out = real;
+    *slot_out = slot;
+    pixel_patch_slot(slot, orig_val, orig_saved, (uintptr_t) hook, 1);
+    LOGI("design-zoom: hook %s installed at slot %p (real %p)", sym, (void *) slot, real);
+    return 1;
+}
+
+#define DZ_HOOK_STATE(name) \
+    static uintptr_t *g_dz_##name##_slot; \
+    static uintptr_t  g_dz_##name##_orig; \
+    static int        g_dz_##name##_saved;
+
+// Set by the SceneManager::create hook, cleared by the setNextScene hook:
+// while a freshly built scene is waiting to be swapped in, the per-frame
+// tick must not "correct" the canvas back to the still-running old scene's
+// mode (that would lay the old scene's last frame out wrong and, worse,
+// flip the canvas twice per transition). Expires after a while as a safety
+// net in case a created scene is never swapped in.
+static int g_dz_factory_pending;
+
+// 1. SceneManager::create(int id, int arg): stock before any scene is built.
+typedef void *(*dz_scenemanager_create_fn)(void *, void *, void *);
+static dz_scenemanager_create_fn p_dz_scenemanager_create;
+DZ_HOOK_STATE(smcreate)
+static void *hooked_SceneManager_create(void *a, void *b, void *c) {
+    LOGI("design-zoom: SceneManager::create(id=%d, arg=%d)", (int) (intptr_t) a, (int) (intptr_t) b);
+    designzoom_set_mode(DZ_STOCK, "SceneManager::create");
+    g_dz_factory_pending = 120;
+    return p_dz_scenemanager_create ? p_dz_scenemanager_create(a, b, c) : NULL;
+}
+
+// 1b. FieldScene::createScene(): field canvas before FieldMap::init runs.
+typedef void *(*dz_createscene_fn)(void);
+static dz_createscene_fn p_dz_fieldscene_create;
+DZ_HOOK_STATE(fieldcreate)
+static void *hooked_FieldScene_createScene(void) {
+    designzoom_set_mode(DZ_FIELD, "FieldScene::createScene");
+    void *scene = p_dz_fieldscene_create ? p_dz_fieldscene_create() : NULL;
+    LOGI("design-zoom: FieldScene::createScene -> scene %p under mode %s", scene,
+         dz_mode_name(g_designzoom_mode));
+    if (g_designzoom_mode == DZ_FIELD) dz_fix_fade_layers(scene, "FieldScene", "createScene");
+    return scene;
+}
+
+// 1c. WorldScene::createScene(): world canvas before WorldMap::Init2 runs,
+// then the root re-centre (mechanism 3).
+static dz_createscene_fn p_dz_worldscene_create;
+DZ_HOOK_STATE(worldcreate)
+static void *hooked_WorldScene_createScene(void) {
+    designzoom_set_mode(DZ_WORLD, "WorldScene::createScene");
+    void *scene = p_dz_worldscene_create ? p_dz_worldscene_create() : NULL;
+    LOGI("design-zoom: WorldScene::createScene -> scene %p under mode %s", scene,
+         dz_mode_name(g_designzoom_mode));
+    dz_fix_world_root(scene, "createScene");
+    if (g_designzoom_mode == DZ_WORLD) dz_fix_fade_layers(scene, "WorldScene", "createScene");
+    return scene;
+}
+
+// 2. Director::setNextScene() (no args; swaps _runningScene = _nextScene):
+// classify the new running scene after the swap. Catches every transition
+// API (replace/push/pop/runWithScene all funnel through it).
+typedef void (*dz_setnextscene_fn)(void *);
+static dz_setnextscene_fn p_dz_setnextscene;
+DZ_HOOK_STATE(nextscene)
+static void *g_designzoom_scene_ptr;   // last running Scene seen
+static void hooked_Director_setNextScene(void *thiz) {
+    if (p_dz_setnextscene) p_dz_setnextscene(thiz);
+    g_dz_factory_pending = 0;
+    if (!designzoom_enabled() || !g_designzoom_base_captured) return;
+    void *scene = find_running_scene();
+    if (!scene) return;
+    char tb[96];
+    const char *tn = type_name(scene, tb, sizeof(tb));
+    int mode = designzoom_classify_scene(scene);
+    LOGI("design-zoom: setNextScene -> scene %p (%s) wants %s (current %s)", scene,
+         tn ? tn : "?", dz_mode_name(mode), dz_mode_name(g_designzoom_mode));
+    g_designzoom_scene_ptr = scene;
+    designzoom_set_mode(mode, "setNextScene");
+}
+
+// 4. FieldMap::setScrollLimit(const MapInfo&): widen-aware horizontal clamp.
+// FieldMap layout (v2.1.5): +0x330/+0x334 map size in SNES px, +0x34c
+// visible rows, +0x350/+0x358/+0x360 the three layers' scroll Vec2s,
+// +0x378 clamp min Vec2, +0x380 clamp max Vec2.
+typedef void (*dz_setscrolllimit_fn)(void *, const void *);
+static dz_setscrolllimit_fn p_dz_setscrolllimit;
+DZ_HOOK_STATE(scrolllimit)
+static void hooked_FieldMap_setScrollLimit(void *fm, const void *mapinfo) {
+    if (p_dz_setscrolllimit) p_dz_setscrolllimit(fm, mapinfo);
+    uint8_t *f = (uint8_t *) fm;
+    int32_t mapw = 0, maph = 0, visrows = 0, mapid = 0;
+    float lim[4];
+    safe_read(f + 0x330, &mapw, 4);
+    safe_read(f + 0x334, &maph, 4);
+    safe_read(f + 0x34c, &visrows, 4);
+    safe_read(f + 0x32c, &mapid, 4);
+    if (!safe_read(f + 0x378, lim, sizeof(lim))) return;
+    float minx = lim[0], miny = lim[1], maxx = lim[2], maxy = lim[3];
+    float dxu = 0.0f;
+    if (g_designzoom_mode == DZ_FIELD && g_dz_x_offset && g_dz_boot_captured) {
+        // setScrollLimit's own s0 = (44 - originX)*256/480 assumed the stock
+        // x_offset; the extra canvas width in SNES px is what it misses.
+        dxu = (*g_dz_x_offset - g_dz_boot_x_offset) * 256.0f / 480.0f;
+    }
+    float ylo = g_dz_field_ylim_lo, yhi = g_dz_field_ylim_hi;
+    if (g_designzoom_mode == DZ_FIELD && (dxu != 0.0f || ylo != 0.0f || yhi != 0.0f)) {
+        float nminx = minx + dxu, nmaxx = maxx - dxu;
+        if (nminx > nmaxx) nminx = nmaxx = (nminx + nmaxx) * 0.5f;  // same midpoint rule as the original
+        float nminy = miny + ylo, nmaxy = maxy + yhi;
+        if (nminy > nmaxy) nminy = nmaxy = (nminy + nmaxy) * 0.5f;
+        plain_write_f32(f + 0x378, nminx);
+        plain_write_f32(f + 0x37c, nminy);
+        plain_write_f32(f + 0x380, nmaxx);
+        plain_write_f32(f + 0x384, nmaxy);
+        // Re-clamp the three layer scroll vectors the original clamped.
+        for (int off = 0x350; off <= 0x360; off += 8) {
+            float v[2];
+            if (!safe_read(f + off, v, 8)) continue;
+            float cx = v[0] < nminx ? nminx : v[0] > nmaxx ? nmaxx : v[0];
+            float cy = v[1] < nminy ? nminy : v[1] > nmaxy ? nmaxy : v[1];
+            if (cx != v[0]) plain_write_f32(f + off, cx);
+            if (cy != v[1]) plain_write_f32(f + off + 4, cy);
+        }
+        LOGI("design-zoom: setScrollLimit map=%d %dx%d visRows=%d limits x[%.1f..%.1f] y[%.1f..%.1f] -> "
+             "x[%.1f..%.1f] y[%.1f..%.1f] (dx=%.2f ylo=%.2f yhi=%.2f)",
+             mapid, mapw, maph, visrows, (double) minx, (double) maxx, (double) miny, (double) maxy,
+             (double) nminx, (double) nmaxx, (double) nminy, (double) nmaxy,
+             (double) dxu, (double) ylo, (double) yhi);
+    } else {
+        LOGI("design-zoom: setScrollLimit map=%d %dx%d visRows=%d limits x[%.1f..%.1f] y[%.1f..%.1f] (mode %s, untouched)",
+             mapid, mapw, maph, visrows, (double) minx, (double) maxx, (double) miny, (double) maxy,
+             dz_mode_name(g_designzoom_mode));
+    }
+}
+
+// WorldImpl::drawMsg() @0x63dcbc (JUMP_SLOT 0xbce0f0): shows the location
+// label (WorldMap+0x26980) at y = visibleH - 141 (234 for one id), i.e. a
+// fixed distance from the top; under the taller canvas that reads too high
+// and the 14pt label too small. After the real call, place it at the same
+// RELATIVE height it has on the stock canvas (y = H - (H - y) * H/baseH)
+// and scale it by H/baseH.
+typedef void (*dz_drawmsg_fn)(void *);
+static dz_drawmsg_fn p_dz_drawmsg;
+DZ_HOOK_STATE(drawmsg)
+#define WIMPL_WORLDMAP_OFF 0x1e78
+#define WM_MSGLABEL_OFF    0x26980
+static void hooked_WorldImpl_drawMsg(void *impl) {
+    if (p_dz_drawmsg) p_dz_drawmsg(impl);
+    if (g_designzoom_mode != DZ_WORLD) return;
+    void *wm = NULL, *label = NULL;
+    if (!safe_read((uint8_t *) impl + WIMPL_WORLDMAP_OFF, &wm, 8) || !plausible_ptr(wm)) return;
+    if (!safe_read((uint8_t *) wm + WM_MSGLABEL_OFF, &label, 8) || !plausible_ptr(label)) return;
+    if (!vtable_in_libchrono(label)) return;
+    float w, h, pos[2];
+    designzoom_live_size(&w, &h);
+    if (h <= g_designzoom_base_h || !safe_read((uint8_t *) label + NODE_POSITION, pos, 8)) return;
+    float k = h / g_designzoom_base_h;
+    float ny = h - (h - pos[1]) * k;
+    dz_node_set_position(label, pos[0], ny);
+    void **vt;
+    if (safe_read(label, &vt, 8) && plausible_ptr(vt)) {
+        void (*setScale)(void *, float);
+        if (safe_read(vt + (0x80 / 8), &setScale, 8) && setScale) setScale(label, k);
+    }
+    LOGI("design-zoom: world label %p y %.1f -> %.1f, scale %.3f", label, (double) pos[1],
+         (double) ny, (double) k);
+}
+
+// Installs every GOT hook above. Called from nativeSetDesignZoom (part 1)
+// when either zoom differs from 1.0. Each hook is independent; a failure
+// leaves that one slot untouched and is logged.
+static int designzoom_hooks_install(void) {
+    int ok = 1;
+    ok &= dz_install_got_hook("_ZN12SceneManager6createEii", (void *) hooked_SceneManager_create,
+                              (void **) &p_dz_scenemanager_create, &g_dz_smcreate_slot,
+                              &g_dz_smcreate_orig, &g_dz_smcreate_saved);
+    ok &= dz_install_got_hook("_ZN10FieldScene11createSceneEv", (void *) hooked_FieldScene_createScene,
+                              (void **) &p_dz_fieldscene_create, &g_dz_fieldcreate_slot,
+                              &g_dz_fieldcreate_orig, &g_dz_fieldcreate_saved);
+    ok &= dz_install_got_hook("_ZN10WorldScene11createSceneEv", (void *) hooked_WorldScene_createScene,
+                              (void **) &p_dz_worldscene_create, &g_dz_worldcreate_slot,
+                              &g_dz_worldcreate_orig, &g_dz_worldcreate_saved);
+    ok &= dz_install_got_hook("_ZN7cocos2d8Director12setNextSceneEv", (void *) hooked_Director_setNextScene,
+                              (void **) &p_dz_setnextscene, &g_dz_nextscene_slot,
+                              &g_dz_nextscene_orig, &g_dz_nextscene_saved);
+    ok &= dz_install_got_hook("_ZN8FieldMap14setScrollLimitERK7MapInfo", (void *) hooked_FieldMap_setScrollLimit,
+                              (void **) &p_dz_setscrolllimit, &g_dz_scrolllimit_slot,
+                              &g_dz_scrolllimit_orig, &g_dz_scrolllimit_saved);
+    ok &= dz_install_got_hook("_ZN9WorldImpl7drawMsgEv", (void *) hooked_WorldImpl_drawMsg,
+                              (void **) &p_dz_drawmsg, &g_dz_drawmsg_slot,
+                              &g_dz_drawmsg_orig, &g_dz_drawmsg_saved);
+    dz_resolve_layout_globals();
+    return ok;
+}
+
+// Per-frame classification (GL thread, from nativeEnforceUiTick): keeps the
+// canvas matched to the running scene when a transition slipped past the
+// hooks. Logs the running scene class on change only.
+static int  g_designzoom_last_logged_scene_valid;
+static char g_designzoom_last_logged_scene[96];
+
+static void designzoom_track_scene(void *scene) {
+    if (!designzoom_enabled() || !g_designzoom_base_captured) return;
+    char tb[96];
+    const char *tn = scene ? type_name(scene, tb, sizeof(tb)) : NULL;
+    const char *label = tn ? tn : "(none)";
+    if (!g_designzoom_last_logged_scene_valid
+            || strncmp(g_designzoom_last_logged_scene, label, sizeof(g_designzoom_last_logged_scene)) != 0) {
+        LOGI("design-zoom: running scene class=%s", label);
+        strncpy(g_designzoom_last_logged_scene, label, sizeof(g_designzoom_last_logged_scene) - 1);
+        g_designzoom_last_logged_scene[sizeof(g_designzoom_last_logged_scene) - 1] = 0;
+        g_designzoom_last_logged_scene_valid = 1;
+    }
+    if (g_dz_factory_pending > 0) {
+        g_dz_factory_pending--;
+        return;
+    }
+    // Diagnostic: the overworld haze ("weather" node under WorldMap, tiles
+    // repositioned every frame by WorldMap::update) -- dump its geometry a
+    // few times so its vertical band can be read off logcat.
+    static int weather_dumps, weather_tick;
+    if (g_designzoom_mode == DZ_WORLD && weather_dumps < 6 && ++weather_tick % 180 == 0) {
+        void *wm = wm_resolve(scene);
+        void *wn = wm ? dz_find_child_named(wm, "weather") : NULL;
+        if (wn) {
+            weather_dumps++;
+            float pos[2], sc[2], cs[2];
+            safe_read((uint8_t *) wn + NODE_POSITION, pos, 8);
+            safe_read((uint8_t *) wn + NODE_SCALEX, sc, 8);
+            safe_read((uint8_t *) wn + NODE_CONTENT, cs, 8);
+            LOGI("design-zoom: weather node %p pos=(%.1f,%.1f) scale=(%.3f,%.3f) size=(%.0f,%.0f)",
+                 wn, (double) pos[0], (double) pos[1], (double) sc[0], (double) sc[1],
+                 (double) cs[0], (double) cs[1]);
+            void *vecp = p_node_getChildren ? p_node_getChildren(wn) : NULL;
+            void *ptrs[2];
+            if (vecp && safe_read(vecp, ptrs, 16)) {
+                void **b = (void **) ptrs[0], **e = (void **) ptrs[1];
+                int n = 0;
+                float miny = 1e9f, maxy = -1e9f, minx = 1e9f, maxx = -1e9f;
+                for (void **c = b; c < e && n < 2048; c++, n++) {
+                    void *ch; float cp[2];
+                    if (!safe_read(c, &ch, 8) || !plausible_ptr(ch)) continue;
+                    if (!safe_read((uint8_t *) ch + NODE_POSITION, cp, 8)) continue;
+                    if (cp[1] < miny) miny = cp[1];
+                    if (cp[1] > maxy) maxy = cp[1];
+                    if (cp[0] < minx) minx = cp[0];
+                    if (cp[0] > maxx) maxx = cp[0];
+                }
+                LOGI("design-zoom:   weather tiles n=%d x[%.1f..%.1f] y[%.1f..%.1f]", n,
+                     (double) minx, (double) maxx, (double) miny, (double) maxy);
+            }
+        }
+    }
+    if (!scene) return;
+    int mode = designzoom_classify_scene(scene);
+    if (mode != g_designzoom_mode) {
+        LOGI("design-zoom: tick: scene %p (%s) wants %s, canvas is %s -- switching", scene, label,
+             dz_mode_name(mode), dz_mode_name(g_designzoom_mode));
+        g_designzoom_scene_ptr = scene;
+        designzoom_set_mode(mode, "tick");
+    }
+}
+
+// Exact 1920x1080 game-view screen position of a node's centre. cocos'
+// own Node::convertToWorldSpace @0x88c4e8 returns its Vec2 through the
+// hidden x8 (sret) register and its Mat4 temporaries the same way, so it
+// cannot be called from C (it SIGSEGVed at +112 the first time a battle
+// started). Instead walk the parent chain the way Node::getNodeToParent
+// Transform does for the untransformed case this game uses (no rotation/
+// skew on the UI chain): parent-space point = position + scale * (local -
+// anchorInPoints), with the anchor ignored when _ignoreAnchorPointForPosition
+// is set (Layers/Scenes/Menus). Offsets from the setters' disassembly:
+// _scaleX 0x44, _scaleY 0x48, _position 0x50, _anchorPoint 0x78,
+// _contentSize 0x80, _parent 0x190, _ignoreAnchorPointForPosition 0x1fa.
+// The design point is then mapped like NO_BORDER does: one uniform scale =
+// max(1920/W, 1080/H), design rect centred on the view. Only used while the
+// zoom is active; returns 0 (caller falls back to the legacy walk) otherwise
+// or when the node is not a live libchrono object.
+static int designzoom_screen_px(void *node, float *px, float *py) {
+    if (!designzoom_enabled() || !g_designzoom_thiz) return 0;
+    if (!plausible_ptr(node) || !vtable_in_libchrono(node)) return 0;
+    float cs0[2];
+    if (!safe_read((uint8_t *) node + NODE_CONTENT, cs0, 8)) return 0;
+    float pt[2] = { cs0[0] * 0.5f, cs0[1] * 0.5f };
+    void *n = node;
+    for (int i = 0; i < 16 && n; i++) {
+        float pos[2], anc[2], csz[2], sc[2];
+        uint8_t ignore = 0;
+        void *parent;
+        if (!plausible_ptr(n) || !vtable_in_libchrono(n)) return 0;
+        if (!safe_read((uint8_t *) n + NODE_POSITION, pos, 8)) return 0;
+        if (!safe_read((uint8_t *) n + NODE_ANCHOR, anc, 8)) return 0;
+        if (!safe_read((uint8_t *) n + NODE_CONTENT, csz, 8)) return 0;
+        if (!safe_read((uint8_t *) n + NODE_SCALEX, sc, 8)) return 0;
+        if (!safe_read((uint8_t *) n + NODE_IGNOREANCHOR, &ignore, 1)) return 0;
+        if (!safe_read((uint8_t *) n + NODE_PARENT, &parent, 8)) return 0;
+        float ax = ignore ? 0.0f : anc[0] * csz[0];
+        float ay = ignore ? 0.0f : anc[1] * csz[1];
+        pt[0] = pos[0] + sc[0] * (pt[0] - ax);
+        pt[1] = pos[1] + sc[1] * (pt[1] - ay);
+        n = parent;
+    }
+    float w, h;
+    designzoom_live_size(&w, &h);
+    if (w <= 0.0f || h <= 0.0f) return 0;
+    float sx = 1920.0f / w, sy = 1080.0f / h;
+    float s = sx > sy ? sx : sy;
+    float offx = (w * s - 1920.0f) * 0.5f;
+    float offy = (h * s - 1080.0f) * 0.5f;
+    *px = pt[0] * s - offx;
+    *py = 1080.0f - (pt[1] * s - offy);
+    return 1;
+}
 JNIEXPORT void JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeEnforceUiTick(JNIEnv *env, jclass cls) {
     void *scene = find_running_scene();
@@ -3340,6 +4176,7 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeEnforceUiTick(JNIEnv *env, jclas
     // Live overworld map: arms/performs the RenderTexture readback. Cheap on
     // every non-overworld frame (one shallow depth-2 type search that misses).
     world_map_tick(scene);
+    designzoom_track_scene(scene);
 }
 
 // Dump whole regions to files for offline analysis (adb pull + python).

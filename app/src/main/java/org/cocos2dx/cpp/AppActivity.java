@@ -475,6 +475,12 @@ public class AppActivity extends Cocos2dxActivity {
         // System.loadLibrary("chronoduo") if that hasn't happened yet.
         boolean pixelGraphics = com.kalenjohnson.chronoduo.GameState.applyPixelGraphicsPref(this);
         Log.i(TAG, "pixel graphics: " + (pixelGraphics ? "on" : "off (or native patch failed)"));
+        // True widescreen (per-scene design canvas): must be installed here too,
+        // before nativeInit's GL surface triggers AppDelegate::
+        // applicationDidFinishLaunching's one-time setDesignResolutionSize call.
+        // See GameState.applyDesignZoomPref/nativeSetDesignZoom.
+        float designZoom = com.kalenjohnson.chronoduo.GameState.applyDesignZoomPref(this);
+        Log.i(TAG, "design zoom: " + designZoom);
     }
 
     @Override

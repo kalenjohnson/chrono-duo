@@ -119,6 +119,11 @@ public final class PartySnapshot {
     // excluded).
     private static final float CMD_MIN_X = 1200f;
     private static final float CMD_MIN_Y = 700f;
+    // Same cutoff when the native side hands over exact screen px (design
+    // zoom active, field canvas 7/6): the command column then sits at
+    // y = 819/923/1027 and the character-tab toggles at y = 726 (measured
+    // 2026-09-16), so the stock 700 cutoff would let the tabs in.
+    private static final float CMD_MIN_Y_ZOOM = 770f;
     private static final float CMD_MAX_Y = 1080f;
     private static final int CMD_MAX_TARGETS = 3;
 
@@ -360,6 +365,10 @@ public final class PartySnapshot {
             }
 
             float[] toggles = GameState.nativeGetBattleToggles();
+            // With the design zoom active the native side hands over exact
+            // 1920x1080 screen px (the stock-canvas affine below no longer
+            // applies); see GameState.nativeGetBattleToggleSpace.
+            final boolean screenPx = GameState.nativeGetBattleToggleSpace() == 1;
             // Quintuples: [x, y, visible, selected, selectedIndex] per toggle
             // -- widened from triples to carry the live selection flag (see
             // CommandTarget.selected / GameState.nativeGetBattleToggles).
@@ -368,9 +377,9 @@ public final class PartySnapshot {
                 for (int i = 0; i + 4 < toggles.length; i += 5) {
                     float vis = toggles[i + 2];
                     if (vis < 0.5f) continue;
-                    float sx = CMD_SX_A + CMD_SX_B * toggles[i];
-                    float sy = CMD_SY_A + CMD_SY_B * toggles[i + 1];
-                    if (sx > CMD_MIN_X && sy >= CMD_MIN_Y && sy <= CMD_MAX_Y) {
+                    float sx = screenPx ? toggles[i] : CMD_SX_A + CMD_SX_B * toggles[i];
+                    float sy = screenPx ? toggles[i + 1] : CMD_SY_A + CMD_SY_B * toggles[i + 1];
+                    if (sx > CMD_MIN_X && sy >= (screenPx ? CMD_MIN_Y_ZOOM : CMD_MIN_Y) && sy <= CMD_MAX_Y) {
                         // Selection signal: the game's visible highlight is the
                         // toggle's IMAGE SWAP (selectedIndex >= 1), not the
                         // transient _selected press flag (which only pulses for
@@ -411,8 +420,8 @@ public final class PartySnapshot {
                 if (base + 4 < toggles.length) {
                     snap.autoBattleAvailable = true;
                     snap.autoBattleOn = toggles[base + 4] != 0f;
-                    snap.autoBattleX = CMD_SX_A + CMD_SX_B * toggles[base];
-                    snap.autoBattleY = CMD_SY_A + CMD_SY_B * toggles[base + 1];
+                    snap.autoBattleX = screenPx ? toggles[base] : CMD_SX_A + CMD_SX_B * toggles[base];
+                    snap.autoBattleY = screenPx ? toggles[base + 1] : CMD_SY_A + CMD_SY_B * toggles[base + 1];
                 }
             }
 
@@ -431,8 +440,8 @@ public final class PartySnapshot {
                     boolean usable = list[idx + 1] >= 0.5f;
                     int extra = (int) list[idx + 2];
                     float wx = list[idx + 3], wy = list[idx + 4];
-                    float sx = Float.isNaN(wx) ? Float.NaN : CMD_SX_A + CMD_SX_B * wx;
-                    float sy = Float.isNaN(wy) ? Float.NaN : CMD_SY_A + CMD_SY_B * wy;
+                    float sx = Float.isNaN(wx) ? Float.NaN : screenPx ? wx : CMD_SX_A + CMD_SX_B * wx;
+                    float sy = Float.isNaN(wy) ? Float.NaN : screenPx ? wy : CMD_SY_A + CMD_SY_B * wy;
                     snap.listRows.add(new ListRow(id, usable, extra, sx, sy));
                 }
                 snap.listKind = kind;

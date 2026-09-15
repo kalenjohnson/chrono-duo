@@ -26,6 +26,8 @@ public final class GameState {
     // path can reach it without depending on PartyPanelView.
     private static final String PREFS_NAME = "chronoduo_prefs";
     private static final String KEY_PIXEL_GRAPHICS = "pixel_graphics";
+    private static final String KEY_DESIGN_ZOOM = "design_zoom";
+    private static final String DESIGN_ZOOM_FIELD_FILE = "design_zoom_field.txt";
 
     /**
      * GOT-patches libchrono.so's Texture2D::setAntiAliasTexParameters JUMP_SLOT
@@ -165,6 +167,131 @@ public final class GameState {
         nativeSetPixelGraphics(enable);
         nativeSetPixelDecimate(false); // decimation experiment: breaks texel-space map sampling, off until fixed
         return enable;
+    }
+
+    // --- design zoom ("true widescreen") -----------------------------------
+    // Per-scene design canvases: the stock 568x320-point canvas is enlarged
+    // by a world zoom on the overworld and by a field zoom in fields (and the
+    // battles inside them), everything else stays stock. See gamestate.c's
+    // two "Design zoom" sections for the mechanism and the layout facts.
+
+    /**
+     * The field zoom that shows exactly the full 224-row SNES frame: the
+     * field root draws SNES pixels at 1.6667 points each, so 224 rows need
+     * 373.3 points of canvas height = 320 * 7/6. Larger field zooms would
+     * expose rows below the port's 224-row scroll window (a black band), so
+     * {@link #applyDesignZoomPref} caps the field zoom here. The world map
+     * is a scrolling window and takes any zoom; at 7/6 it also shows 224
+     * rows.
+     */
+    public static final float FIELD_ZOOM_FULL_FRAME = 7f / 6f;
+
+    /**
+     * Installs the design-zoom patches: a vtable trampoline on cocos2d::GLView::
+     * setDesignResolutionSize (captures the game's base canvas at boot) and,
+     * when either zoom differs from 1.0, GOT hooks on SceneManager::create /
+     * FieldScene::createScene / WorldScene::createScene (switch the canvas
+     * before each scene is built), Director::setNextScene (re-classify after
+     * a pop), FieldMap::setScrollLimit (horizontal clamp for the wider canvas)
+     * and WorldMap::setScroll (debug camera nudge, off by default).
+     *
+     * <p><b>Takes effect only on the NEXT app launch</b>: must be called from
+     * AppActivity.onLoadNativeLibraries, before the GL surface exists, like
+     * {@link #applyPixelGraphicsPref}. {@code (1.0, 1.0)} is a strict no-op.</p>
+     *
+     * @param worldZoom canvas multiplier for WorldScene (1.0 = stock)
+     * @param fieldZoom canvas multiplier for FieldScene, incl. battles (1.0 = stock)
+     * @return whether the native patch was installed
+     */
+    public static native boolean nativeSetDesignZoom(float worldZoom, float fieldZoom);
+
+    /**
+     * Debug tuning for the field's vertical scroll limits: SNES rows added to
+     * the clamp's min.y / max.y after FieldMap::setScrollLimit. Applies on
+     * the next map load. Default 0/0.
+     */
+    public static native void nativeSetDesignZoomFieldTune(float ylo, float yhi);
+
+    /**
+     * 1 when {@link #nativeGetBattleToggles()} / {@link #nativeGetBattleList()}
+     * coordinates are already 1920x1080 game-view screen pixels (design zoom
+     * active; computed natively from the live canvas), 0 when they are the
+     * legacy "worldspace" that PartySnapshot's calibrated affine expects.
+     */
+    public static native int nativeGetBattleToggleSpace();
+
+    /** Reads the persisted design-zoom preference. Default 1.0f (stock 568x320 canvas). */
+    public static float getDesignZoomPref(Context ctx) {
+        return ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getFloat(KEY_DESIGN_ZOOM, 1.0f);
+    }
+
+    /** True when the persisted design-zoom preference is not the stock 1.0. */
+    public static boolean getTrueWidescreenPref(Context ctx) {
+        return getDesignZoomPref(ctx) != 1.0f;
+    }
+
+    /**
+     * Persists {@code zoom} for the next launch. Does NOT re-apply it to the
+     * already-running process (see {@link #nativeSetDesignZoom}'s Javadoc).
+     */
+    public static void setDesignZoomPref(Context ctx, float zoom) {
+        ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putFloat(KEY_DESIGN_ZOOM, zoom)
+                .apply();
+    }
+
+    /** World zoom the Settings toggle turns on (the field zoom is capped at {@link #FIELD_ZOOM_FULL_FRAME}). */
+    public static final float WIDESCREEN_WORLD_ZOOM = 1.4f;
+
+    /**
+     * Settings toggle: on = world {@link #WIDESCREEN_WORLD_ZOOM}, field
+     * {@link #FIELD_ZOOM_FULL_FRAME} (the full SNES frame); off = stock. Next
+     * launch.
+     */
+    public static void setTrueWidescreenPref(Context ctx, boolean on) {
+        setDesignZoomPref(ctx, on ? WIDESCREEN_WORLD_ZOOM : 1.0f);
+    }
+
+    /**
+     * Applies the persisted design-zoom preference at boot. Called from
+     * AppActivity's onLoadNativeLibraries override, before the GL surface
+     * exists (same timing as {@link #applyPixelGraphicsPref}).
+     *
+     * <p>The pref is the world zoom; the field zoom is the same value capped
+     * at {@link #FIELD_ZOOM_FULL_FRAME}. One debug file is honoured:
+     * "{@code <getExternalFilesDir(null)>/design_zoom_field.txt}" with two
+     * floats "ylo yhi" for {@link #nativeSetDesignZoomFieldTune} (a nudge
+     * for the field's vertical scroll limits, should a map edge ever show a
+     * band).</p>
+     *
+     * @return the world zoom actually applied.
+     */
+    public static float applyDesignZoomPref(Context ctx) {
+        float zoom = getDesignZoomPref(ctx);
+        float fieldZoom = Math.min(zoom, FIELD_ZOOM_FULL_FRAME);
+        float ylo = 0f, yhi = 0f;
+        java.io.File dir = ctx.getExternalFilesDir(null);
+        if (dir != null) {
+            java.io.File f = new java.io.File(dir, DESIGN_ZOOM_FIELD_FILE);
+            if (f.exists()) {
+                try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f))) {
+                    String line = r.readLine();
+                    String[] parts = line != null ? line.trim().split("\\s+") : new String[0];
+                    if (parts.length >= 2) {
+                        ylo = Float.parseFloat(parts[0]);
+                        yhi = Float.parseFloat(parts[1]);
+                    }
+                    Log.i(TAG, "design-zoom: field tune file " + f + " -> ylo=" + ylo + " yhi=" + yhi);
+                } catch (Exception e) {
+                    Log.w(TAG, "design-zoom: failed to read field tune file " + f, e);
+                }
+            }
+        }
+        nativeSetDesignZoom(zoom, fieldZoom);
+        nativeSetDesignZoomFieldTune(ylo, yhi);
+        Log.i(TAG, "design-zoom: world " + zoom + ", field " + fieldZoom);
+        return zoom;
     }
 
     public static native byte[] nativeReadChara(int idx);

@@ -46,6 +46,7 @@ final class SettingsScreen {
         this.tornPaper = view.tornPaper;
         SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         pixelGraphicsOn = GameState.getPixelGraphicsPref(context);
+        trueWidescreenOn = GameState.getTrueWidescreenPref(context);
         fogOn = prefs.getBoolean(KEY_FOG_ON, true);
     }
 
@@ -602,6 +603,13 @@ final class SettingsScreen {
     private boolean pixelGraphicsOn;
     private final RectF pixelGraphicsHitBox = new RectF();
 
+    // True widescreen toggle row (per-scene design canvas: full 224-row SNES
+    // frame in fields and on the overworld -- see GameState.
+    // setTrueWidescreenPref / gamestate.c "Design zoom"). Applies on the
+    // next app launch only, so the row just flips the pref.
+    private boolean trueWidescreenOn;
+    private final RectF trueWidescreenHitBox = new RectF();
+
     // Dungeon fog-of-war toggle row (see FogOfWar) -- same persistence/hit-
     // test shape as pixelGraphicsOn above, different key, default On (the DS
     // reveals dungeon minimaps as you walk; towns/houses are unaffected --
@@ -870,6 +878,13 @@ final class SettingsScreen {
                 pixelGraphicsOn = !pixelGraphicsOn;
                 GameState.setPixelGraphicsPref(getContext(), pixelGraphicsOn);
                 if (settingsHost != null) settingsHost.onPixelGraphicsChanged(pixelGraphicsOn);
+                invalidate();
+                return true;
+            }
+            if (!trueWidescreenHitBox.isEmpty()
+                    && trueWidescreenHitBox.contains(event.getX(), event.getY())) {
+                trueWidescreenOn = !trueWidescreenOn;
+                GameState.setTrueWidescreenPref(getContext(), trueWidescreenOn);
                 invalidate();
                 return true;
             }
@@ -1221,6 +1236,7 @@ final class SettingsScreen {
         importButtonHitBox.setEmpty();
         saveImportButtonHitBox.setEmpty();
         pixelGraphicsHitBox.setEmpty();
+        trueWidescreenHitBox.setEmpty();
         fogToggleHitBox.setEmpty();
         fogResetHitBox.setEmpty();
         origArtButtonHitBox.setEmpty();
@@ -1352,8 +1368,8 @@ final class SettingsScreen {
         // Buttons are drawn after the clip is released (they sit on top of
         // the parchment overlay); the text pass below only records where
         // each one goes.
-        RectF btnA = null, btnB = null;
-        String labelA = null, labelB = null;
+        RectF btnA = null, btnB = null, btnC = null;
+        String labelA = null, labelB = null, labelC = null;
         float btnW = Math.min(textW, w * 0.34f);
         float btnH = h * 0.07f;
 
@@ -1416,6 +1432,22 @@ final class SettingsScreen {
                 settingsFocusRects.add(btnB);
                 settingsFocusActivate.add(() -> {
                     if (!origArtBusyB && settingsHost != null) settingsHost.requestOrigArtBuild();
+                });
+                settingsFocusStepLeft.add(null);
+                settingsFocusStepRight.add(null);
+                y = btnB.bottom + h * 0.06f;
+
+                y = drawSettingsHeading(c, "True widescreen", left, y, h);
+                y = drawSettingsBody(c, "Shows the full SNES frame (all 224 rows) plus the "
+                        + "extra 16:9 width in fields, battles and on the overworld. "
+                        + "Takes effect after a game restart.",
+                        left, y, textW, h, inkDim);
+                btnC = new RectF(left, y + h * 0.01f, left + btnW, y + h * 0.01f + btnH);
+                labelC = "True widescreen: " + (trueWidescreenOn ? "On" : "Off");
+                settingsFocusRects.add(btnC);
+                settingsFocusActivate.add(() -> {
+                    trueWidescreenOn = !trueWidescreenOn;
+                    GameState.setTrueWidescreenPref(getContext(), trueWidescreenOn);
                 });
                 settingsFocusStepLeft.add(null);
                 settingsFocusStepRight.add(null);
@@ -2008,6 +2040,7 @@ final class SettingsScreen {
         } else if (page == 1) {
             drawSettingsButton(c, btnA, labelA, winTex, false, pixelGraphicsHitBox);
             drawSettingsButton(c, btnB, labelB, winTex, origArtBuilding, origArtButtonHitBox);
+            drawSettingsButton(c, btnC, labelC, winTex, false, trueWidescreenHitBox);
         } else if (page == 2) {
             drawSettingsButton(c, btnA, labelA, winTex, false, fogToggleHitBox);
             // Small text-style "Reset explored maps" action under the fog

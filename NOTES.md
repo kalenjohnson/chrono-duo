@@ -836,3 +836,111 @@ actions/fades speed up consistently (good); music tempo does not change
 render frame so a tap = `n` logic frames (same as emulator fast-forward).
 Also confirmed: every scene's `update` runs on the GL thread, so any
 per-frame native work belongs there.
+
+## Design zoom / "true widescreen" (2026-09-16, reworked later that day)
+
+Goal: show the SNES's full 224 rows plus 16:9's extra width. Shipped behind
+pref `design_zoom` (float; the Settings "True widescreen" toggle sets 7/6 or
+1.0; debug overrides `design_zoom.txt`, `design_zoom_field.txt` = "fieldZoom
+[ylo yhi]", `design_zoom_center.txt` = "kx ky ox oy"). All addresses are
+libchrono.so v2.1.5 arm64 file offsets; the lib is not on disk, pull
+`split_config.arm64_v8a.apk` from the device and `llvm-objdump -d` it.
+
+**Layout facts (the whole design rests on these):**
+- `AppDelegate::applicationDidFinishLaunching` picks the design canvas
+  (568x320 pt on 16:9) and derives, once, `ctr::x_offset = (visW-480)/2 +
+  originX` (44), `ctr::x_base_offset = 156 - x_offset` (112), `ctr::gameArea
+  = Rect(x_offset-44, ., 568, .)` (0x641a68-0x641ae0). All three are exported
+  data symbols (`_ZN3ctr8x_offsetE` etc.).
+- The field root node "fieldmap" (`FieldMap::makeField` @0x57520c, end) and
+  the world root "worldmap" (`WorldMap::Init2` @0x6073b0, 0x607c98-0x607ce4)
+  are scaled **(1.875, 1.6667): one unit is one SNES pixel** (the earlier
+  "2x" belief was wrong). 568x320 pt therefore shows 303x192 SNES px: the
+  port simply cuts the bottom 32 rows of the SNES frame (the party stands at
+  ~40% from the bottom in stock, cf. docs/screenshots/forest.webp). Roots sit
+  at x = x_offset; field root y = 0, world root y = visibleH - 224.
+- `FieldMap::init` @0x56d6ec stores visible rows at FieldMap+0x34c
+  (visH*192/320); `FieldMap::Scroll` @0x576ec8 uses it for the vertical
+  camera (`+0x354 = sy - mapH + visRows`), `makeField` for the strip layer
+  positions, `setScrollLimit` @0x570c90 reads getVisibleSize. `FieldImpl::
+  CheckInScreen` @0x59e3bc, `MsgWindow::init`, `BattleMenu::init`,
+  `VirtualPad`, `ctr::SideMask` read x_offset live (SideMask only adds side
+  sprites when x_offset > 156, i.e. canvases wider than 792 pt).
+- The 432x224 RenderTextures of makeField sit centred at (128,112) directly
+  under the field root (root x [-88,344], y [0,224]); the 640/768/dyn x256
+  strips live in four layer nodes whose position FieldMap::update sets from
+  FieldMap+0x368 (x = -64 + clamp residual, y = visRows - 256). Content is
+  drawn into the RTs relative to their bottom-left, so enlarging an RT shifts
+  its content by half the delta -- that was the displacement seen earlier;
+  the RT-resize hook is gone.
+- `FieldMap::setScroll` @0x576cd8 (x = 128 - sx, y = sy + 96 - mapH) has
+  no callers through the PLT and only sets the initial scroll; Scroll
+  rewrites +0x350/+0x354 every frame.
+- `ChipTable+0x518..0x524` (ChronoCanvas+0x13518) is the map's valid
+  metatile rectangle (x0,x1,y0,y1), used by `MapTable::CreateSprites` to
+  iterate tiles and by setScrollLimit as the clamp bounds. It is not a
+  viewport window; writer still not located (not needed).
+- World sprites are placed at fixed root positions (`WorldObject::setPos`:
+  (x+192, 224-y)); the map scroll (`WorldMap::setScroll` @0x6098cc, every
+  frame) moves the map under them. Centring must move the root, not the
+  camera.
+- Battle is a Layer under the field Scene drawing into the field layers
+  (`Battle::DrawLo/Draw(node, 224)` from FieldMap::Scroll); BattleMenu is
+  laid out from x_offset/gameArea/safeArea at battle start.
+
+**Mechanism (gamestate.c "Design zoom" parts 1 and 2):**
+1. GLViewImpl vtable slot 0xb8 (`GLView::setDesignResolutionSize`) is
+   trampolined only to capture the boot canvas; boot stays stock.
+2. Per-scene canvas modes stock/world/field. GOT hooks: `SceneManager::
+   create(int,int)` @0x644498 (the factory for every scene) switches to
+   stock before any scene is built; `FieldScene::createScene` @0x755b58 and
+   `WorldScene::createScene` @0x782e5c switch to the field/world canvas
+   before their scene is built; `Director::setNextScene` and the per-frame
+   tick classify the running scene (WorldScene / FieldScene layer at depth
+   2) to handle pops back to an existing scene. Each switch re-derives the
+   three layout globals (x_offset += (W-568)/2, gameArea origin += half the
+   deltas, x_base_offset = 156 - x_offset).
+3. World: right after createScene the "worldmap" root is moved down by
+   (H-320)/2 so the party is centred. The old setScroll dx/dy nudge is kept
+   as a debug tune, default off.
+4. Field: zoom capped at 7/6 (373.3 pt = exactly 224 rows: the RT window
+   covers the visible area exactly; larger zooms expose rows below it).
+   `FieldMap::setScrollLimit` hook tightens min.x/max.x by
+   (x_offset-44)*256/480 (the function hardcodes 44). Vertical limits are
+   left alone (logged per map; `design_zoom_field.txt` "z ylo yhi" tunes).
+5. Battles stay on the field canvas (switching mid-scene would break the
+   field built under it). Battle toggle / list-row coordinates for the
+   second screen come from `Node::convertToWorldSpace` + the live canvas
+   (`designzoom_screen_px`) as exact 1920x1080 px when the zoom is active;
+   PartySnapshot skips its stock affine (`nativeGetBattleToggleSpace`).
+
+Verified on device 2026-09-16 (walk-through by the user): fields, battles
+(mirrored command taps), overworld centring, fade, haze, location label.
+
+Follow-ups found on device, all in gamestate.c part 2:
+- Fade-to-black: FieldScene/WorldScene add a 1136x360 pt LayerColor at
+  (-x_base_offset, 0); stretched to the canvas height (+16 pt wider) after
+  createScene (`dz_fix_fade_layers`).
+- Haze: `WorldMap::initWeatherMap` @0x60802c builds a 4-column stack of
+  128x2 tiles in a node named "weather"/"weather2" under WorldMap (not the
+  root), scale (1.875 or 2.34, 1.6667); `WorldMap::update` repositions the
+  tiles every frame inside a fixed window whose top is ~207 node rows. Its
+  scaleY is set to H/200 so the band reaches the top.
+- Location label: `WorldImpl::drawMsg` @0x63dcbc (GOT) sets WorldMap+0x26980's
+  y to visibleH-141; hook re-places it at the stock relative height and
+  scales it by H/320.
+- Battle toggle screen positions: cocos' `Node::convertToWorldSpace` returns
+  through x8 (sret) and cannot be called from C (crashed); replaced by a
+  manual parent walk with scale (+0x44/+0x48) and ignoreAnchor (+0x1fa).
+  PartySnapshot's command band uses a 770 px lower cutoff in screen-px mode
+  (character tabs sit at y=726, the command column at 819/923/1027).
+- The "600 A.D." era chip is NOT a cocos node: it is SNES map content drawn
+  by the game into the world RenderTextures at the SNES frame's bottom-left,
+  so it moves with the root. Left alone. (The unnamed WorldMap node at
+  (328, (visibleH-320)/2) scaled 1.875 is something else -- do not touch.)
+- Precedence: the Settings toggle ("True widescreen", Graphics page) is the
+  only control -- on = world 1.4 / field 7/6, off = stock, next launch. The
+  design_zoom.txt / design_zoom_center.txt override files are gone; only
+  design_zoom_field.txt ("ylo yhi" scroll-limit nudge) remains.
+(The second screen's fog-of-war reveal is a fixed radius around the party on
+the minimap, a "where you've walked" trail, and is unaffected by the zoom.)
