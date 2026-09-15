@@ -68,8 +68,26 @@ android {
 dependencies {
     // required by vendored Cocos2dxDownloader (the engine FindClass()es it at nativeInit)
     implementation 'com.loopj.android:android-async-http:1.4.9'
+    // 7z extraction for mod archives (ModManager#unSevenZInto) -- xz is
+    // Commons Compress's own <optional>true</optional> LZMA/LZMA2 dependency,
+    // so it must be declared explicitly (Gradle doesn't pull Maven "optional"
+    // deps transitively); pinned to the version commons-compress 1.28.0 was
+    // built/tested against.
+    implementation 'org.apache.commons:commons-compress:1.28.0'
+    implementation 'org.tukaani:xz:1.10'
+    // RAR4 extraction (ModManager#unRarInto). junrar declares slf4j-api as a
+    // plain runtime dependency so Gradle pulls it transitively anyway, but
+    // it's pinned explicitly here since older junrar releases shipped it as
+    // provided/optional and silently dropping it is a runtime-only
+    // NoClassDefFoundError that assembleDebug can't catch.
+    implementation 'com.github.junrar:junrar:8.1.1'
+    implementation 'org.slf4j:slf4j-api:2.0.19'
     // JVM unit tests (app/src/test/java) -- pure-Java classes like ModManager
     // are deliberately Android-dependency-free so they can run here without
     // an emulator/instrumentation.
     testImplementation 'junit:junit:4.13.2'
+    // ArchiveOverlayImporterTest builds a synthetic 7z fixture with
+    // Commons Compress's SevenZOutputFile.
+    testImplementation 'org.apache.commons:commons-compress:1.28.0'
+    testImplementation 'org.tukaani:xz:1.10'
 }

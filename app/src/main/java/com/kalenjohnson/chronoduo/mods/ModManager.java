@@ -23,6 +23,12 @@ import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
+import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
+import org.apache.commons.compress.archivers.sevenz.SevenZFile;
+import com.github.junrar.Archive;
+import com.github.junrar.exception.RarException;
+import com.github.junrar.rarfile.FileHeader;
+
 /**
  * User mod loader, layered onto gamestate.c's mechanism-7 asset-substitution
  * hook (see {@code ctr::ResourceManager::getData} in gamestate.c and
@@ -83,6 +89,95 @@ public final class ModManager {
     // extractZip's class doc) -- deleted outright so they never get swept
     // into a mod's archive-substitution set by collect()/walk().
     private static final Set<String> NON_ASSET_EXTENSIONS = new HashSet<>(Collections.singletonList("xdelta"));
+
+    /**
+     * Progress notification for a (potentially multi-GB, e.g. a 4K FMV pack)
+     * archive extraction -- see {@link #extractArchiveFileInto}/{@link
+     * #unzipFileInto}/{@link #unSevenZInto}/{@link #unRarInto}. {@code
+     * totalBytes} is the best available denominator: the archive file's own
+     * size for zip/RAR (progress tracks compressed bytes consumed from that
+     * file) or the summed uncompressed entry size for 7z (Commons Compress
+     * exposes the full entry list upfront); {@code -1} if genuinely unknown.
+     * Calls are throttled to ~2/s by {@link ThrottledProgress} -- callers
+     * never need their own rate limiting.
+     */
+    public interface ProgressCallback {
+        void onProgress(long processed, long totalBytes);
+    }
+
+    /** Rate-limits a {@link ProgressCallback} to ~2 calls/sec; {@code null}-safe (a no-op delegate). */
+    private static final class ThrottledProgress {
+        private final ProgressCallback delegate;
+        private long lastMillis = -1;
+
+        ThrottledProgress(ProgressCallback delegate) {
+            this.delegate = delegate;
+        }
+
+        void report(long processed, long total, boolean force) {
+            if (delegate == null) return;
+            long now = System.currentTimeMillis();
+            if (force || lastMillis < 0 || now - lastMillis >= 500) {
+                lastMillis = now;
+                delegate.onProgress(processed, total);
+            }
+        }
+    }
+
+    /**
+     * Archive container formats {@link #sniff} recognizes from magic bytes,
+     * per the fix for the "Nexus .bin that's secretly a .7z went through
+     * ZipInputStream and silently produced a 0-file mod" failure -- see the
+     * class doc's real-world-failure list. Never route anything but {@link
+     * #ZIP} through {@link java.util.zip.ZipInputStream}.
+     */
+    enum ArchiveFormat { ZIP, ZIP_EMPTY, SEVEN_Z, RAR4, RAR5, GZIP, TAR, UNKNOWN }
+
+    /**
+     * Classifies an archive by its first {@code len} magic bytes of {@code
+     * head} (a buffer of at least 262 bytes when available -- the tar check
+     * needs the "ustar" string at offset 257). RAR5's 8-byte magic is a
+     * superset of RAR4's 7-byte prefix, so RAR5 is checked first. Returns
+     * {@link ArchiveFormat#UNKNOWN} for anything else, including a buffer
+     * too short to contain any recognized magic.
+     */
+    static ArchiveFormat sniff(byte[] head, int len) {
+        if (len >= 8 && head[0] == 'R' && head[1] == 'a' && head[2] == 'r' && head[3] == '!'
+                && (head[4] & 0xFF) == 0x1A && head[5] == 0x07 && head[6] == 0x01 && head[7] == 0x00) {
+            return ArchiveFormat.RAR5;
+        }
+        if (len >= 7 && head[0] == 'R' && head[1] == 'a' && head[2] == 'r' && head[3] == '!'
+                && (head[4] & 0xFF) == 0x1A && head[5] == 0x07 && head[6] == 0x00) {
+            return ArchiveFormat.RAR4;
+        }
+        if (len >= 6 && (head[0] & 0xFF) == 0x37 && (head[1] & 0xFF) == 0x7A && (head[2] & 0xFF) == 0xBC
+                && (head[3] & 0xFF) == 0xAF && (head[4] & 0xFF) == 0x27 && (head[5] & 0xFF) == 0x1C) {
+            return ArchiveFormat.SEVEN_Z;
+        }
+        if (len >= 4 && head[0] == 'P' && head[1] == 'K' && head[2] == 0x03 && head[3] == 0x04) {
+            return ArchiveFormat.ZIP;
+        }
+        if (len >= 4 && head[0] == 'P' && head[1] == 'K' && head[2] == 0x05 && head[3] == 0x06) {
+            return ArchiveFormat.ZIP_EMPTY;
+        }
+        if (len >= 2 && (head[0] & 0xFF) == 0x1F && (head[1] & 0xFF) == 0x8B) {
+            return ArchiveFormat.GZIP;
+        }
+        if (len >= 262 && head[257] == 'u' && head[258] == 's' && head[259] == 't' && head[260] == 'a'
+                && head[261] == 'r') {
+            return ArchiveFormat.TAR;
+        }
+        return ArchiveFormat.UNKNOWN;
+    }
+
+    static final int SNIFF_HEADER_LEN = 262;
+
+    /** Best-effort fill of {@code buf} from {@code in} -- returns the number of bytes actually available (may be less than {@code buf.length} for a short/empty file). */
+    private static int readHeaderBestEffort(InputStream in, byte[] buf) throws IOException {
+        int off = 0, n;
+        while (off < buf.length && (n = in.read(buf, off, buf.length - off)) > 0) off += n;
+        return off;
+    }
 
     /**
      * Result of {@link #extractZip}/{@link #importArchive}/{@link
@@ -204,7 +299,21 @@ public final class ModManager {
      */
     public static File resolveFromResult(ScanResult result, String archivePath) {
         if (result == null) return null;
-        String disk = result.archiveToDiskPath.get(normalizeArchivePath(archivePath));
+        String norm = normalizeArchivePath(archivePath);
+        String disk = result.archiveToDiskPath.get(norm);
+        if (disk == null) {
+            // Case-insensitive fallback for Java-side callers (the FMV
+            // override: a Steam mod shipped "007-En.dat" for the game's
+            // "007-en.dat"). The native table stays exact-case, matching the
+            // engine's own strcmp on archive paths.
+            String lower = norm.toLowerCase(Locale.ROOT);
+            for (Map.Entry<String, String> e : result.archiveToDiskPath.entrySet()) {
+                if (e.getKey().toLowerCase(Locale.ROOT).equals(lower)) {
+                    disk = e.getValue();
+                    break;
+                }
+            }
+        }
         return disk != null ? new File(disk) : null;
     }
 
@@ -272,9 +381,21 @@ public final class ModManager {
             String name = modDir.getName();
             boolean enabled = !new File(modDir, DISABLED_MARKER).isFile();
             int fileCount = 0, conflicts = 0;
+            List<String[]> files = new ArrayList<>(); // {relArchivePath, absDiskPath}
+            walk(modDir, "", files);
+            if (files.isEmpty() && !hasVisibleFile(modDir)) {
+                // A mod directory holding nothing but dotfiles (.source/.group/
+                // .disabled) is the residue of a failed import -- e.g. a 7z that
+                // an older build read as an empty zip. Listing it would show an
+                // On/Off toggle for a mod that does nothing and hide the
+                // catalog's "Get" button, so remove it and pretend it never
+                // existed. (walk() skips font.ttf and root-level readmes on
+                // purpose, hence the separate hasVisibleFile check: a font-only
+                // sub-mod is a real mod.)
+                deleteRecursive(modDir);
+                continue;
+            }
             if (enabled) {
-                List<String[]> files = new ArrayList<>(); // {relArchivePath, absDiskPath}
-                walk(modDir, "", files);
                 for (String[] pair : files) {
                     String rel = pair[0];
                     fileCount++;
@@ -554,14 +675,123 @@ public final class ModManager {
      * @return the created mod director{y,ies}, see {@link ImportResult}
      */
     public static ImportResult extractZip(InputStream in, File modsRoot, String name) throws IOException {
+        return extractZip(in, modsRoot, name, null);
+    }
+
+    /**
+     * Like {@link #extractZip(InputStream, File, String)}, but sniffs {@code
+     * in}'s magic bytes first instead of assuming zip (see {@link #sniff}):
+     * a plain zip is streamed exactly as before; anything else (7z, RAR4 --
+     * RAR5 is a clear error, not a fallback) is spooled to a temp file
+     * first, since {@link SevenZFile}/{@link Archive} both need random
+     * file access that an {@link InputStream} can't give them. {@code
+     * progress}, if non-null, is throttled to ~2 calls/sec (see {@link
+     * ThrottledProgress}) and reports bytes of the (possibly multi-GB, e.g.
+     * a 4K FMV pack) primary download consumed so far.
+     */
+    public static ImportResult extractZip(InputStream in, File modsRoot, String name, ProgressCallback progress)
+            throws IOException {
+        InputStream markable = in.markSupported() ? in : new java.io.BufferedInputStream(in, SNIFF_HEADER_LEN + 8);
+        byte[] head = new byte[SNIFF_HEADER_LEN];
+        markable.mark(SNIFF_HEADER_LEN + 8);
+        int headLen = readHeaderBestEffort(markable, head);
+        markable.reset();
+        ArchiveFormat fmt = sniff(head, headLen);
+
+        if (fmt == ArchiveFormat.ZIP) {
+            return extractFromUnpacker(dir -> {
+                try (ZipInputStream zis = new ZipInputStream(markable)) {
+                    return unzipInto(zis, dir, progress);
+                }
+            }, modsRoot, name);
+        }
+        rejectUnsupportedFormat(fmt);
+
+        // SEVEN_Z or RAR4 from here: both need a real File for random access
+        // (SevenZFile/Archive), so spool the stream to one first.
+        File tmp = File.createTempFile("modimport_", ".archive", modsRoot.getParentFile() != null
+                ? modsRoot.getParentFile() : modsRoot);
+        try {
+            try (OutputStream out = new FileOutputStream(tmp)) {
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = markable.read(buf)) > 0) out.write(buf, 0, n);
+            }
+            return importArchiveFile(tmp, modsRoot, name, progress);
+        } finally {
+            tmp.delete();
+        }
+    }
+
+    /**
+     * File-based counterpart of {@link #extractZip(InputStream, File,
+     * String, ProgressCallback)} -- sniffs {@code archiveFile} directly
+     * (no spooling needed, it's already a file) and dispatches to the
+     * matching extractor. Preferred over the {@link InputStream} overload
+     * whenever the caller already has the archive on disk (e.g. {@code
+     * AppActivity#downloadAndImportMod}'s download temp file) since it
+     * avoids an extra multi-GB copy for the 7z/RAR case and gives {@code
+     * progress} an accurate byte/entry total from the start.
+     */
+    public static ImportResult importArchiveFile(File archiveFile, File modsRoot, String name,
+                                                   ProgressCallback progress) throws IOException {
+        if (!modsRoot.isDirectory() && !modsRoot.mkdirs() && !modsRoot.isDirectory()) {
+            throw new IOException("cannot create mods directory " + modsRoot);
+        }
+        return extractFromUnpacker(dir -> extractArchiveFileInto(archiveFile, dir, progress), modsRoot, name);
+    }
+
+    /** Like {@link #importArchiveFile(File, File, String, ProgressCallback)}, but under an exact directory name (no {@link #sanitizeName} pass) -- mirrors {@link #importArchiveNamed}'s relationship to {@link #importArchive(InputStream, String, File)}. */
+    public static ImportResult importArchiveFileNamed(File archiveFile, File modsRoot, String forcedName,
+                                                        ProgressCallback progress) throws IOException {
+        if (!modsRoot.isDirectory() && !modsRoot.mkdirs() && !modsRoot.isDirectory()) {
+            throw new IOException("cannot create mods directory " + modsRoot);
+        }
+        return extractFromUnpacker(dir -> extractArchiveFileInto(archiveFile, dir, progress), modsRoot, forcedName);
+    }
+
+    private static void rejectUnsupportedFormat(ArchiveFormat fmt) throws IOException {
+        switch (fmt) {
+            case RAR5:
+                throw new IOException("RAR5 archives aren't supported; re-pack as zip/7z.");
+            case GZIP:
+            case TAR:
+                throw new IOException("gzip/tar archives aren't supported; re-pack as zip/7z.");
+            case ZIP_EMPTY:
+                throw new IOException("archive contains no files");
+            case UNKNOWN:
+                throw new IOException("unrecognized archive format (not zip/7z/rar)");
+            default:
+                // ZIP/SEVEN_Z/RAR4 are handled by the caller.
+        }
+    }
+
+    /** One step of populating a staging directory from SOME archive format -- see {@link #extractFromUnpacker}. Returns the number of regular files written. */
+    private interface Unpacker {
+        int unpackInto(File stagingDir) throws IOException;
+    }
+
+    /**
+     * Shared staging/multi-mod-split/rename pipeline behind every import
+     * entry point ({@link #extractZip}, {@link #importArchiveFile}, {@link
+     * #importArchiveFileNamed}): creates the {@code <name>.tmp} staging
+     * directory, runs {@code unpacker} to populate it, then applies the
+     * exact same wrapper-strip / multi-archive-split / loose-file / font /
+     * resources.bin-overlay handling {@link #extractZip} always has. Fails
+     * (and never creates/enables the mod dir) if the unpacker or the final
+     * tree ends up with zero regular files -- see the class doc's "Nexus
+     * .bin that's secretly a .7z" failure.
+     */
+    private static ImportResult extractFromUnpacker(Unpacker unpacker, File modsRoot, String name) throws IOException {
         File stagingDir = new File(modsRoot, name + ".tmp");
         deleteRecursive(stagingDir);
         if (!stagingDir.mkdirs() && !stagingDir.isDirectory()) {
             throw new IOException("cannot create staging directory " + stagingDir);
         }
         try {
-            try (ZipInputStream zis = new ZipInputStream(in)) {
-                unzipInto(zis, stagingDir);
+            int written = unpacker.unpackInto(stagingDir);
+            if (written <= 0) {
+                throw new IOException("archive contains no files");
             }
             stripSingleTopFolder(stagingDir);
             File logicalRoot = findLogicalRoot(stagingDir);
@@ -581,6 +811,10 @@ public final class ModManager {
                 stripSingleTopFolder(stagingDir);
                 deleteNonAssetLooseFiles(stagingDir);
                 processFonts(stagingDir);
+                applyResourcesBinOverlay(stagingDir);
+                if (countRegularFiles(stagingDir) <= 0) {
+                    throw new IOException("archive contains no files");
+                }
                 File finalDir = new File(modsRoot, name);
                 deleteRecursive(finalDir);
                 if (!stagingDir.renameTo(finalDir)) {
@@ -614,6 +848,88 @@ public final class ModManager {
         }
     }
 
+    /**
+     * If a mod archive (or resulting sub-mod) contains a file literally
+     * named {@code resources.bin} at any depth -- a full ARC1 repack, as
+     * shipped by e.g. "Orchestral Wonders" -- diffs it against the game's
+     * own archive via {@link ArchiveOverlayImporter} and replaces it with
+     * per-entry loose files. No-op if no such file exists, or if no game
+     * archive source has been registered (see {@link #setGameArchiveSource})
+     * -- e.g. under a plain JVM unit test, where this is skipped and
+     * {@code resources.bin} is left as an inert loose file (harmless: it's
+     * not a recognized archive-substitution path, so {@link #collect} would
+     * register it as a substitution for the literal path "resources.bin",
+     * which the native side never looks up).
+     */
+    private static void applyResourcesBinOverlay(File modDir) {
+        File found = findFileNamed(modDir, "resources.bin");
+        if (found == null) return;
+        ArchiveOverlayImporter.RegionSource gameSource = gameArchiveSourceFactory != null
+                ? gameArchiveSourceFactory.open() : null;
+        if (gameSource == null) {
+            Log.w(TAG, "mods: " + modDir.getName() + " ships a resources.bin repack but no game "
+                    + "archive source is registered -- leaving it as a loose file");
+            return;
+        }
+        try {
+            ArchiveOverlayImporter.Result result = ArchiveOverlayImporter.overlay(found, gameSource, modDir, null);
+            Log.i(TAG, "mods: " + modDir.getName() + " resources.bin overlay: " + result.total + " entries, "
+                    + result.added + " added, " + result.changed + " changed, " + result.identical + " identical");
+        } catch (IOException e) {
+            Log.w(TAG, "mods: resources.bin overlay failed for " + modDir.getName(), e);
+        } finally {
+            try { gameSource.close(); } catch (IOException ignored) { }
+        }
+    }
+
+    /** Depth-first search for a file named exactly {@code fileName} (case-sensitive) anywhere under {@code dir}; {@code null} if none. Dotfiles/dirs are not skipped here (unlike {@link #walk}) since {@code resources.bin} can legitimately sit inside a mod's own wrapper folder before it's stripped. */
+    private static File findFileNamed(File dir, String fileName) {
+        File[] children = dir.listFiles();
+        if (children == null) return null;
+        for (File c : children) {
+            if (c.isDirectory()) {
+                File hit = findFileNamed(c, fileName);
+                if (hit != null) return hit;
+            } else if (c.getName().equals(fileName)) {
+                return c;
+            }
+        }
+        return null;
+    }
+
+    /** Recursively counts regular files under {@code dir} -- used to reject an import that unpacked "successfully" into zero usable files (e.g. an archive that was all directories, or a resources.bin overlay that ended up empty). */
+    private static int countRegularFiles(File dir) {
+        File[] children = dir.listFiles();
+        if (children == null) return 0;
+        int n = 0;
+        for (File c : children) {
+            if (c.isDirectory()) n += countRegularFiles(c);
+            else if (c.isFile()) n++;
+        }
+        return n;
+    }
+
+    /**
+     * Factory for the game's own resources.bin, registered once from
+     * AppActivity (which has the game {@code AssetManager}) so {@link
+     * #applyResourcesBinOverlay} can diff a mod's repack against it without
+     * this otherwise-Android-free class depending on {@code AssetManager}
+     * directly. {@code null} (the default, and always the case under a JVM
+     * unit test) disables the overlay feature entirely -- see {@link
+     * #applyResourcesBinOverlay}'s doc.
+     */
+    public interface GameArchiveSourceFactory {
+        /** Opens a fresh {@link ArchiveOverlayImporter.RegionSource} over the game's resources.bin, or {@code null} if it can't be opened right now. */
+        ArchiveOverlayImporter.RegionSource open();
+    }
+
+    private static volatile GameArchiveSourceFactory gameArchiveSourceFactory;
+
+    /** Registers (or clears, with {@code null}) the game-archive source factory {@link #applyResourcesBinOverlay} uses -- call once at boot, e.g. from {@code AppActivity#onCreate}. */
+    public static void setGameArchiveSource(GameArchiveSourceFactory factory) {
+        gameArchiveSourceFactory = factory;
+    }
+
     /** Extracts one nested archive (a sub-mod's {@code .ctp}/{@code .zip}) into {@code <modsRoot>/<subName>}, applying the same wrapper-strip/loose-file/font handling a top-level import gets. */
     private static File extractSubMod(File modsRoot, File archive, String subName) throws IOException {
         File subStaging = new File(modsRoot, subName + ".tmp");
@@ -623,12 +939,14 @@ public final class ModManager {
         }
         boolean ok = false;
         try {
-            try (ZipInputStream zis = new ZipInputStream(new java.io.BufferedInputStream(new java.io.FileInputStream(archive)))) {
-                unzipInto(zis, subStaging);
+            int written = extractArchiveFileInto(archive, subStaging, null);
+            if (written <= 0) {
+                throw new IOException("archive contains no files: " + archive);
             }
             stripSingleTopFolder(subStaging);
             deleteNonAssetLooseFiles(subStaging);
             processFonts(subStaging);
+            applyResourcesBinOverlay(subStaging);
             File finalSub = new File(modsRoot, subName);
             deleteRecursive(finalSub);
             if (!subStaging.renameTo(finalSub)) {
@@ -674,7 +992,7 @@ public final class ModManager {
                 continue;
             }
             String lower = n.toLowerCase(Locale.ROOT);
-            if (lower.endsWith(".ctp") || lower.endsWith(".zip")) out.add(c);
+            if (lower.endsWith(".ctp") || lower.endsWith(".zip") || lower.endsWith(".7z")) out.add(c);
         }
     }
 
@@ -836,29 +1154,197 @@ public final class ModManager {
         }
     }
 
-    /** Extracts every regular entry of {@code zis} under {@code dir} (zip-slip checked, {@code __MACOSX} skipped). */
-    private static void unzipInto(ZipInputStream zis, File dir) throws IOException {
+    /** Extracts every regular entry of {@code zis} under {@code dir} (zip-slip checked, {@code __MACOSX} skipped). Returns the number of regular files written. No progress reporting -- used only for small nested archives (sub-mod/{@code expandNestedArchives} expansion); the multi-GB primary-download case goes through {@link #unzipFileInto}. */
+    private static int unzipInto(ZipInputStream zis, File dir) throws IOException {
+        return unzipInto(zis, dir, null);
+    }
+
+    /** Like {@link #unzipInto(ZipInputStream, File)}, reporting {@code progress} (entry count as both numerator and, since a {@link ZipInputStream} can't know the total ahead of time, denominator -- see {@link #unzipFileInto} for the byte-accurate wrapper actually used for the primary download). */
+    private static int unzipInto(ZipInputStream zis, File dir, ProgressCallback progress) throws IOException {
+        ThrottledProgress tp = new ThrottledProgress(progress);
         ZipEntry entry;
-        byte[] buf = new byte[8192];
+        int written = 0;
+        int seen = 0;
         while ((entry = zis.getNextEntry()) != null) {
-            String entryName = entry.getName();
-            if (entryName == null || entryName.isEmpty()) continue;
-            if (entryName.contains("__MACOSX/") || entryName.equals("__MACOSX")) continue;
-            if (entry.isDirectory()) continue;
-            File outFile = safeResolve(dir, entryName);
-            if (outFile == null) {
-                throw new IOException("zip entry escapes target directory: " + entryName);
-            }
-            File parent = outFile.getParentFile();
-            if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
-                throw new IOException("cannot create directory " + parent);
-            }
-            try (OutputStream out = new FileOutputStream(outFile)) {
-                int n;
-                while ((n = zis.read(buf)) > 0) out.write(buf, 0, n);
-            }
+            seen++;
+            if (writeEntryChecked(dir, entry.getName(), entry.isDirectory(), zis)) written++;
             zis.closeEntry();
+            tp.report(seen, -1, false);
         }
+        tp.report(seen, -1, true);
+        return written;
+    }
+
+    /**
+     * Shared entry-write logic for every archive extractor (zip/7z/RAR):
+     * zip-slip check (via {@link #safeResolve}), directory/{@code __MACOSX}
+     * skip, parent-directory creation. Returns {@code true} if a regular
+     * file was actually written.
+     */
+    private static boolean writeEntryChecked(File dir, String entryName, boolean isDirectory, InputStream data)
+            throws IOException {
+        if (entryName == null || entryName.isEmpty()) return false;
+        if (entryName.contains("__MACOSX/") || entryName.equals("__MACOSX")) return false;
+        if (isDirectory) return false;
+        File outFile = safeResolve(dir, entryName);
+        if (outFile == null) {
+            throw new IOException("archive entry escapes target directory: " + entryName);
+        }
+        File parent = outFile.getParentFile();
+        if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+            throw new IOException("cannot create directory " + parent);
+        }
+        try (OutputStream out = new FileOutputStream(outFile)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = data.read(buf)) > 0) out.write(buf, 0, n);
+        }
+        return true;
+    }
+
+    /**
+     * Sniffs {@code archiveFile} and dispatches to the matching extractor --
+     * the single choke point every File-based import path (the top-level
+     * {@link #extractZip}/{@link #importArchiveFile} spool, nested {@code
+     * .ctp}/{@code .zip}/{@code .7z} expansion in {@link #expandNestedArchives},
+     * and {@link #extractSubMod}) goes through, so format support only needs
+     * to be added once. Returns the number of regular files written.
+     */
+    private static int extractArchiveFileInto(File archiveFile, File dir, ProgressCallback progress) throws IOException {
+        byte[] head = new byte[SNIFF_HEADER_LEN];
+        int headLen;
+        try (InputStream probe = new java.io.FileInputStream(archiveFile)) {
+            headLen = readHeaderBestEffort(probe, head);
+        }
+        ArchiveFormat fmt = sniff(head, headLen);
+        switch (fmt) {
+            case ZIP:
+                return unzipFileInto(archiveFile, dir, progress);
+            case SEVEN_Z:
+                return unSevenZInto(archiveFile, dir, progress);
+            case RAR4:
+                return unRarInto(archiveFile, dir, progress);
+            default:
+                rejectUnsupportedFormat(fmt);
+                // rejectUnsupportedFormat always throws for every remaining
+                // case (RAR5/GZIP/TAR/ZIP_EMPTY/UNKNOWN) -- unreachable.
+                throw new IOException("unrecognized archive format (not zip/7z/rar): " + archiveFile);
+        }
+    }
+
+    /** Zip extraction from a real file, reporting byte-accurate progress (compressed bytes of {@code zipFile} consumed so far vs. its total size). */
+    private static int unzipFileInto(File zipFile, File dir, ProgressCallback progress) throws IOException {
+        long total = zipFile.length();
+        ThrottledProgress tp = new ThrottledProgress(progress);
+        long[] done = {0};
+        try (InputStream counting = new java.io.FilterInputStream(
+                new java.io.BufferedInputStream(new java.io.FileInputStream(zipFile))) {
+                    @Override public int read() throws IOException {
+                        int b = super.read();
+                        if (b >= 0) { done[0]++; tp.report(done[0], total, false); }
+                        return b;
+                    }
+                    @Override public int read(byte[] b, int off, int len) throws IOException {
+                        int n = super.read(b, off, len);
+                        if (n > 0) { done[0] += n; tp.report(done[0], total, false); }
+                        return n;
+                    }
+                };
+             ZipInputStream zis = new ZipInputStream(counting)) {
+            int written = unzipInto(zis, dir);
+            tp.report(total, total, true);
+            return written;
+        }
+    }
+
+    /**
+     * 7z extraction via Apache Commons Compress's {@link SevenZFile}, which
+     * needs random file access (LZMA2 solid blocks aren't necessarily read
+     * sequentially per entry) -- hence the {@link File} parameter rather
+     * than an {@link InputStream}. Progress is reported against the summed
+     * uncompressed size of every non-directory entry, read upfront from
+     * {@link SevenZFile#getEntries()} (cheap: that's already-parsed central
+     * directory metadata, no entry data is touched by it).
+     */
+    private static int unSevenZInto(File archiveFile, File dir, ProgressCallback progress) throws IOException {
+        ThrottledProgress tp = new ThrottledProgress(progress);
+        int written = 0;
+        try (SevenZFile szf = SevenZFile.builder().setFile(archiveFile).get()) {
+            long total = 0;
+            for (SevenZArchiveEntry e : szf.getEntries()) {
+                if (!e.isDirectory()) total += Math.max(e.getSize(), 0);
+            }
+            long done = 0;
+            SevenZArchiveEntry entry;
+            while ((entry = szf.getNextEntry()) != null) {
+                if (entry.isDirectory()) continue;
+                String entryName = entry.getName();
+                if (entryName == null || entryName.isEmpty()) continue;
+                if (entryName.contains("__MACOSX/") || entryName.equals("__MACOSX")) continue;
+                File outFile = safeResolve(dir, entryName);
+                if (outFile == null) throw new IOException("7z entry escapes target directory: " + entryName);
+                File parent = outFile.getParentFile();
+                if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+                    throw new IOException("cannot create directory " + parent);
+                }
+                try (OutputStream out = new FileOutputStream(outFile)) {
+                    byte[] buf = new byte[65536];
+                    int n;
+                    while ((n = szf.read(buf)) > 0) {
+                        out.write(buf, 0, n);
+                        done += n;
+                        tp.report(done, total, false);
+                    }
+                }
+                written++;
+            }
+            tp.report(total, total, true);
+        }
+        return written;
+    }
+
+    /**
+     * RAR4 extraction via junrar (RAR5 is rejected earlier by {@link
+     * #sniff}/{@link #rejectUnsupportedFormat} -- never reaches here).
+     * junrar's {@code Archive#extractFile} writes an entry's full contents
+     * in one call (no incremental byte callback), so progress here advances
+     * per-entry rather than per-byte-written; the denominator is the sum of
+     * every non-directory entry's unpacked size.
+     */
+    private static int unRarInto(File archiveFile, File dir, ProgressCallback progress) throws IOException {
+        ThrottledProgress tp = new ThrottledProgress(progress);
+        int written = 0;
+        try (Archive archive = new Archive(archiveFile)) {
+            long total = 0;
+            for (FileHeader h : archive.getFileHeaders()) {
+                if (!h.isDirectory()) total += Math.max(h.getFullUnpackSize(), 0);
+            }
+            long done = 0;
+            FileHeader fh;
+            while ((fh = archive.nextFileHeader()) != null) {
+                if (fh.isDirectory()) continue;
+                String entryName = fh.getFileName();
+                if (entryName == null || entryName.isEmpty()) continue;
+                entryName = entryName.replace('\\', '/');
+                if (entryName.contains("__MACOSX/") || entryName.equals("__MACOSX")) continue;
+                File outFile = safeResolve(dir, entryName);
+                if (outFile == null) throw new IOException("RAR entry escapes target directory: " + entryName);
+                File parent = outFile.getParentFile();
+                if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+                    throw new IOException("cannot create directory " + parent);
+                }
+                try (OutputStream out = new FileOutputStream(outFile)) {
+                    archive.extractFile(fh, out);
+                }
+                written++;
+                done += Math.max(fh.getFullUnpackSize(), 0);
+                tp.report(done, total, false);
+            }
+            tp.report(total, total, true);
+        } catch (RarException e) {
+            throw new IOException("could not read RAR archive: " + e.getMessage(), e);
+        }
+        return written;
     }
 
     /**
@@ -883,11 +1369,9 @@ public final class ModManager {
                 continue;
             }
             String lower = c.getName().toLowerCase(Locale.ROOT);
-            if (!(lower.endsWith(".ctp") || lower.endsWith(".zip"))) continue;
+            if (!(lower.endsWith(".ctp") || lower.endsWith(".zip") || lower.endsWith(".7z"))) continue;
             File parent = c.getParentFile() != null ? c.getParentFile() : dir;
-            try (ZipInputStream zis = new ZipInputStream(new java.io.BufferedInputStream(new java.io.FileInputStream(c)))) {
-                unzipInto(zis, parent);
-            }
+            extractArchiveFileInto(c, parent, null);
             if (!c.delete()) throw new IOException("could not remove nested archive " + c);
             expandNestedArchives(parent, depth + 1);
         }
@@ -897,9 +1381,11 @@ public final class ModManager {
      * Resolves a zip entry name against {@code baseDir}, rejecting (returns
      * null) any entry whose canonical path would land outside {@code
      * baseDir} -- the zip-slip check (a {@code ../../evil} entry, or an
-     * absolute path, must not escape the staging directory).
+     * absolute path, must not escape the staging directory). Package-visible
+     * (not private) so {@link ArchiveOverlayImporter} can route its
+     * attacker-controlled-archive-path writes through the same check.
      */
-    private static File safeResolve(File baseDir, String entryName) throws IOException {
+    static File safeResolve(File baseDir, String entryName) throws IOException {
         String normalized = entryName.replace('\\', '/');
         while (normalized.startsWith("/")) normalized = normalized.substring(1);
         if (normalized.isEmpty()) return null;
@@ -931,6 +1417,18 @@ public final class ModManager {
         sole.delete();
     }
 
+    /** True if {@code dir} contains any regular file (at any depth) whose name doesn't start with '.'. */
+    private static boolean hasVisibleFile(File dir) {
+        File[] children = dir.listFiles();
+        if (children == null) return false;
+        for (File c : children) {
+            if (c.getName().startsWith(".")) continue;
+            if (c.isDirectory()) { if (hasVisibleFile(c)) return true; }
+            else if (c.isFile()) return true;
+        }
+        return false;
+    }
+
     /** Recursively deletes {@code f} (file or directory); a no-op if it doesn't exist. Best-effort. */
     private static void deleteRecursive(File f) {
         if (f == null || !f.exists()) return;
@@ -950,11 +1448,17 @@ public final class ModManager {
      * rescanning -- e.g. from a JVM test). No Android dependency.
      */
     public static ImportResult importArchive(InputStream in, String displayName, File modsRoot) throws IOException {
+        return importArchive(in, displayName, modsRoot, null);
+    }
+
+    /** Like {@link #importArchive(InputStream, String, File)}, reporting extraction progress -- see {@link ProgressCallback}. */
+    public static ImportResult importArchive(InputStream in, String displayName, File modsRoot,
+                                               ProgressCallback progress) throws IOException {
         String name = sanitizeName(displayName);
         if (!modsRoot.isDirectory() && !modsRoot.mkdirs() && !modsRoot.isDirectory()) {
             throw new IOException("cannot create mods directory " + modsRoot);
         }
-        return extractZip(in, modsRoot, name);
+        return extractZip(in, modsRoot, name, progress);
     }
 
     /**
@@ -968,6 +1472,11 @@ public final class ModManager {
      * @return the import result (mod directories created)
      */
     public ImportResult importArchive(Uri uri, ContentResolver resolver) throws IOException {
+        return importArchive(uri, resolver, null);
+    }
+
+    /** Like {@link #importArchive(Uri, ContentResolver)}, reporting extraction progress -- see {@link ProgressCallback}. */
+    public ImportResult importArchive(Uri uri, ContentResolver resolver, ProgressCallback progress) throws IOException {
         String displayName = queryDisplayName(resolver, uri);
         if (displayName == null || displayName.isEmpty()) {
             String seg = uri.getLastPathSegment();
@@ -976,7 +1485,7 @@ public final class ModManager {
         ImportResult result;
         try (InputStream in = resolver.openInputStream(uri)) {
             if (in == null) throw new IOException("could not open " + uri);
-            result = importArchive(in, displayName, root);
+            result = importArchive(in, displayName, root, progress);
         }
         scan();
         return result;
@@ -992,10 +1501,16 @@ public final class ModManager {
      * semantics as the sibling overload. Pure Java I/O.
      */
     public static ImportResult importArchiveNamed(InputStream in, File modsRoot, String forcedName) throws IOException {
+        return importArchiveNamed(in, modsRoot, forcedName, null);
+    }
+
+    /** Like {@link #importArchiveNamed(InputStream, File, String)}, reporting extraction progress -- see {@link ProgressCallback}. */
+    public static ImportResult importArchiveNamed(InputStream in, File modsRoot, String forcedName,
+                                                    ProgressCallback progress) throws IOException {
         if (!modsRoot.isDirectory() && !modsRoot.mkdirs() && !modsRoot.isDirectory()) {
             throw new IOException("cannot create mods directory " + modsRoot);
         }
-        return extractZip(in, modsRoot, forcedName);
+        return extractZip(in, modsRoot, forcedName, progress);
     }
 
     /**
@@ -1014,18 +1529,44 @@ public final class ModManager {
      * @return the import result (mod directories created)
      */
     public ImportResult importCatalogMod(InputStream in, String id, String sourceUrl) throws IOException {
-        ImportResult result = importArchiveNamed(in, root, id);
-        if (sourceUrl != null) {
-            for (String modName : result.modNames) {
-                try (OutputStream out = new FileOutputStream(new File(new File(root, modName), ".source"))) {
-                    out.write(sourceUrl.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                } catch (IOException e) {
-                    Log.w(TAG, "mods: could not write .source for " + modName, e);
-                }
-            }
-        }
+        return importCatalogMod(in, id, sourceUrl, null);
+    }
+
+    /** Like {@link #importCatalogMod(InputStream, String, String)}, reporting extraction progress -- see {@link ProgressCallback}. */
+    public ImportResult importCatalogMod(InputStream in, String id, String sourceUrl, ProgressCallback progress)
+            throws IOException {
+        ImportResult result = importArchiveNamed(in, root, id, progress);
+        writeSourceMarkers(result, sourceUrl);
         scan();
         return result;
+    }
+
+    /**
+     * File-based counterpart of {@link #importCatalogMod(InputStream,
+     * String, String)}, for a caller that already has the archive on disk
+     * (see {@link #importArchiveFileNamed}'s doc -- {@code
+     * AppActivity#downloadAndImportMod}'s download temp file is exactly
+     * this case, and this is the entry point that lets it report byte-
+     * accurate extraction progress for a multi-GB 7z/zip/RAR mod instead of
+     * spooling through {@link InputStream}).
+     */
+    public ImportResult importCatalogMod(File archiveFile, String id, String sourceUrl, ProgressCallback progress)
+            throws IOException {
+        ImportResult result = importArchiveFileNamed(archiveFile, root, id, progress);
+        writeSourceMarkers(result, sourceUrl);
+        scan();
+        return result;
+    }
+
+    private void writeSourceMarkers(ImportResult result, String sourceUrl) {
+        if (sourceUrl == null) return;
+        for (String modName : result.modNames) {
+            try (OutputStream out = new FileOutputStream(new File(new File(root, modName), ".source"))) {
+                out.write(sourceUrl.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            } catch (IOException e) {
+                Log.w(TAG, "mods: could not write .source for " + modName, e);
+            }
+        }
     }
 
     /** Package-visible for {@code AppActivity}'s {@code .ctp} intent-filter handler, which needs the same display-name lookup this class already does for {@link #importArchive(Uri, ContentResolver)}. */

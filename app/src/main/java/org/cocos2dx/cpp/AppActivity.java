@@ -782,7 +782,9 @@ public class AppActivity extends Cocos2dxActivity {
         final com.kalenjohnson.chronoduo.mods.ModManager mm = modManager;
         new Thread(() -> {
             try {
-                com.kalenjohnson.chronoduo.mods.ModManager.ImportResult result = mm.importArchive(uri, getContentResolver());
+                com.kalenjohnson.chronoduo.mods.ModManager.setGameArchiveSource(gameArchiveSourceFactory());
+                com.kalenjohnson.chronoduo.mods.ModManager.ImportResult result = mm.importArchive(uri,
+                        getContentResolver(), this::updateModsProgress);
                 logImportResult(result);
                 updateModsStatus(false, describeImportResult(result), null);
                 refreshCompanionAssetsForModChange();
@@ -838,6 +840,68 @@ public class AppActivity extends Cocos2dxActivity {
     /** Same as the 3-arg overload with no success message -- the common idle/importing/error case. */
     private void updateModsStatus(boolean importing, String error) {
         updateModsStatus(importing, null, error);
+    }
+
+    /**
+     * Forwards a {@link com.kalenjohnson.chronoduo.mods.ModManager.ProgressCallback}
+     * tick (see {@link com.kalenjohnson.chronoduo.mods.ModManager#extractZip}
+     * et al -- a multi-GB 7z/zip/RAR mod, e.g. a 4K FMV pack, can take a
+     * while) to the settings panel's status line via {@link
+     * #updateModsStatus}, throttled upstream to ~2/s by {@code ModManager}
+     * already. {@code totalBytes <= 0} means the extractor doesn't know a
+     * total ahead of time (a plain {@link java.util.zip.ZipInputStream}
+     * can't without a first pass) -- shown as an entry count instead of a
+     * percentage.
+     */
+    private void updateModsProgress(long processed, long totalBytes) {
+        String msg = totalBytes > 0
+                ? "Extracting... " + Math.min(100, (int) (processed * 100 / totalBytes)) + "%"
+                : "Extracting... " + processed + (processed == 1 ? " file" : " files");
+        updateModsStatus(true, msg, null);
+    }
+
+    /**
+     * Builds a {@link com.kalenjohnson.chronoduo.mods.ModManager.GameArchiveSourceFactory}
+     * over the game's own {@code resources.bin} asset, for {@link
+     * com.kalenjohnson.chronoduo.mods.ModManager}'s resources.bin-overlay
+     * import step (see {@code ArchiveOverlayImporter} -- a mod that ships a
+     * full ARC1 repack, e.g. "Orchestral Wonders", needs to diff against the
+     * real archive). Registered fresh before every mod-import call site
+     * (cheap -- just wraps {@code runtime}) rather than once at boot, since
+     * {@link #onCreate} isn't among the methods this class may edit. Mirrors
+     * {@code ChronoResources#readRegion}'s open-the-whole-asset-and-skip
+     * approach exactly (simple and always correct, at the cost of not being
+     * true random access) -- reusing {@code ChronoResources} itself isn't an
+     * option since its table/cache are keyed to the always-unmodded archive.
+     */
+    private com.kalenjohnson.chronoduo.mods.ModManager.GameArchiveSourceFactory gameArchiveSourceFactory() {
+        final android.content.res.AssetManager ga = runtime != null ? runtime.getChronoAssets() : null;
+        if (ga == null) return () -> null;
+        return () -> new com.kalenjohnson.chronoduo.mods.ArchiveOverlayImporter.RegionSource() {
+            @Override
+            public byte[] readRaw(long offset, int length) throws java.io.IOException {
+                try (java.io.InputStream in = ga.open("resources.bin")) {
+                    long toSkip = offset;
+                    while (toSkip > 0) {
+                        long skipped = in.skip(toSkip);
+                        if (skipped <= 0) {
+                            if (in.read() < 0) throw new java.io.IOException("unexpected EOF while skipping");
+                            toSkip--;
+                        } else {
+                            toSkip -= skipped;
+                        }
+                    }
+                    byte[] buf = new byte[length];
+                    int off = 0;
+                    while (off < buf.length) {
+                        int n = in.read(buf, off, buf.length - off);
+                        if (n < 0) throw new java.io.IOException("unexpected EOF");
+                        off += n;
+                    }
+                    return buf;
+                }
+            }
+        };
     }
 
     /** Posts the current mod list and an optional neutral status/error message to the bottom-screen panel's settings view, if one is currently showing -- a no-op otherwise. Safe from any thread. Mirrors {@link #updateOrigArtStatus}. {@code message} is shown in the panel's normal body color (no prefix); {@code error} is shown red with an "error: " prefix -- see {@link PartyPanelView#setModsStatus}. */
@@ -998,12 +1062,16 @@ public class AppActivity extends Cocos2dxActivity {
                 try {
                     String name = suggestedName != null ? suggestedName : url;
                     if (!looksLikeModArchive(name)) {
-                        Log.w(TAG, "mods: '" + name + "' doesn't look like a .ctp/.zip -- importing anyway");
+                        // No longer a hard requirement -- extractArchiveFileInto
+                        // sniffs magic bytes now (zip/7z/RAR4), not the
+                        // filename/extension a Nexus download happens to have
+                        // (e.g. a .7z served with a misleading .bin name) --
+                        // still worth a log line for anything genuinely odd.
+                        Log.i(TAG, "mods: '" + name + "' has no .ctp/.zip/.7z extension -- importing by content anyway");
                     }
-                    com.kalenjohnson.chronoduo.mods.ModManager.ImportResult result;
-                    try (java.io.InputStream in = new java.io.FileInputStream(tmp)) {
-                        result = mm.importCatalogMod(in, entry.id, entry.page != null ? entry.page : url);
-                    }
+                    com.kalenjohnson.chronoduo.mods.ModManager.setGameArchiveSource(gameArchiveSourceFactory());
+                    com.kalenjohnson.chronoduo.mods.ModManager.ImportResult result = mm.importCatalogMod(
+                            tmp, entry.id, entry.page != null ? entry.page : url, this::updateModsProgress);
                     // extractZip already picks the right default-enabled
                     // sub-mod(s) fresh on every import (see its class doc) --
                     // no need to force-enable entry.id, which for a
@@ -1019,17 +1087,7 @@ public class AppActivity extends Cocos2dxActivity {
             }
             if (failure != null) {
                 Log.e(TAG, "mod get failed for " + entry.id, failure);
-                String msg = failure.getMessage() != null ? failure.getMessage() : failure.toString();
-                String lower = msg.toLowerCase(java.util.Locale.ROOT);
-                if (lower.contains("central directory") || lower.contains("not in gzip")
-                        || lower.contains("zip")) {
-                    // ZipInputStream can't read 7z/rar -- Nexus mods are
-                    // frequently packaged as one of those, so name the
-                    // limitation explicitly rather than a bare stack-trace
-                    // message.
-                    msg = "not a zip archive (7z/rar not supported): " + msg;
-                }
-                updateModsStatus(false, msg);
+                updateModsStatus(false, failure.getMessage() != null ? failure.getMessage() : failure.toString());
             }
             if (tmp != null) tmp.delete();
         }, "ChronoModGet").start();
@@ -1089,16 +1147,17 @@ public class AppActivity extends Cocos2dxActivity {
         updateModsStatus(true, null);
         new Thread(() -> {
             try {
+                com.kalenjohnson.chronoduo.mods.ModManager.setGameArchiveSource(gameArchiveSourceFactory());
                 com.kalenjohnson.chronoduo.mods.ModManager.ImportResult result;
                 if (finalMatch != null) {
                     try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
                         if (in == null) throw new java.io.IOException("could not open " + uri);
-                        result = mm.importCatalogMod(in, finalMatch.id, "local:" + uri);
+                        result = mm.importCatalogMod(in, finalMatch.id, "local:" + uri, this::updateModsProgress);
                     }
                     // See downloadAndImportMod's matching comment: extractZip
                     // already establishes the right enabled state per import.
                 } else {
-                    result = mm.importArchive(uri, getContentResolver());
+                    result = mm.importArchive(uri, getContentResolver(), this::updateModsProgress);
                 }
                 logImportResult(result);
                 updateModsStatus(false, describeImportResult(result), null);
