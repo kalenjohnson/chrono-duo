@@ -1357,23 +1357,33 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      * reason.
      */
     // ChronoType's glyphs sit small in the em box compared to the serif it
-    // replaces, so a pre-snap size that fit the serif reads a step too small
-    // once swapped to the mod font -- scale up before snapping to compensate.
-    private static final float MOD_FONT_SIZE_BOOST = 1.25f;
+    // replaces, so a size that fit the serif reads a little small once
+    // swapped to the mod font -- scale up modestly to compensate.
+    private static final float MOD_FONT_SIZE_BOOST = 1.15f;
+    // Snap to the font's native pixel grid (crisp, antialiasing off) only
+    // when the size is already within this fraction of a grid step; the
+    // panel is drawn at device resolution and never upscaled, so a
+    // fractional size with antialiasing looks better than jumping a whole
+    // step (10 -> 20 px) to stay on the grid.
+    private static final float MOD_FONT_SNAP_TOLERANCE = 0.12f;
 
     private void applyTypeface(Typeface fallback) {
         Typeface mod = com.kalenjohnson.chronoduo.mods.ModManager.activeTypeface();
         if (mod != null) {
             text.setTypeface(mod);
             int ppem = com.kalenjohnson.chronoduo.mods.ModManager.activeTypefacePpem();
+            float size = text.getTextSize() * MOD_FONT_SIZE_BOOST;
+            boolean crisp = false;
             if (ppem > 0) {
-                float size = text.getTextSize();
-                int snapped = (int) Math.ceil(size * MOD_FONT_SIZE_BOOST / ppem) * ppem;
-                snapped = Math.max(ppem, snapped);
-                text.setTextSize(snapped);
+                int nearest = Math.max(ppem, Math.round(size / ppem) * ppem);
+                if (Math.abs(size - nearest) <= ppem * MOD_FONT_SNAP_TOLERANCE) {
+                    size = nearest;
+                    crisp = true;
+                }
             }
-            text.setAntiAlias(false);
-            text.setSubpixelText(false);
+            text.setTextSize(size);
+            text.setAntiAlias(!crisp);
+            text.setSubpixelText(!crisp);
         } else {
             text.setTypeface(fallback);
             text.setAntiAlias(true);
