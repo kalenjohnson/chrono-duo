@@ -332,6 +332,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         void onModToggled(String name, boolean enabled);
         /** A catalog row's "Get" button tapped: {@code id} is the {@link com.kalenjohnson.chronoduo.mods.ModCatalog.Entry#id}. */
         void requestModGet(String id);
+        /** A grouped mod's option-row cycle button tapped (see {@link com.kalenjohnson.chronoduo.mods.ModManager.ModGroup}): {@code group} is the download name, {@code optionTitle} the {@link com.kalenjohnson.chronoduo.mods.ModManager.OptionGroup#title}, and {@code dirOrNull} the choice directory to select ({@code null} to select none). */
+        void onModOptionSelected(String group, String optionTitle, String dirOrNull);
     }
     private SettingsHost settingsHost;
 
@@ -388,8 +390,37 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private static final int MODS_PAGE = SETTINGS_PAGES.length - 1;
     private static final int SPEED_PAGE = MODS_PAGE - 1;
     private int settingsPage;
-    private final RectF settingsPrevHitBox = new RectF();
-    private final RectF settingsNextHitBox = new RectF();
+    // Left tab rail hit boxes, one per SETTINGS_PAGES entry -- replaces the
+    // old prev/next arrow buttons; tapping a tab jumps settingsPage directly
+    // (see drawSettingsScreen). settingsBackHitBox (declared with the other
+    // settings hit boxes below) is the rail's own Back button now, not a
+    // bottom-row button.
+    private final RectF[] settingsTabHitBoxes = new RectF[SETTINGS_PAGES.length];
+    {
+        for (int i = 0; i < SETTINGS_PAGES.length; i++) settingsTabHitBoxes[i] = new RectF();
+    }
+
+    // --- Settings d-pad focus (nice-to-have controller nav in settingsMode) -
+    // Two focus areas: the tab rail (cursor over the tabs plus a trailing
+    // Back "slot") and the content area (cursor over whatever the current
+    // page draws -- rebuilt fresh every drawSettingsScreen pass into
+    // settingsFocusRects/settingsFocusActivate/settingsFocusStepLeft/Right,
+    // parallel lists indexed by settingsContentFocus). LEFT/RIGHT switch
+    // between the two areas (RIGHT from the rail enters content, LEFT from
+    // content returns to the rail) EXCEPT when the focused content item is a
+    // Mods option-cycle picker, in which case LEFT/RIGHT step its choice
+    // instead (settingsFocusStepLeft/Right non-null only for those entries).
+    // Only ever consulted while settingsMode is true -- see
+    // onControllerLeft/Right/Up/Down/Confirm -- so this can never steal
+    // gameplay d-pad/A input while settings is closed.
+    private static final int SETTINGS_FOCUS_RAIL = 0, SETTINGS_FOCUS_CONTENT = 1;
+    private int settingsFocusArea = SETTINGS_FOCUS_RAIL;
+    private int settingsRailFocus; // 0..SETTINGS_PAGES.length-1 = tabs, SETTINGS_PAGES.length = Back
+    private int settingsContentFocus;
+    private final java.util.List<RectF> settingsFocusRects = new java.util.ArrayList<>();
+    private final java.util.List<Runnable> settingsFocusActivate = new java.util.ArrayList<>();
+    private final java.util.List<Runnable> settingsFocusStepLeft = new java.util.ArrayList<>();
+    private final java.util.List<Runnable> settingsFocusStepRight = new java.util.ArrayList<>();
 
     // Import status, pushed from AppActivity via setImportStatus as the
     // background ROM import (see SettingsHost) progresses. importError is
@@ -456,6 +487,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // (none, normally) until it arrives.
     private java.util.List<com.kalenjohnson.chronoduo.mods.ModCatalog.Entry> modCatalog =
             java.util.Collections.emptyList();
+    // Multi-.ctp download groupings (see com.kalenjohnson.chronoduo.mods.ModManager.ModGroup),
+    // pushed alongside modsList/modCatalog -- see buildModRows/buildDisplayRows.
+    private java.util.List<com.kalenjohnson.chronoduo.mods.ModManager.ModGroup> modGroupList =
+            java.util.Collections.emptyList();
     private final RectF modImportButtonHitBox = new RectF();
     // One row per catalog entry (in catalog order) plus any installed mod not
     // in the catalog -- see buildModRows(). Capped at MAX_MOD_ROWS; rows that
@@ -469,20 +504,54 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // installed catalog entry (modRowCatalogId set, tapping it calls
     // requestModGet) or an installed mod's On/Off toggle (modRowDirName set
     // instead, tapping it calls onModToggled) -- never both.
-    private static final int MAX_MOD_ROWS = 10;
-    // Real minimum touch-target height for a row's Get/On/Off button (dp,
-    // converted to px via dp() at draw time) -- see drawSettingsScreen's Mods
-    // case, which centers the button vertically in its (correspondingly
+    // Bumped from the original 10: a grouped multi-.ctp download (e.g. the
+    // ~30-sub-mod Pixel Demaster) now collapses to one parent row, but
+    // expanding it to see/change its option groups adds one flattened row
+    // per option group (see ModDisplayRow/buildDisplayRows) -- MAX_MOD_ROWS
+    // is the cap on the FLATTENED row count (parents + any expanded
+    // options), not on catalog/installed entries.
+    private static final int MAX_MOD_ROWS = 48;
+    // Real minimum touch-target height for a row's Get/On/Off/cycle button
+    // (dp, converted to px via dp() at draw time) -- see drawSettingsScreen's
+    // Mods case, which centers the button vertically in its (correspondingly
     // taller) row.
     private static final float MOD_ROW_BUTTON_H_DP = 48f;
     private final RectF[] modRowHitBoxes = new RectF[MAX_MOD_ROWS];
     private final String[] modRowDirName = new String[MAX_MOD_ROWS];
     private final String[] modRowCatalogId = new String[MAX_MOD_ROWS];
     private final boolean[] modRowEnabled = new boolean[MAX_MOD_ROWS];
+    // True when row i is a grouped mod's option-cycle row (see
+    // ModDisplayRow) rather than a parent Get/On/Off row -- in that case
+    // modRowHitBoxes[i] is the cycle button and modRowDirName/CatalogId are
+    // unused; modRowOptionGroupKey/Title/NextChoice below carry what tapping
+    // it should do instead (see onTouchEvent and SettingsHost#onModOptionSelected).
+    private final boolean[] modRowIsOptionCycle = new boolean[MAX_MOD_ROWS];
+    private final String[] modRowOptionGroupKey = new String[MAX_MOD_ROWS];
+    private final String[] modRowOptionTitle = new String[MAX_MOD_ROWS];
+    private final String[] modRowOptionNextChoice = new String[MAX_MOD_ROWS]; // null == "select none"
+    // Back-step choice (mirrors modRowOptionNextChoice) -- tapping the left
+    // ~30% of a picker button (see drawSettingsScreen's Mods case, the "◂"
+    // end) steps back through the cycle instead of forward.
+    private final String[] modRowOptionPrevChoice = new String[MAX_MOD_ROWS];
+    // A parent row's "Options ▾/▴" expander tap target -- separate from
+    // modRowHitBoxes[i] (that stays the row's own Get/On/Off button) so both
+    // can be live at once. Non-empty only for rows whose ModRow has a
+    // non-empty ModGroup#options list (see buildDisplayRows).
+    private final RectF[] modExpanderHitBoxes = new RectF[MAX_MOD_ROWS];
+    private final String[] modExpanderKey = new String[MAX_MOD_ROWS]; // the group's downloadName
     private int modRowCount;
     {
-        for (int i = 0; i < MAX_MOD_ROWS; i++) modRowHitBoxes[i] = new RectF();
+        for (int i = 0; i < MAX_MOD_ROWS; i++) {
+            modRowHitBoxes[i] = new RectF();
+            modExpanderHitBoxes[i] = new RectF();
+        }
     }
+    // Which groups (keyed by ModGroup#downloadName) are expanded on the Mods
+    // page, showing their option-group rows -- session-only UI state, never
+    // persisted, reset implicitly whenever the app restarts. Not cleared on
+    // page navigation, so leaving and returning to the Mods page keeps a
+    // group open.
+    private final java.util.Set<String> modExpandedGroups = new java.util.HashSet<>();
 
     // --- Mods list scrolling ------------------------------------------------
     // The row list is the only part of the Mods page that scrolls (heading,
@@ -549,6 +618,12 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         invalidate();
     }
 
+    /** Pushes the current multi-.ctp download groupings (see {@link com.kalenjohnson.chronoduo.mods.ModManager#groups}) to the settings screen; called from AppActivity alongside {@link #setModsList} after every scan/import/toggle/option-select. */
+    public void setModGroups(java.util.List<com.kalenjohnson.chronoduo.mods.ModManager.ModGroup> groups) {
+        this.modGroupList = groups != null ? groups : java.util.Collections.emptyList();
+        invalidate();
+    }
+
     /** One row of the Mods page's combined catalog+installed list -- see {@link #buildModRows}. */
     private static final class ModRow {
         final String title, summary, notes; // notes may be null
@@ -557,9 +632,16 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         final String catalogId; // not-yet-installed catalog entries only: id (for requestModGet)
         final boolean enabled;
         final String suffix;    // "N files"/"N files, conflicts: N" -- installed rows only, else null
+        // Non-null when this row is the PARENT of a multi-.ctp download
+        // (dirName == group.mainDir, or this is an uncatalogued group's own
+        // "Imported mod" row) -- see buildModRows/buildDisplayRows. The
+        // On/Off button above still binds to dirName/enabled (the main mod);
+        // group is only consulted for the Options ▾/▴ expander.
+        final com.kalenjohnson.chronoduo.mods.ModManager.ModGroup group;
 
         ModRow(String title, String summary, String notes, boolean installed, String dirName,
-               String catalogId, boolean enabled, String suffix) {
+               String catalogId, boolean enabled, String suffix,
+               com.kalenjohnson.chronoduo.mods.ModManager.ModGroup group) {
             this.title = title;
             this.summary = summary;
             this.notes = notes;
@@ -568,6 +650,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             this.catalogId = catalogId;
             this.enabled = enabled;
             this.suffix = suffix;
+            this.group = group;
         }
     }
 
@@ -578,7 +661,21 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      * no matching installed directory, an On/Off row if it does), followed
      * by any installed mod directory (from {@link #modsList}) that matches
      * no catalog entry at all -- a mod imported before the catalog existed,
-     * or dropped in by hand. Pure w.r.t. this view's own fields.
+     * or dropped in by hand.
+     *
+     * <p>A multi-.ctp download (see {@link #modGroupList}) collapses to a
+     * SINGLE row bound to its {@link com.kalenjohnson.chronoduo.mods.ModManager.ModGroup#mainDir}:
+     * a catalog entry matching that group's main dir (via {@link
+     * com.kalenjohnson.chronoduo.mods.ModCatalog#findInstalledDirName}'s
+     * group-aware overload) gets the row as usual, but with {@code
+     * ModRow#group} set so drawSettingsScreen draws the Options ▾/▴
+     * expander; an uncatalogued group's main dir gets an "Imported mod" row
+     * titled by the group's OWN download name (not the raw directory name)
+     * instead. Every other directory belonging to a group -- the main dir
+     * of a group already emitted, and every option-choice dir -- is
+     * excluded entirely from the flat list; see {@link #buildDisplayRows}
+     * for how an expanded group's option rows get drawn instead. Pure
+     * w.r.t. this view's own fields.
      */
     private java.util.List<ModRow> buildModRows() {
         java.util.List<ModRow> rows = new java.util.ArrayList<>();
@@ -588,22 +685,138 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             dirNames.add(m.name);
             byDir.put(m.name, m);
         }
-        java.util.Set<String> matchedDirs = new java.util.HashSet<>();
+
+        java.util.Map<String, com.kalenjohnson.chronoduo.mods.ModManager.ModGroup> groupByMainDir =
+                new java.util.HashMap<>();
+        // Only a group WITH a main dir gets collapsed to one parent row --
+        // hiding its option choices' flat rows depends on that parent row
+        // existing to show them via its expander. A group with no main dir
+        // (ModGroup#mainDir's doc: "null if the download had no such
+        // single-segment sub-mod" -- an all-options Nexus download) has
+        // nowhere to put an expander, so its sub-mods are left OUT of
+        // optionDirs/groupByMainDir entirely and fall through to today's
+        // flat "Imported mod" rows below instead of vanishing.
+        java.util.Set<String> optionDirs = new java.util.HashSet<>();
+        for (com.kalenjohnson.chronoduo.mods.ModManager.ModGroup g : modGroupList) {
+            if (g.mainDir == null) continue;
+            groupByMainDir.put(g.mainDir, g);
+            for (com.kalenjohnson.chronoduo.mods.ModManager.OptionGroup og : g.options) {
+                for (com.kalenjohnson.chronoduo.mods.ModManager.Choice c : og.choices) optionDirs.add(c.dir);
+            }
+        }
+
+        java.util.Set<String> consumedDirs = new java.util.HashSet<>();
         for (com.kalenjohnson.chronoduo.mods.ModCatalog.Entry e : modCatalog) {
-            String dir = com.kalenjohnson.chronoduo.mods.ModCatalog.findInstalledDirName(e, dirNames);
+            String dir = com.kalenjohnson.chronoduo.mods.ModCatalog.findInstalledDirName(e, dirNames, modGroupList);
             if (dir != null) {
-                matchedDirs.add(dir);
+                consumedDirs.add(dir);
                 com.kalenjohnson.chronoduo.mods.ModManager.ModInfo m = byDir.get(dir);
-                rows.add(new ModRow(e.name, e.summary, e.notes, true, dir, null, m.enabled, modSuffix(m)));
+                com.kalenjohnson.chronoduo.mods.ModManager.ModGroup g = groupByMainDir.get(dir);
+                rows.add(new ModRow(e.name, e.summary, e.notes, true, dir, null, m.enabled, modSuffix(m), g));
             } else {
-                rows.add(new ModRow(e.name, e.summary, e.notes, false, null, e.id, false, null));
+                rows.add(new ModRow(e.name, e.summary, e.notes, false, null, e.id, false, null, null));
             }
         }
         for (com.kalenjohnson.chronoduo.mods.ModManager.ModInfo m : modsList) {
-            if (matchedDirs.contains(m.name)) continue;
-            rows.add(new ModRow(m.name, "Imported mod", null, true, m.name, null, m.enabled, modSuffix(m)));
+            if (consumedDirs.contains(m.name)) continue;
+            if (optionDirs.contains(m.name)) continue; // grouped option sub-dir -- shown only via its expanded parent
+            com.kalenjohnson.chronoduo.mods.ModManager.ModGroup g = groupByMainDir.get(m.name);
+            if (g != null) {
+                consumedDirs.add(m.name);
+                rows.add(new ModRow(g.downloadName, "Imported mod", null, true, m.name, null, m.enabled, modSuffix(m), g));
+            } else {
+                rows.add(new ModRow(m.name, "Imported mod", null, true, m.name, null, m.enabled, modSuffix(m), null));
+            }
         }
         return rows;
+    }
+
+    /**
+     * One row of the Mods page's FLATTENED display list -- either a {@link
+     * #parent} row (a {@link ModRow}, exactly as {@link #buildModRows}
+     * built it) or, immediately following an expanded parent, one {@link
+     * #option} row per {@link com.kalenjohnson.chronoduo.mods.ModManager.ModGroup#options}
+     * entry. Each option row contributes its own entry to the draw loop's
+     * {@code rowHeights[]}/hit-box arrays exactly like a parent row does --
+     * it's never folded into the parent's own row height.
+     */
+    private static final class ModDisplayRow {
+        final ModRow parent; // non-null for a parent row
+        final boolean expandable;
+        final String expandKey; // parent rows only: group.downloadName
+        final com.kalenjohnson.chronoduo.mods.ModManager.OptionGroup option; // non-null for an option row
+        final String optionGroupKey; // option rows only: the owning group's downloadName
+        // Option rows only: og.title with any shared leading segment
+        // stripped for display (see #sharedLeadingSegment) -- the RAW
+        // og.title is still what's sent to onModOptionSelected, so this is
+        // purely cosmetic.
+        final String optionDisplayTitle;
+
+        ModDisplayRow(ModRow parent, boolean expandable, String expandKey) {
+            this.parent = parent;
+            this.expandable = expandable;
+            this.expandKey = expandKey;
+            this.option = null;
+            this.optionGroupKey = null;
+            this.optionDisplayTitle = null;
+        }
+
+        ModDisplayRow(com.kalenjohnson.chronoduo.mods.ModManager.OptionGroup option, String optionGroupKey,
+                      String optionDisplayTitle) {
+            this.parent = null;
+            this.expandable = false;
+            this.expandKey = null;
+            this.option = option;
+            this.optionGroupKey = optionGroupKey;
+            this.optionDisplayTitle = optionDisplayTitle;
+        }
+    }
+
+    /**
+     * The " - "-joined leading segment (e.g. "Interface") shared by every
+     * option-group title in {@code options} that HAS more than one segment
+     * -- a single-segment title (e.g. "Font") is excluded from the check
+     * entirely and never stripped, so a mod whose option groups are a mix
+     * of top-level and nested titles ("Font" alongside "Interface - Art
+     * Icons") still gets the "Interface - " prefix stripped off the nested
+     * ones even though "Font" itself has nothing to strip. Returns null if
+     * no multi-segment title exists, or the multi-segment titles disagree
+     * on their leading segment.
+     */
+    private static String sharedLeadingSegment(java.util.List<com.kalenjohnson.chronoduo.mods.ModManager.OptionGroup> options) {
+        String shared = null;
+        for (com.kalenjohnson.chronoduo.mods.ModManager.OptionGroup og : options) {
+            String[] segs = og.title.split(" - ", 2);
+            if (segs.length < 2) continue; // single-segment title -- not part of the check
+            if (shared == null) shared = segs[0];
+            else if (!shared.equals(segs[0])) return null;
+        }
+        return shared;
+    }
+
+    /** Strips a leading {@code "<prefix> - "} from {@code title} when present; returns {@code title} unchanged when it isn't, or when stripping would leave nothing (the title WAS exactly the shared segment). */
+    private static String stripLeadingSegment(String title, String prefix) {
+        if (prefix == null) return title;
+        String lead = prefix + " - ";
+        if (title.startsWith(lead) && title.length() > lead.length()) return title.substring(lead.length());
+        return title;
+    }
+
+    /** Flattens {@code rows} into the Mods page's actual draw order: every parent row, followed by its {@link com.kalenjohnson.chronoduo.mods.ModManager.ModGroup#options} rows (one per option group) whenever that parent's group is in {@link #modExpandedGroups}. */
+    private java.util.List<ModDisplayRow> buildDisplayRows(java.util.List<ModRow> rows) {
+        java.util.List<ModDisplayRow> out = new java.util.ArrayList<>();
+        for (ModRow row : rows) {
+            boolean expandable = row.group != null && !row.group.options.isEmpty();
+            String key = row.group != null ? row.group.downloadName : null;
+            out.add(new ModDisplayRow(row, expandable, key));
+            if (expandable && modExpandedGroups.contains(key)) {
+                String sharedPrefix = sharedLeadingSegment(row.group.options);
+                for (com.kalenjohnson.chronoduo.mods.ModManager.OptionGroup og : row.group.options) {
+                    out.add(new ModDisplayRow(og, key, stripLeadingSegment(og.title, sharedPrefix)));
+                }
+            }
+        }
+        return out;
     }
 
     private static String modSuffix(com.kalenjohnson.chronoduo.mods.ModManager.ModInfo m) {
@@ -790,6 +1003,21 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     private final Path tornEdge = new Path();
     private final Path tornPaper = new Path();
     private int tornW, tornH;
+    // The rect buildTornPaths last built tornEdge/tornPaper for -- settings
+    // mode's near-full-screen parchment and the normal mode's smaller,
+    // lower map-panel rect can both be requested at the SAME view width/
+    // height (a mode switch never resizes the view), so caching on w/h
+    // alone reused whichever rect happened to be cached first for every
+    // later draw of the OTHER mode: e.g. a Presentation recreated behind
+    // our back (sleep/wake, or switching away and back -- see
+    // AppActivity#onSecondScreenPanelAttached's doc) re-entering settings
+    // mode at the same view size the old instance already had normal-mode
+    // paths cached for drew the settings screen's rail/content against the
+    // correct full rect, but its background parchment fill/clip stayed the
+    // OLD, smaller normal-mode shape -- a black band above it with the
+    // title/first row clipped away. NaN initially so the very first call
+    // always rebuilds regardless of r.
+    private float tornRectL = Float.NaN, tornRectT = Float.NaN, tornRectR = Float.NaN, tornRectB = Float.NaN;
 
     public PartyPanelView(Context context) {
         super(context);
@@ -922,10 +1150,30 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 return true;
             }
             for (int i = 0; i < modRowCount; i++) {
+                if (!modExpanderHitBoxes[i].isEmpty()
+                        && modExpanderHitBoxes[i].contains(event.getX(), event.getY())) {
+                    // "Options ▾/▴" -- purely local UI state, no SettingsHost
+                    // call: just flips this group's membership in
+                    // modExpandedGroups (see buildDisplayRows).
+                    String key = modExpanderKey[i];
+                    if (key != null) {
+                        if (!modExpandedGroups.remove(key)) modExpandedGroups.add(key);
+                        invalidate();
+                    }
+                    return true;
+                }
+            }
+            for (int i = 0; i < modRowCount; i++) {
                 if (!modRowHitBoxes[i].isEmpty()
                         && modRowHitBoxes[i].contains(event.getX(), event.getY())) {
                     if (settingsHost != null) {
-                        if (modRowCatalogId[i] != null) {
+                        if (modRowIsOptionCycle[i]) {
+                            // Left ~30% of the wide picker ("◂" end) steps
+                            // back one choice; the rest steps forward.
+                            boolean stepBack = event.getX() < modRowHitBoxes[i].left + modRowHitBoxes[i].width() * 0.3f;
+                            settingsHost.onModOptionSelected(modRowOptionGroupKey[i], modRowOptionTitle[i],
+                                    stepBack ? modRowOptionPrevChoice[i] : modRowOptionNextChoice[i]);
+                        } else if (modRowCatalogId[i] != null) {
                             settingsHost.requestModGet(modRowCatalogId[i]);
                         } else {
                             settingsHost.onModToggled(modRowDirName[i], !modRowEnabled[i]);
@@ -973,19 +1221,17 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 invalidate();
                 return true;
             }
-            if (!settingsPrevHitBox.isEmpty()
-                    && settingsPrevHitBox.contains(event.getX(), event.getY())) {
-                if (modsPageActive) modScrollY = 0f; // leaving the Mods page
-                settingsPage = (settingsPage + SETTINGS_PAGES.length - 1) % SETTINGS_PAGES.length;
-                invalidate();
-                return true;
-            }
-            if (!settingsNextHitBox.isEmpty()
-                    && settingsNextHitBox.contains(event.getX(), event.getY())) {
-                if (modsPageActive) modScrollY = 0f; // leaving the Mods page
-                settingsPage = (settingsPage + 1) % SETTINGS_PAGES.length;
-                invalidate();
-                return true;
+            for (int i = 0; i < SETTINGS_PAGES.length; i++) {
+                if (!settingsTabHitBoxes[i].isEmpty()
+                        && settingsTabHitBoxes[i].contains(event.getX(), event.getY())) {
+                    if (modsPageActive && i != settingsPage) modScrollY = 0f; // leaving the Mods page
+                    settingsPage = i;
+                    settingsFocusArea = SETTINGS_FOCUS_RAIL;
+                    settingsRailFocus = i;
+                    settingsContentFocus = 0;
+                    invalidate();
+                    return true;
+                }
             }
             if (!settingsBackHitBox.isEmpty()
                     && settingsBackHitBox.contains(event.getX(), event.getY())) {
@@ -1003,6 +1249,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         if (!snap.inBattle && !gearHitBox.isEmpty()
                 && gearHitBox.contains(event.getX(), event.getY())) {
             settingsMode = true;
+            settingsFocusArea = SETTINGS_FOCUS_RAIL;
+            settingsRailFocus = Math.floorMod(settingsPage, SETTINGS_PAGES.length);
+            settingsContentFocus = 0;
             invalidate();
             return true;
         }
@@ -1235,6 +1484,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      * callers must forward the event to the game unchanged when false.
      */
     public boolean onControllerLeft() {
+        if (settingsMode) return settingsNavLeft();
         if (!commandNavActive()) return false;
         if (commandSel > 0) {
             commandSel--;
@@ -1245,11 +1495,106 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
     /** Same as {@link #onControllerLeft}, moving right and clamping at {@code commandCount - 1}. */
     public boolean onControllerRight() {
+        if (settingsMode) return settingsNavRight();
         if (!commandNavActive()) return false;
         if (commandSel < commandCount - 1) {
             commandSel++;
             invalidate();
         }
+        return true;
+    }
+
+    /**
+     * Settings-mode d-pad focus (see the settingsFocus* fields' javadoc
+     * above): LEFT returns from the content area to the rail, unless the
+     * focused content item is a Mods option-cycle picker, in which case it
+     * steps that picker's choice back instead.
+     */
+    private boolean settingsNavLeft() {
+        if (settingsFocusArea == SETTINGS_FOCUS_CONTENT) {
+            Runnable step = settingsContentFocus >= 0 && settingsContentFocus < settingsFocusStepLeft.size()
+                    ? settingsFocusStepLeft.get(settingsContentFocus) : null;
+            if (step != null) {
+                step.run();
+            } else {
+                settingsFocusArea = SETTINGS_FOCUS_RAIL;
+            }
+            invalidate();
+        }
+        return true;
+    }
+
+    /** Same as {@link #settingsNavLeft}, entering the content area from the rail, or stepping a focused picker's choice forward. */
+    private boolean settingsNavRight() {
+        if (settingsFocusArea == SETTINGS_FOCUS_RAIL) {
+            if (!settingsFocusRects.isEmpty()) {
+                settingsFocusArea = SETTINGS_FOCUS_CONTENT;
+                settingsContentFocus = Math.max(0, Math.min(settingsContentFocus, settingsFocusRects.size() - 1));
+                invalidate();
+            }
+        } else {
+            Runnable step = settingsContentFocus >= 0 && settingsContentFocus < settingsFocusStepRight.size()
+                    ? settingsFocusStepRight.get(settingsContentFocus) : null;
+            if (step != null) {
+                step.run();
+                invalidate();
+            }
+        }
+        return true;
+    }
+
+    /** Moves the rail cursor (tabs + trailing Back slot) or the content cursor up one, clamped at 0 -- no wrap either way. */
+    private boolean settingsNavUpInternal() {
+        if (settingsFocusArea == SETTINGS_FOCUS_RAIL) {
+            if (settingsRailFocus > 0) {
+                settingsRailFocus--;
+                invalidate();
+            }
+        } else if (settingsContentFocus > 0) {
+            settingsContentFocus--;
+            invalidate();
+        }
+        return true;
+    }
+
+    /** Same as {@link #settingsNavUpInternal}, moving down and clamping at the last tab/Back slot or the last content item. */
+    private boolean settingsNavDownInternal() {
+        if (settingsFocusArea == SETTINGS_FOCUS_RAIL) {
+            if (settingsRailFocus < SETTINGS_PAGES.length) { // SETTINGS_PAGES.length itself == Back
+                settingsRailFocus++;
+                invalidate();
+            }
+        } else if (settingsContentFocus < settingsFocusRects.size() - 1) {
+            settingsContentFocus++;
+            invalidate();
+        }
+        return true;
+    }
+
+    /**
+     * Activates whatever the focus cursor is currently on: a rail tab jumps
+     * {@link #settingsPage} to it, the rail's trailing Back slot exits
+     * settings, and a content item runs its {@link #settingsFocusActivate}
+     * entry (the same action a tap on it would perform).
+     */
+    private boolean settingsNavConfirm() {
+        if (settingsFocusArea == SETTINGS_FOCUS_RAIL) {
+            if (settingsRailFocus == SETTINGS_PAGES.length) {
+                if (Math.floorMod(settingsPage, SETTINGS_PAGES.length) == MODS_PAGE) modScrollY = 0f;
+                settingsMode = false;
+            } else {
+                if (settingsRailFocus != settingsPage
+                        && Math.floorMod(settingsPage, SETTINGS_PAGES.length) == MODS_PAGE) {
+                    modScrollY = 0f;
+                }
+                settingsPage = settingsRailFocus;
+                settingsContentFocus = 0;
+            }
+        } else if (settingsContentFocus >= 0 && settingsContentFocus < settingsFocusActivate.size()) {
+            Runnable act = settingsFocusActivate.get(settingsContentFocus);
+            if (act != null) act.run();
+        }
+        invalidate();
         return true;
     }
 
@@ -1267,6 +1612,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      * refuses to consume A at all -- see that field's javadoc for why.
      */
     public boolean onControllerConfirm() {
+        if (settingsMode) return settingsNavConfirm();
         if (pendingMenuClose) return false;
         if (commandNavActive()) {
             injectCommand(commandSel);
@@ -1289,6 +1635,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
      * cases.
      */
     public boolean onControllerUp() {
+        if (settingsMode) return settingsNavUpInternal();
         if (!listNavActive()) return false;
         if (listSel > 0) {
             listSel--;
@@ -1299,6 +1646,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
 
     /** Same as {@link #onControllerUp}, moving down and clamping at {@code snap.listRows.size() - 1}. */
     public boolean onControllerDown() {
+        if (settingsMode) return settingsNavDownInternal();
         if (!listNavActive()) return false;
         if (listSel < snap.listRows.size() - 1) {
             listSel++;
@@ -1825,11 +2173,38 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         out.close();
     }
 
+    /**
+     * The index reached by stepping one position FORWARD (the picker's "▸"
+     * end) through a {@code totalChoices}-long cycle from {@code curIdx},
+     * wrapping around -- see the Mods-page option picker (the "◂ label ▸"
+     * row) in {@link #drawSettingsScreen}'s Mods case. Pure/no Android
+     * dependency, so it's JVM-testable; package-visible for that. Plain
+     * modulo, NOT a "curIdx + 1 < total" bounds check -- the latter breaks
+     * when {@code curIdx == totalChoices - 1} is the trailing "None" slot
+     * (nothing selected), where {@code curIdx + 1} is never {@code <
+     * totalChoices} so stepping forward from "None" silently did nothing.
+     */
+    static int cycleStepForward(int curIdx, int totalChoices) {
+        return (curIdx + 1) % totalChoices;
+    }
+
+    /** Like {@link #cycleStepForward}, stepping one position BACK (the picker's "◂" end) instead. */
+    static int cycleStepBack(int curIdx, int totalChoices) {
+        return (curIdx - 1 + totalChoices) % totalChoices;
+    }
+
     private void buildTornPaths(RectF r) {
         int w = getWidth(), h = getHeight();
-        if (w == tornW && h == tornH) return;
+        if (w == tornW && h == tornH && r.left == tornRectL && r.top == tornRectT
+                && r.right == tornRectR && r.bottom == tornRectB) {
+            return;
+        }
         tornW = w;
         tornH = h;
+        tornRectL = r.left;
+        tornRectT = r.top;
+        tornRectR = r.right;
+        tornRectB = r.bottom;
         tornEdge.reset();
         buildTornPath(tornEdge, r, 4242L, 3.5f, 16f);
         RectF paper = new RectF(r);
@@ -2860,20 +3235,25 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     }
 
     /**
-     * The settings screen: same parchment chrome as the normal panel, split
-     * into the pages named by {@link #SETTINGS_PAGES} -- Imports (DS ROM
-     * maps, SNES/DS saves), Graphics (pixel graphics, original art) and Maps
-     * (dungeon fog, world map status) -- with prev/next arrows flanking a
-     * "Back" button along the bottom. Buttons mid-operation (importing /
-     * building) are dimmed and get no hit box. Every settings hit box is
-     * cleared up front so a control on another page can never catch a tap.
-     * Drawn instead of everything else whenever {@link #settingsMode} is
-     * true -- see {@link #onDraw} -- including before any party exists.
+     * The settings screen: a full-screen parchment sheet (nearly the whole
+     * view, small torn-paper border) split into a left tab rail -- one entry
+     * per {@link #SETTINGS_PAGES}, plus a trailing Back button -- and a
+     * content area to its right holding that page's title/subtitle/body.
+     * Replaces the old prev/next-arrow pagination entirely; tapping (or
+     * d-pad-confirming) a tab jumps {@link #settingsPage} directly. Buttons
+     * mid-operation (importing / building) are dimmed and get no hit box.
+     * Every settings hit box -- and the d-pad focus lists -- is cleared/
+     * rebuilt up front so a control on another page can never catch a tap or
+     * a stale focus index. Drawn instead of everything else whenever
+     * {@link #settingsMode} is true -- see {@link #onDraw} -- including
+     * before any party exists.
      */
     private void drawSettingsScreen(Canvas c) {
         int w = getWidth(), h = getHeight();
-        float pad = w * 0.02f;
-        RectF parchment = new RectF(pad * 3, h * 0.2f, w - pad * 3, h - pad * 2.2f);
+        // Full-screen sheet: fills the view minus a small torn-paper border,
+        // rather than the map-panel-sized rect the normal panel uses.
+        float pad = w * 0.012f;
+        RectF parchment = new RectF(pad, pad, w - pad, h - pad);
         drawParchmentBase(c, parchment);
 
         importButtonHitBox.setEmpty();
@@ -2886,7 +3266,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         ffModeHitBox.setEmpty();
         ffHitBox.setEmpty();
         modImportButtonHitBox.setEmpty();
-        for (int i = 0; i < MAX_MOD_ROWS; i++) modRowHitBoxes[i].setEmpty();
+        for (int i = 0; i < MAX_MOD_ROWS; i++) {
+            modRowHitBoxes[i].setEmpty();
+            modExpanderHitBoxes[i].setEmpty();
+        }
         modRowCount = 0;
         modListViewport.setEmpty();
         modScrollUpHitBox.setEmpty();
@@ -2894,30 +3277,122 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         modScrollbarThumb.setEmpty();
         modContentHeight = 0f;
         modViewportHeight = 0f;
+        for (int i = 0; i < SETTINGS_PAGES.length; i++) settingsTabHitBoxes[i].setEmpty();
+        settingsBackHitBox.setEmpty();
+        settingsFocusRects.clear();
+        settingsFocusActivate.clear();
+        settingsFocusStepLeft.clear();
+        settingsFocusStepRight.clear();
 
         int page = Math.floorMod(settingsPage, SETTINGS_PAGES.length);
         int inkDim = Color.argb(200, Color.red(INK), Color.green(INK), Color.blue(INK));
-        float left = parchment.left + w * 0.06f;
-        float textW = parchment.width() - w * 0.12f;
         Bitmap winTex = ChronoAssets.getWindowTex();
+
+        // --- Left tab rail -----------------------------------------------
+        // ~260px wide at the 1240px-wide reference resolution -- scaled by
+        // view width so it holds its proportion on any secondary display.
+        // The rail rect is inset inside the parchment's inner border line
+        // (drawParchmentOverlay's "frame" -- 7px paper inset + 14px frame
+        // inset = 21px total, both literal device px like the rest of that
+        // border) by a further ~24px on all sides, so neither the rail's
+        // tint nor the "Settings" title/tab text ever touches that line or
+        // the torn edge beyond it. Tab labels and the Back button get their
+        // own ~32px left padding inside the rail (tabLeftPad below).
+        float innerBorderInset = 21f;
+        float railPadding = 24f;
+        float tabLeftPad = 32f;
+        float railW = parchment.width() * (260f / 1240f);
+        RectF rail = new RectF(parchment.left + innerBorderInset + railPadding,
+                parchment.top + innerBorderInset + railPadding,
+                parchment.left + innerBorderInset + railPadding + railW,
+                parchment.bottom - innerBorderInset - railPadding);
+
+        float contentLeft = rail.right + w * 0.03f;
+        float contentRight = parchment.right - w * 0.03f;
+        float left = contentLeft;
+        float textW = contentRight - contentLeft;
 
         c.save();
         c.clipPath(tornPaper);
 
-        setText(h * 0.055f, INK, true, Paint.Align.CENTER, false);
+        // Rail background: a faint tint distinguishing it from the content
+        // area, same paper underneath.
+        fill.setShader(null);
+        fill.setColor(Color.argb(28, 0, 0, 0));
+        c.drawRect(rail, fill);
+
+        // "Settings" title must fit inside the rail -- shrink the text size
+        // until it does rather than let it overflow the rail's right edge.
+        // setText resets the typeface to plain MONOSPACE every call (see its
+        // doc), so applyTypeface(SERIF/BOLD) must come AFTER each setText,
+        // both while measuring here and for the final draw below.
+        float titleAvailW = rail.width() - 2 * tabLeftPad;
+        float settingsTitleSize = h * 0.05f;
+        setText(settingsTitleSize, INK, true, Paint.Align.LEFT, false);
         applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
-        c.drawText("Settings", parchment.centerX(), parchment.top + h * 0.09f, text);
-        setText(h * 0.024f, inkDim, false, Paint.Align.CENTER, false);
-        c.drawText(SETTINGS_PAGES[page] + "  ·  " + (page + 1) + " / " + SETTINGS_PAGES.length,
-                parchment.centerX(), parchment.top + h * 0.125f, text);
+        while (settingsTitleSize > h * 0.02f && text.measureText("Settings") > titleAvailW) {
+            settingsTitleSize -= h * 0.002f;
+            setText(settingsTitleSize, INK, true, Paint.Align.LEFT, false);
+            applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        }
+        c.drawText("Settings", rail.left + tabLeftPad, rail.top + h * 0.09f, text);
+
+        float tabTop = rail.top + h * 0.15f;
+        float tabH = h * 0.075f;
+        for (int i = 0; i < SETTINGS_PAGES.length; i++) {
+            RectF tabBox = new RectF(rail.left, tabTop, rail.right, tabTop + tabH);
+            boolean selected = i == page;
+            if (selected) {
+                // Alpha bumped up from a first pass (60) since drawParchmentOverlay's
+                // vignette/speckle pass, drawn on top of the whole sheet afterwards,
+                // otherwise washes out the selected tint -- the navy marker bar
+                // (opaque) still reads clearly either way.
+                fill.setColor(Color.argb(95, 255, 255, 250));
+                c.drawRect(tabBox, fill);
+                fill.setColor(BOX_BG); // navy marker bar, left edge
+                c.drawRect(tabBox.left, tabBox.top, tabBox.left + w * 0.006f, tabBox.bottom, fill);
+            }
+            setText(h * 0.032f, selected ? INK : inkDim, selected, Paint.Align.LEFT, false);
+            applyTypeface(Typeface.create(Typeface.SERIF, selected ? Typeface.BOLD : Typeface.NORMAL));
+            c.drawText(SETTINGS_PAGES[i], rail.left + tabLeftPad, tabBox.centerY() + h * 0.011f, text);
+            // Tab hit box (and its d-pad focus ring, drawn around this same
+            // rect at the bottom of this method) stays inside the rail
+            // rect itself -- both share rail.left/rail.right exactly.
+            settingsTabHitBoxes[i].set(tabBox);
+            tabTop += tabH;
+        }
+
+        // Back button (rail-owned; drawn as a real button, deferred past the
+        // clip release below like every other settings button). Anchored to
+        // rail.bottom (not parchment.bottom) so it stays inside the now-
+        // inset rail rect.
+        RectF backBtn = new RectF(rail.left + tabLeftPad, rail.bottom - h * 0.07f,
+                rail.right - tabLeftPad, rail.bottom - h * 0.005f);
+
+        // Page title + one dim subtitle line, then the page body.
+        setText(h * 0.048f, INK, true, Paint.Align.LEFT, false);
+        applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        float y = parchment.top + h * 0.075f;
+        c.drawText(SETTINGS_PAGES[page], left, y, text);
+        y += h * 0.032f;
+        String subtitle;
+        switch (page) {
+            case 0: subtitle = "Chrono Trigger DS room maps and SNES/DS save import."; break;
+            case 1: subtitle = "Pixel-perfect rendering and original sprite/chip art."; break;
+            case 2: subtitle = "Dungeon fog of war and overworld map rendering."; break;
+            case 3: subtitle = "Speed up the whole game, held or toggled."; break;
+            default: subtitle = "Alphabetical order, first mod wins a conflict."; break;
+        }
+        setText(h * 0.022f, inkDim, false, Paint.Align.LEFT, false);
+        c.drawText(subtitle, left, y, text);
+        y += h * 0.045f;
 
         // Buttons are drawn after the clip is released (they sit on top of
         // the parchment overlay); the text pass below only records where
         // each one goes.
         RectF btnA = null, btnB = null;
         String labelA = null, labelB = null;
-        float y = parchment.top + h * 0.19f;
-        float btnW = parchment.width() * 0.6f;
+        float btnW = Math.min(textW, w * 0.34f);
         float btnH = h * 0.07f;
 
         switch (page) {
@@ -2925,9 +3400,15 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 y = drawSettingsHeading(c, "DS maps: " + importStatusText(), left, y, h);
                 y = drawSettingsBody(c, "Room maps are available if you can provide the "
                         + "Chrono Trigger DS ROM (.nds or .zip).", left, y, textW, h, inkDim);
-                btnA = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
-                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                btnA = new RectF(left, y + h * 0.01f, left + btnW, y + h * 0.01f + btnH);
                 labelA = "Import DS ROM...";
+                final boolean importBusyA = importing;
+                settingsFocusRects.add(btnA);
+                settingsFocusActivate.add(() -> {
+                    if (!importBusyA && settingsHost != null) settingsHost.requestRomImport();
+                });
+                settingsFocusStepLeft.add(null);
+                settingsFocusStepRight.add(null);
                 y = btnA.bottom + h * 0.06f;
 
                 y = drawSettingsHeading(c, "SNES/DS save:", left, y, h);
@@ -2935,9 +3416,15 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 y = drawSettingsBody(c, "Copies a save from a SNES (.srm) or DS (.sav/.dst/"
                         + ".duc/.dsv) file into one of this game's save slots.",
                         left, y, textW, h, inkDim);
-                btnB = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
-                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                btnB = new RectF(left, y + h * 0.01f, left + btnW, y + h * 0.01f + btnH);
                 labelB = "Import SNES/DS save...";
+                final boolean saveBusyB = savingImport;
+                settingsFocusRects.add(btnB);
+                settingsFocusActivate.add(() -> {
+                    if (!saveBusyB && settingsHost != null) settingsHost.requestSaveImport();
+                });
+                settingsFocusStepLeft.add(null);
+                settingsFocusStepRight.add(null);
                 break;
             }
             case 1: { // Graphics
@@ -2945,18 +3432,31 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 y = drawSettingsBody(c, "Nearest-neighbour texture filtering for crisp, "
                         + "unsmoothed sprites. Full effect after a game restart.",
                         left, y, textW, h, inkDim);
-                btnA = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
-                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                btnA = new RectF(left, y + h * 0.01f, left + btnW, y + h * 0.01f + btnH);
                 labelA = "Pixel graphics: " + (pixelGraphicsOn ? "On" : "Off");
+                settingsFocusRects.add(btnA);
+                settingsFocusActivate.add(() -> {
+                    pixelGraphicsOn = !pixelGraphicsOn;
+                    GameState.setPixelGraphicsPref(getContext(), pixelGraphicsOn);
+                    if (settingsHost != null) settingsHost.onPixelGraphicsChanged(pixelGraphicsOn);
+                });
+                settingsFocusStepLeft.add(null);
+                settingsFocusStepRight.add(null);
                 y = btnA.bottom + h * 0.06f;
 
                 y = drawSettingsHeading(c, "Original art: " + origArtStatusText(), left, y, h);
                 y = drawSettingsBody(c, "Rebuilds character sprites and field chips from the "
                         + "game's own 1x art. Only applies when Pixel graphics is On.",
                         left, y, textW, h, inkDim);
-                btnB = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
-                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                btnB = new RectF(left, y + h * 0.01f, left + btnW, y + h * 0.01f + btnH);
                 labelB = "Build original art";
+                final boolean origArtBusyB = origArtBuilding;
+                settingsFocusRects.add(btnB);
+                settingsFocusActivate.add(() -> {
+                    if (!origArtBusyB && settingsHost != null) settingsHost.requestOrigArtBuild();
+                });
+                settingsFocusStepLeft.add(null);
+                settingsFocusStepRight.add(null);
                 break;
             }
             case 2: { // Maps
@@ -2964,12 +3464,19 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 y = drawSettingsBody(c, "Dungeon minimaps are revealed as you explore them, "
                         + "like on the DS. Towns and houses are always fully shown.",
                         left, y, textW, h, inkDim);
-                btnA = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
-                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                btnA = new RectF(left, y + h * 0.01f, left + btnW, y + h * 0.01f + btnH);
                 // An import made before the fog flag was exported has no fog
                 // data: say so on the button instead of silently never fogging.
                 labelA = fogOn && countDsMaps() > 0 && !AreaMapCalib.hasFogData()
                         ? "Dungeon fog: re-import ROM" : "Dungeon fog: " + (fogOn ? "On" : "Off");
+                settingsFocusRects.add(btnA);
+                settingsFocusActivate.add(() -> {
+                    fogOn = !fogOn;
+                    getContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                            .putBoolean(KEY_FOG_ON, fogOn).apply();
+                });
+                settingsFocusStepLeft.add(null);
+                settingsFocusStepRight.add(null);
                 y = btnA.bottom + h * 0.075f;
 
                 y = drawSettingsHeading(c, worldMapStatusText(), left, y, h);
@@ -2982,107 +3489,202 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 y = drawSettingsBody(c, "Speeds up the whole game -- field, world map and "
                         + "battle alike -- while held or toggled on. Sound effects and music "
                         + "tempo are unaffected.", left, y, textW, h, inkDim);
-                btnA = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
-                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                btnA = new RectF(left, y + h * 0.01f, left + btnW, y + h * 0.01f + btnH);
                 labelA = "Speed: " + (int) GameSpeed.getSpeed(getContext()) + "x";
+                settingsFocusRects.add(btnA);
+                settingsFocusActivate.add(() -> GameSpeed.cycleSpeed(getContext()));
+                settingsFocusStepLeft.add(null);
+                settingsFocusStepRight.add(null);
                 y = btnA.bottom + h * 0.03f;
 
-                btnB = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
-                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                btnB = new RectF(left, y + h * 0.01f, left + btnW, y + h * 0.01f + btnH);
                 labelB = "Right trigger: "
                         + (GameSpeed.getMode(getContext()) == GameSpeed.Mode.HOLD ? "Hold" : "Toggle");
+                settingsFocusRects.add(btnB);
+                settingsFocusActivate.add(() -> GameSpeed.cycleMode(getContext()));
+                settingsFocusStepLeft.add(null);
+                settingsFocusStepRight.add(null);
                 break;
             }
             default: { // Mods -- a curated catalog (tap to get) plus any installed/imported mods.
-                y = drawSettingsHeading(c, "Mods", left, y, h);
-
                 java.util.List<ModRow> rows = buildModRows();
-                // Row name/summary/notes text and the row Get/On/Off button
-                // were both bumped up for legibility/touch-target size (see
-                // MOD_ROW_BUTTON_H_DP and the ~1.3x text sizes below). Each
-                // row's height is now the taller of the button's real
-                // minimum touch height (minRowH) and the actual wrapped text
-                // stack (textStackH, computed per row below from the real
-                // number of title/summary/notes lines) -- so a row with a
-                // long title/summary that wraps to 2 lines grows to fit
-                // instead of clipping or overlapping the row below it, while
-                // a short row still gets at least a full touch target.
-                float boxH = dp(MOD_ROW_BUTTON_H_DP);
-                // Minimum row height so the (also-enlarged) button always has
-                // real clearance even on a 1-line title + 1-line summary row
-                // with no notes -- the text stack can now push a row taller
-                // than this (see the wrap-driven textStackH below), but never
-                // shorter.
+                java.util.List<ModDisplayRow> displayRows = buildDisplayRows(rows);
+                // Row title/description text and the row Get/On/Off button
+                // sizes below match the redesigned mock: a fixed ~150x64px
+                // (at the 1240x1080 reference resolution) button column for
+                // parent rows, and a much wider ~520x64px "picker" button for
+                // an expanded option row (title + centered choice label +
+                // ◂/▸ step glyphs) -- see pickerW below. Both still respect a
+                // real minimum touch height via dp(). Each row's height is
+                // the taller of that button's height and the actual wrapped
+                // text stack (textStackH, from the real number of title/
+                // description lines) -- see buildDisplayRows for how a
+                // grouped mod's expanded option rows flatten into this same
+                // per-row loop.
+                float boxH = Math.max(dp(MOD_ROW_BUTTON_H_DP), h * (64f / 1080f));
                 float minRowH = h * 0.02f + boxH;
-                // Wider than before so the bigger button gets real horizontal
-                // padding around its label instead of being label-width-tight.
-                float toggleW = w * 0.22f;
+                // Parent rows: fixed ~150px On/Off/Get button. Option rows:
+                // much wider ~520px picker (title + ◂ current-choice ▸).
+                float toggleW = w * (150f / 1240f);
+                float pickerW = w * (520f / 1240f);
                 float modsBtnH = h * 0.055f;
+                // Leave room to the right of the button/picker column for the
+                // scrollbar track (trackX0..trackX1 below, contentRight-0.022w
+                // .. -0.006w) so a wide On/Off/Get button can never sit under it.
+                float btnRight = contentRight - w * 0.03f;
                 // The list viewport is a FIXED rect (listTop..maxY) regardless
-                // of row count, so the status line/Import button/restart note
-                // below it never move -- only the row list inside scrolls
-                // (see modScrollY). navTop/footerReserve size that fixed
-                // reserve exactly as before (status line, Import-file button,
-                // restart note, then the prev/Back/next nav row drawn after
-                // this switch). The status-line term is scaled up to match
-                // STATUS_LINE_SIZE_FRAC below.
+                // of row count, so the footer (Import button + status text)
+                // below it never moves -- only the row list inside scrolls
+                // (see modScrollY).
                 float listTop = y;
-                float navTop = parchment.bottom - h * 0.09f;
-                float footerReserve = h * 0.03f * 1.3f /* status line, enlarged */ + modsBtnH
-                        + h * 0.02f /* gaps */ + h * 0.022f /* one-line restart note */;
-                float maxY = navTop - h * 0.02f - footerReserve;
+                // Footer text budget is 2 lines (message + restart note, or
+                // just the restart note -- see below), which can be taller
+                // than the Import button itself.
+                float footerStatusLineH = h * STATUS_LINE_SIZE_FRAC * BODY_LINE_H_RATIO;
+                float footerH = Math.max(modsBtnH, footerStatusLineH * 2f + footerStatusLineH * 0.8f);
+                float footerReserve = footerH + h * 0.025f /* gap above footer */;
+                float maxY = parchment.bottom - h * 0.03f - footerReserve;
                 float viewportH = Math.max(0f, maxY - listTop);
 
-                // Row title/summary column width -- the wrap width for both
-                // title and summary text, and the max width notes still gets
-                // ellipsized against (unchanged, single line).
+                // Row title/description column width -- the wrap width for
+                // both. Option rows are indented under their parent's title
+                // and sit next to the much wider picker button, so they get
+                // their own (narrower) max width.
                 float rowTextMaxW = textW - toggleW - w * 0.02f;
+                float optionIndent = w * 0.04f;
+                float optionTextMaxW = Math.max(0f, textW - pickerW - optionIndent - w * 0.02f);
 
-                // Title/summary font sizes (~1.3x the original single-line
-                // sizes, per the earlier legibility pass) -- set once here so
-                // titleLineH/summaryLineH below (Paint.ascent()/descent() at
-                // THIS size) match what the draw loop below re-applies per
-                // row via setText. Small vertical gaps between blocks
-                // (titleGap/summaryGap) are fixed regardless of line count.
-                setText(h * 0.026f, INK, true, Paint.Align.LEFT, false);
+                // Text sizes -- title ~34px, description ~24px, option title
+                // ~28px at the 1240x1080 reference resolution. Set once here
+                // so titleLineH/summaryLineH (Paint.ascent()/descent() at
+                // THESE sizes) match what the draw loop below re-applies per
+                // row via setText.
+                float titleSize = h * (34f / 1080f);
+                float summarySize = h * (24f / 1080f);
+                // Notes render at the SAME size as the description (item 5)
+                // and wrap onto up to 2 lines instead of a single ellipsized
+                // line -- see notesLines below and wrapLines' doc.
+                float expanderSize = h * 0.019f;
+                // Option row title (left label, e.g. "Font"/"Art Icons") --
+                // single fixed size, wrapped onto up to 2 lines (see the
+                // option-row branch below). The PICKER label (the current
+                // choice, drawn inside the ◂/▸ button) uses its own 3-size
+                // fit instead -- see pickerLabelSizes below.
+                float optionTitleSize = h * (28f / 1080f);
+                float[] pickerLabelSizes = { h * (28f / 1080f), h * (24f / 1080f), h * (21f / 1080f) };
+                // File-count/conflicts suffix, drawn UNDER the row's button
+                // instead of above/beside the description.
+                float suffixSize = h * 0.014f;
+                float suffixGap = h * 0.004f;
+                setText(titleSize, INK, true, Paint.Align.LEFT, false);
                 applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
                 float titleLineH = text.descent() - text.ascent();
-                setText(h * 0.021f, inkDim, false, Paint.Align.LEFT, false);
+                setText(summarySize, inkDim, false, Paint.Align.LEFT, false);
                 float summaryLineH = text.descent() - text.ascent();
-                setText(h * 0.017f, inkDim, false, Paint.Align.LEFT, false);
-                float notesLineH = text.descent() - text.ascent();
+                float notesLineH = summaryLineH;
+                setText(suffixSize, inkDim, false, Paint.Align.CENTER, false);
+                float suffixLineH = text.descent() - text.ascent();
+                setText(expanderSize, INK, true, Paint.Align.LEFT, false);
+                float expanderLineH = text.descent() - text.ascent();
                 float rowTopPad = h * 0.006f;
-                float titleGap = h * 0.006f;   // title block -> summary block
-                float summaryGap = h * 0.006f; // summary block -> notes line
+                float titleGap = h * 0.006f;   // title block -> description block
+                float summaryGap = h * 0.006f; // description block -> notes line
+                float optionsGap = h * 0.006f; // notes/description/title block -> Options ▾/▴ line
                 float rowBottomPad = h * 0.006f;
 
-                // Word-wrap title (up to 2 lines) and summary (up to 2 lines)
-                // against rowTextMaxW now, up front, so both the row-height
-                // pass below and the draw loop further down use the exact
-                // same wrapped text -- computed once per row, not per frame
-                // twice, and guaranteed consistent between the two passes.
-                int rowCount = Math.min(rows.size(), MAX_MOD_ROWS);
+                // Word-wrap title (up to 2 lines) and description (up to 2
+                // lines, ellipsized after that -- see wrapLines) against
+                // rowTextMaxW now, up front, so both the row-height pass
+                // below and the draw loop further down use the exact same
+                // wrapped text. displayRows is already flattened (see
+                // buildDisplayRows), so every parent AND every expanded
+                // option-group row gets its own entry here.
+                int rowCount = Math.min(displayRows.size(), MAX_MOD_ROWS);
                 String[][] titleLines = new String[rowCount][];
                 String[][] summaryLines = new String[rowCount][];
+                String[][] notesLines = new String[rowCount][];
+                String[][] optionTitleLines = new String[rowCount][];
                 float[] rowHeights = new float[rowCount];
+                // Maps each mods-page focus-list index (before the trailing
+                // Import button, added after this switch) to the display-row
+                // index it belongs to -- a plain row/picker contributes one
+                // focus entry (its button/picker), an expandable parent row
+                // contributes two (the "Options ▾/▴" line, then its button)
+                // -- see the draw loop below, which appends
+                // settingsFocusRects/Activate/StepLeft/Right in this SAME
+                // order so the two stay in lockstep.
+                java.util.List<Integer> focusRowIndex = new java.util.ArrayList<>();
                 float contentH = 0f;
                 for (int i = 0; i < rowCount; i++) {
-                    ModRow row = rows.get(i);
-                    setText(h * 0.026f, INK, true, Paint.Align.LEFT, false);
-                    applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
-                    titleLines[i] = wrapLines(row.title, rowTextMaxW, 2);
-                    setText(h * 0.021f, inkDim, false, Paint.Align.LEFT, false);
-                    summaryLines[i] = wrapLines(row.summary, rowTextMaxW, 2);
-                    boolean hasNotes = row.notes != null && !row.notes.isEmpty();
+                    ModDisplayRow dr = displayRows.get(i);
+                    if (dr.parent != null) {
+                        ModRow row = dr.parent;
+                        setText(titleSize, INK, true, Paint.Align.LEFT, false);
+                        applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+                        titleLines[i] = wrapLines(row.title, rowTextMaxW, 2);
+                        setText(summarySize, inkDim, false, Paint.Align.LEFT, false);
+                        summaryLines[i] = wrapLines(row.summary, rowTextMaxW, 2);
+                        boolean hasNotes = row.notes != null && !row.notes.isEmpty();
+                        // Notes render at summarySize (same as the
+                        // description) and wrap onto up to 2 lines -- see
+                        // item 5: never a single ellipsized line.
+                        notesLines[i] = hasNotes ? wrapLines(row.notes, rowTextMaxW, 2) : new String[0];
 
-                    float textStackH = rowTopPad
-                            + titleLines[i].length * titleLineH
-                            + (summaryLines[i].length > 0 ? titleGap + summaryLines[i].length * summaryLineH : 0f)
-                            + (hasNotes ? summaryGap + notesLineH : 0f)
-                            + rowBottomPad;
-                    rowHeights[i] = Math.max(textStackH, minRowH);
+                        float textStackH = rowTopPad
+                                + titleLines[i].length * titleLineH
+                                + (summaryLines[i].length > 0 ? titleGap + summaryLines[i].length * summaryLineH : 0f)
+                                + (notesLines[i].length > 0 ? summaryGap + notesLines[i].length * notesLineH : 0f)
+                                + (dr.expandable ? optionsGap + expanderLineH : 0f)
+                                + rowBottomPad;
+                        // The button+suffix block is centered as one unit
+                        // (see the draw loop below) -- its own minimum height
+                        // must include the suffix line when present so it's
+                        // never drawn past the row's bottom edge.
+                        float buttonBlockH = boxH + (row.suffix != null ? suffixGap + suffixLineH : 0f);
+                        rowHeights[i] = Math.max(textStackH, h * 0.02f + buttonBlockH);
+                        if (dr.expandable) focusRowIndex.add(i); // "Options ▾/▴" line
+                        focusRowIndex.add(i); // the row's own button
+                    } else {
+                        // Option row title (left label): shared-prefix
+                        // stripped already (dr.optionDisplayTitle -- see
+                        // buildDisplayRows), wrapped onto up to 2 lines
+                        // (ellipsized only if it still overflows -- see
+                        // wrapLines) instead of a single ellipsized line.
+                        setText(optionTitleSize, INK, false, Paint.Align.LEFT, false);
+                        optionTitleLines[i] = wrapLines(dr.optionDisplayTitle, optionTextMaxW, 2);
+                        float optionTitleLineH = text.descent() - text.ascent();
+                        float optionTextStackH = rowTopPad
+                                + Math.max(1, optionTitleLines[i].length) * optionTitleLineH
+                                + rowBottomPad;
+                        rowHeights[i] = Math.max(minRowH, optionTextStackH);
+                        focusRowIndex.add(i); // the picker
+                    }
                     contentH += rowHeights[i];
                 }
+
+                // D-pad focus follow: when the content cursor is on a mod row
+                // (index < focusRowIndex.size() -- see the trailing
+                // Import-button entry added after this switch), scroll its
+                // OWN row (via focusRowIndex, not the raw index) fully into
+                // view BEFORE clamping/drawing below, so the per-row loop
+                // always finds it rowVisible and the eventual focus ring
+                // never lands on a partially-clipped row.
+                int rowsFocusable = focusRowIndex.size();
+                int modsFocusableCount = rowsFocusable + 1; // rows/expanders + the Import button
+                if (settingsFocusArea == SETTINGS_FOCUS_CONTENT) {
+                    if (settingsContentFocus >= modsFocusableCount) {
+                        settingsContentFocus = Math.max(0, modsFocusableCount - 1);
+                    }
+                    if (settingsContentFocus < rowsFocusable) {
+                        int rowIdx = focusRowIndex.get(settingsContentFocus);
+                        float acc = 0f;
+                        for (int k = 0; k < rowIdx; k++) acc += rowHeights[k];
+                        float focusTop = acc, focusBottom = acc + rowHeights[rowIdx];
+                        if (focusTop < modScrollY) modScrollY = focusTop;
+                        else if (focusBottom > modScrollY + viewportH) modScrollY = focusBottom - viewportH;
+                    }
+                }
+
                 float maxScroll = Math.max(0f, contentH - viewportH);
                 // Clamp here (not only in onTouchEvent) since content height
                 // can change out from under a held offset with no touch event
@@ -3091,7 +3693,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 modScrollY = Math.max(0f, Math.min(maxScroll, modScrollY));
                 modContentHeight = contentH;
                 modViewportHeight = viewportH;
-                modListViewport.set(parchment.left, listTop, parchment.right, maxY);
+                modListViewport.set(contentLeft, listTop, contentRight, maxY);
 
                 c.save();
                 c.clipRect(modListViewport);
@@ -3102,84 +3704,266 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                     float rowBottom = rowY + rowH;
                     rowY += rowH;
                     if (rowBottom <= listTop || rowTop >= maxY) continue; // fully scrolled out
-                    ModRow row = rows.get(i);
-                    boolean hasNotes = row.notes != null && !row.notes.isEmpty();
+                    ModDisplayRow dr = displayRows.get(i);
+                    // A row only gets a live hit box when it's FULLY inside
+                    // the viewport -- a partially-clipped row at the top/
+                    // bottom edge is visible but not tappable, so a drag that
+                    // stops mid-scroll can never fire a half-seen button.
+                    boolean rowVisible = rowTop >= listTop && rowBottom <= maxY;
 
-                    // Row name/summary/notes text -- title and summary wrap
-                    // onto up to 2 lines each (see titleLines/summaryLines
-                    // above, computed once and reused here so the drawn text
-                    // always matches the row height computed from it). Each
-                    // block is laid out from its own top (blockTop, not a
-                    // baseline) so switching fonts/sizes between blocks never
-                    // carries over the wrong ascent -- baseline of a block's
-                    // first line is blockTop - ascent, same as textStackH's
-                    // computation above.
-                    float blockTop = rowTop + rowTopPad;
-
-                    setText(h * 0.026f, row.installed && !row.enabled ? inkDim : INK, true, Paint.Align.LEFT, false);
-                    applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
-                    float baseline = blockTop - text.ascent();
-                    for (String line : titleLines[i]) {
-                        c.drawText(line, left, baseline, text);
-                        baseline += titleLineH;
+                    // Thin divider above every top-level mod row (not before
+                    // an option row, and never above the very first row).
+                    if (dr.parent != null && i > 0) {
+                        stroke.setStrokeWidth(1.5f);
+                        stroke.setColor(Color.argb(90, 96, 72, 40));
+                        c.drawLine(contentLeft, rowTop, contentRight, rowTop, stroke);
                     }
-                    blockTop += titleLines[i].length * titleLineH;
 
-                    if (summaryLines[i].length > 0) {
-                        blockTop += titleGap;
-                        setText(h * 0.021f, inkDim, false, Paint.Align.LEFT, false);
-                        baseline = blockTop - text.ascent();
-                        for (String line : summaryLines[i]) {
+                    if (dr.parent != null) {
+                        ModRow row = dr.parent;
+                        float blockTop = rowTop + rowTopPad;
+
+                        setText(titleSize, row.installed && !row.enabled ? inkDim : INK, true, Paint.Align.LEFT, false);
+                        applyTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+                        float baseline = blockTop - text.ascent();
+                        for (String line : titleLines[i]) {
                             c.drawText(line, left, baseline, text);
-                            baseline += summaryLineH;
+                            baseline += titleLineH;
                         }
-                        blockTop += summaryLines[i].length * summaryLineH;
-                    }
+                        blockTop += titleLines[i].length * titleLineH;
 
-                    if (hasNotes) {
-                        blockTop += summaryGap;
-                        setText(h * 0.017f, inkDim, false, Paint.Align.LEFT, false);
-                        c.drawText(ellipsize(row.notes, rowTextMaxW), left, blockTop - text.ascent(), text);
-                    }
+                        if (summaryLines[i].length > 0) {
+                            blockTop += titleGap;
+                            setText(summarySize, inkDim, false, Paint.Align.LEFT, false);
+                            baseline = blockTop - text.ascent();
+                            for (String line : summaryLines[i]) {
+                                c.drawText(line, left, baseline, text);
+                                baseline += summaryLineH;
+                            }
+                            blockTop += summaryLines[i].length * summaryLineH;
+                        }
 
-                    // The button texture is drawn here (inside the clip, on
-                    // top of the row text) so it scrolls and clips exactly
-                    // like the row it belongs to. It only gets a live hit
-                    // box when the row is FULLY inside the viewport, though
-                    // -- a partially-clipped row at the top/bottom edge is
-                    // visible but not tappable, so a drag that stops
-                    // mid-scroll can never fire a half-seen button -- and
-                    // never while modsImporting (busy scrim below, same as
-                    // drawSettingsButton's own dimming elsewhere on this
-                    // page). boxH (the real ~48dp touch height) is computed
-                    // once above the loop, alongside rowBaseH. box is
-                    // centered vertically in the row so it stays clear of the
-                    // (also-enlarged) text stack on the left regardless of
-                    // whether this particular row has a notes line.
-                    RectF box = modRowHitBoxes[i];
-                    float boxTop = rowTop + (rowH - boxH) / 2f;
-                    box.set(parchment.right - w * 0.03f - toggleW, boxTop,
-                            parchment.right - w * 0.03f, boxTop + boxH);
+                        if (notesLines[i].length > 0) {
+                            blockTop += summaryGap;
+                            setText(summarySize, inkDim, false, Paint.Align.LEFT, false);
+                            baseline = blockTop - text.ascent();
+                            for (String line : notesLines[i]) {
+                                c.drawText(line, left, baseline, text);
+                                baseline += notesLineH;
+                            }
+                            blockTop += notesLines[i].length * notesLineH;
+                        }
 
-                    if (row.suffix != null) {
-                        setText(h * 0.012f, inkDim, false, Paint.Align.CENTER, false);
-                        c.drawText(row.suffix, parchment.right - w * 0.03f - toggleW / 2f,
-                                boxTop - h * 0.008f, text);
-                    }
+                        // "Options ▾/▴" expander -- own tap target
+                        // (modExpanderHitBoxes[i], separate from the row's
+                        // own On/Off button below) that just flips this
+                        // group's membership in modExpandedGroups; see
+                        // onTouchEvent. Only drawn for a row whose group has
+                        // at least one option group (dr.expandable). Also its
+                        // own d-pad focus entry (added first, ahead of the
+                        // row's button -- see focusRowIndex above) so a
+                        // controller-only user can reach it at all. The hit
+                        // box itself is full-row-width and at least
+                        // MOD_ROW_BUTTON_H_DP tall (centered on the text's
+                        // own line, clamped inside this row) rather than a
+                        // tight box around the short label -- device
+                        // feedback was that the label-sized box was hard to
+                        // land a tap on.
+                        RectF expBox = modExpanderHitBoxes[i];
+                        if (dr.expandable) {
+                            blockTop += optionsGap;
+                            boolean expanded = modExpandedGroups.contains(dr.expandKey);
+                            String label = "Options " + (expanded ? "▴" : "▾");
+                            setText(expanderSize, INK, true, Paint.Align.LEFT, false);
+                            c.drawText(label, left, blockTop - text.ascent(), text);
+                            float expMinH = dp(MOD_ROW_BUTTON_H_DP);
+                            float expCenterY = blockTop + expanderLineH / 2f;
+                            float expBottom = Math.min(rowBottom, Math.max(blockTop + expanderLineH,
+                                    expCenterY + expMinH / 2f));
+                            float expTop = Math.max(rowTop, expBottom - expMinH);
+                            // Right edge stops short of the row's own On/Off
+                            // button column (checked AFTER this hit box in
+                            // onTouchEvent) so widening this box can never
+                            // swallow a tap meant for that button.
+                            expBox.set(contentLeft, expTop, btnRight - toggleW - w * 0.01f, expBottom);
+                            modExpanderKey[i] = dr.expandKey;
+                            if (modsImporting || !rowVisible) expBox.setEmpty();
+                            final String expKey = dr.expandKey;
+                            settingsFocusRects.add(new RectF(expBox));
+                            settingsFocusActivate.add(() -> {
+                                if (expKey == null) return;
+                                if (!modExpandedGroups.remove(expKey)) modExpandedGroups.add(expKey);
+                                invalidate();
+                            });
+                            settingsFocusStepLeft.add(null);
+                            settingsFocusStepRight.add(null);
+                        } else {
+                            expBox.setEmpty();
+                        }
 
-                    String rowLabel = row.catalogId != null ? "Get" : (row.enabled ? "On" : "Off");
-                    drawCommandButton(c, box, rowLabel, winTex, false);
-                    if (modsImporting) {
-                        fill.setShader(null);
-                        fill.setColor(Color.argb(150, 0, 0, 0));
-                        c.drawRect(box, fill);
-                        box.setEmpty();
-                    } else if (rowTop < listTop || rowBottom > maxY) {
-                        box.setEmpty();
+                        // Button column: fixed ~150x64px at the right edge.
+                        // The button+suffix block (see buttonBlockH above) is
+                        // centered as one unit so a row with a suffix line
+                        // always has real clearance below the button.
+                        float buttonBlockH = boxH + (row.suffix != null ? suffixGap + suffixLineH : 0f);
+                        RectF box = modRowHitBoxes[i];
+                        float boxTop = rowTop + (rowH - buttonBlockH) / 2f;
+                        box.set(btnRight - toggleW, boxTop, btnRight, boxTop + boxH);
+
+                        String rowLabel = row.catalogId != null ? "Get" : (row.enabled ? "On" : "Off");
+                        drawCommandButton(c, box, rowLabel, winTex, false);
+
+                        // File count / conflicts, in small dim text UNDER the
+                        // button (moved off the description line's baseline).
+                        if (row.suffix != null) {
+                            setText(suffixSize, inkDim, false, Paint.Align.CENTER, false);
+                            c.drawText(row.suffix, box.centerX(), box.bottom + suffixGap - text.ascent(), text);
+                        }
+
+                        boolean rowActionable = !modsImporting;
+                        if (modsImporting) {
+                            fill.setShader(null);
+                            fill.setColor(Color.argb(150, 0, 0, 0));
+                            c.drawRect(box, fill);
+                            box.setEmpty();
+                        } else if (!rowVisible) {
+                            box.setEmpty();
+                        }
+                        modRowDirName[i] = row.dirName;
+                        modRowCatalogId[i] = row.catalogId;
+                        modRowEnabled[i] = row.enabled;
+                        modRowIsOptionCycle[i] = false;
+
+                        final String actDir = row.dirName;
+                        final String actCatalogId = row.catalogId;
+                        final boolean actEnabled = row.enabled;
+                        final boolean actOk = rowActionable;
+                        settingsFocusRects.add(new RectF(box));
+                        settingsFocusActivate.add(() -> {
+                            if (!actOk || settingsHost == null) return;
+                            if (actCatalogId != null) settingsHost.requestModGet(actCatalogId);
+                            else settingsHost.onModToggled(actDir, !actEnabled);
+                        });
+                        settingsFocusStepLeft.add(null);
+                        settingsFocusStepRight.add(null);
+                    } else {
+                        // Indented option-group row (only present when its
+                        // parent is expanded -- see buildDisplayRows): title
+                        // on the left, a wide ~520x64px picker on the right
+                        // with ◂/▸ glyphs at the ends and the centered choice
+                        // label. Tapping the left ~22% steps back one choice
+                        // (through choices + "None", wrapping); the rest of
+                        // the button steps forward -- same cycle d-pad
+                        // left/right drive via settingsFocusStepLeft/Right.
+                        com.kalenjohnson.chronoduo.mods.ModManager.OptionGroup og = dr.option;
+
+                        // Title block (1-2 lines, see optionTitleLines above)
+                        // centered as one unit within the row, exactly like
+                        // the parent row's title/description stack.
+                        setText(optionTitleSize, INK, false, Paint.Align.LEFT, false);
+                        float optionTitleLineH = text.descent() - text.ascent();
+                        String[] otLines = optionTitleLines[i];
+                        float titleBlockH = otLines.length * optionTitleLineH;
+                        float titleBaseline = rowTop + (rowH - titleBlockH) / 2f - text.ascent();
+                        for (String line : otLines) {
+                            c.drawText(line, left + optionIndent, titleBaseline, text);
+                            titleBaseline += optionTitleLineH;
+                        }
+
+                        String selectedDir = og.selected();
+                        String selectedLabel = "None";
+                        int selectedIdx = -1;
+                        java.util.List<com.kalenjohnson.chronoduo.mods.ModManager.Choice> choices = og.choices;
+                        for (int ci = 0; ci < choices.size(); ci++) {
+                            if (choices.get(ci).dir.equals(selectedDir)) {
+                                selectedIdx = ci;
+                                selectedLabel = choices.get(ci).label;
+                                break;
+                            }
+                        }
+                        int totalChoices = choices.size() + 1; // + the trailing "None" slot
+                        int curIdx = selectedIdx >= 0 ? selectedIdx : choices.size();
+
+                        RectF box = modRowHitBoxes[i];
+                        float boxTop = rowTop + (rowH - boxH) / 2f;
+                        box.set(btnRight - pickerW, boxTop, btnRight, boxTop + boxH);
+                        drawCommandButton(c, box, "", winTex, false);
+                        float arrowInset = box.width() * 0.06f;
+                        setText(boxH * 0.4f, Color.WHITE, true, Paint.Align.LEFT, true);
+                        c.drawText("◂", box.left + arrowInset, box.centerY() + boxH * 0.14f, text);
+                        setText(boxH * 0.4f, Color.WHITE, true, Paint.Align.RIGHT, true);
+                        c.drawText("▸", box.right - arrowInset, box.centerY() + boxH * 0.14f, text);
+                        // Pick the largest of the 3 picker-label sizes that
+                        // fits between the arrows; falling through to the
+                        // smallest and ellipsizing there is correct by
+                        // construction regardless of the real device
+                        // font metrics for labels like "Original Font
+                        // (Playstation Buttons)", "Steam Controller",
+                        // "Black & White Icons", or "No Battle Gauges".
+                        float pickerLabelMaxW = box.width() * 0.72f;
+                        float chosenPickerSize = pickerLabelSizes[pickerLabelSizes.length - 1];
+                        for (float sz : pickerLabelSizes) {
+                            setText(sz, Color.WHITE, true, Paint.Align.CENTER, true);
+                            if (text.measureText(selectedLabel) <= pickerLabelMaxW) {
+                                chosenPickerSize = sz;
+                                break;
+                            }
+                        }
+                        setText(chosenPickerSize, Color.WHITE, true, Paint.Align.CENTER, true);
+                        c.drawText(ellipsize(selectedLabel, pickerLabelMaxW), box.centerX(),
+                                box.centerY() - (text.ascent() + text.descent()) / 2f, text);
+                        boolean rowActionable = !modsImporting;
+                        if (modsImporting || !rowVisible) box.setEmpty();
+
+                        modRowIsOptionCycle[i] = true;
+                        modRowOptionGroupKey[i] = dr.optionGroupKey;
+                        modRowOptionTitle[i] = og.title;
+                        // Wrap with modulo (matching prevIdx below and the
+                        // settingsFocusStepRight runnable further down) --
+                        // NOT a plain "+1 < size" bounds check, which breaks
+                        // specifically when nothing is selected yet (curIdx
+                        // == choices.size(), the trailing "None" slot): +1
+                        // would be choices.size()+1, never < choices.size(),
+                        // so tapping the forward ("▸") side of the
+                        // picker from a fresh, all-disabled import (every
+                        // option starts disabled -- see extractZip's class
+                        // doc) silently did nothing instead of selecting the
+                        // first choice.
+                        int nextIdx = cycleStepForward(curIdx, totalChoices);
+                        modRowOptionNextChoice[i] = nextIdx < choices.size() ? choices.get(nextIdx).dir : null;
+                        int prevIdx = cycleStepBack(curIdx, totalChoices);
+                        modRowOptionPrevChoice[i] = prevIdx < choices.size() ? choices.get(prevIdx).dir : null;
+                        modExpanderHitBoxes[i].setEmpty();
+
+                        final String ogKey = dr.optionGroupKey;
+                        final String ogTitle = og.title;
+                        final java.util.List<com.kalenjohnson.chronoduo.mods.ModManager.Choice> choicesFinal = choices;
+                        final int curIdxFinal = curIdx, totalFinal = totalChoices;
+                        final boolean actOk = rowActionable;
+                        settingsFocusRects.add(new RectF(box));
+                        if (totalFinal > 1) {
+                            Runnable stepBack = () -> {
+                                if (!actOk || settingsHost == null) return;
+                                int ni = (curIdxFinal - 1 + totalFinal) % totalFinal;
+                                settingsHost.onModOptionSelected(ogKey, ogTitle,
+                                        ni < choicesFinal.size() ? choicesFinal.get(ni).dir : null);
+                            };
+                            Runnable stepForward = () -> {
+                                if (!actOk || settingsHost == null) return;
+                                int ni = (curIdxFinal + 1) % totalFinal;
+                                settingsHost.onModOptionSelected(ogKey, ogTitle,
+                                        ni < choicesFinal.size() ? choicesFinal.get(ni).dir : null);
+                            };
+                            // Confirm is never a no-op: it steps forward, same as ▸/right.
+                            settingsFocusActivate.add(stepForward);
+                            settingsFocusStepLeft.add(stepBack);
+                            settingsFocusStepRight.add(stepForward);
+                        } else {
+                            settingsFocusActivate.add(null);
+                            settingsFocusStepLeft.add(null);
+                            settingsFocusStepRight.add(null);
+                        }
                     }
-                    modRowDirName[i] = row.dirName;
-                    modRowCatalogId[i] = row.catalogId;
-                    modRowEnabled[i] = row.enabled;
                 }
                 c.restore();
                 modRowCount = rowCount;
@@ -3188,8 +3972,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 // end) in the reserved margin right of the row toggles --
                 // only shown/tappable while the list actually overflows.
                 if (maxScroll > 0f) {
-                    float trackX0 = parchment.right - w * 0.022f;
-                    float trackX1 = parchment.right - w * 0.006f;
+                    float trackX0 = contentRight - w * 0.022f;
+                    float trackX1 = contentRight - w * 0.006f;
                     float chevronH = h * 0.025f;
                     modScrollUpHitBox.set(trackX0, listTop, trackX1, listTop + chevronH);
                     modScrollDownHitBox.set(trackX0, maxY - chevronH, trackX1, maxY);
@@ -3213,31 +3997,42 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                     modScrollY = 0f;
                 }
 
-                y = maxY + h * 0.008f;
+                // Pinned footer: Import button on the left, status/message
+                // text (two lines max) to its right -- the "restart for a
+                // full refresh" note is always the second line, taking the
+                // first line's place when there's no message to show.
+                float footerY = maxY + h * 0.025f;
+                btnA = new RectF(left, footerY, left + Math.min(textW * 0.42f, w * 0.34f), footerY + modsBtnH);
+                labelA = "Import file…";
+                final boolean modsBusyImport = modsImporting;
+                settingsFocusRects.add(new RectF(btnA));
+                settingsFocusActivate.add(() -> {
+                    if (!modsBusyImport && settingsHost != null) settingsHost.requestModImport();
+                });
+                settingsFocusStepLeft.add(null);
+                settingsFocusStepRight.add(null);
 
-                // Fixed advance (not drawSettingsBody's own return) regardless
-                // of whether anything is actually drawn here, so the button/
-                // note below never shifts position the instant an
-                // import/get starts, finishes, or errors -- that shift was
-                // exactly what made the row budget above unsafe to compute
-                // once, up front.
+                float statusX = btnA.right + w * 0.025f;
+                float statusW = Math.max(0f, contentRight - statusX);
+                String statusLine1 = null;
+                int statusColor1 = INK;
                 if (modsImporting) {
-                    drawSettingsBody(c, modsMessage != null ? modsMessage : "working...",
-                            left, y, textW, h, INK, STATUS_LINE_SIZE_FRAC);
+                    statusLine1 = modsMessage != null ? modsMessage : "working...";
                 } else if (modsError != null) {
-                    drawSettingsBody(c, "error: " + modsError, left, y, textW, h,
-                            Color.rgb(150, 30, 30), STATUS_LINE_SIZE_FRAC);
+                    statusLine1 = "error: " + modsError;
+                    statusColor1 = Color.rgb(150, 30, 30);
                 } else if (modsMessage != null) {
-                    drawSettingsBody(c, modsMessage, left, y, textW, h, INK, STATUS_LINE_SIZE_FRAC);
+                    statusLine1 = modsMessage;
                 }
-                y += h * 0.03f;
-
-                btnA = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.006f,
-                        parchment.centerX() + btnW / 2f, y + h * 0.006f + modsBtnH);
-                labelA = "Import file (.ctp / .zip)...";
-                y = btnA.bottom + h * 0.02f;
-
-                drawSettingsBody(c, "Restart the game for a full refresh.", left, y, textW, h, inkDim);
+                float statusLineH = h * STATUS_LINE_SIZE_FRAC * BODY_LINE_H_RATIO;
+                float statusBaseline1 = btnA.top + statusLineH * 0.8f;
+                if (statusLine1 != null) {
+                    setText(h * STATUS_LINE_SIZE_FRAC, statusColor1, false, Paint.Align.LEFT, false);
+                    c.drawText(ellipsize(statusLine1, statusW), statusX, statusBaseline1, text);
+                }
+                setText(h * STATUS_LINE_SIZE_FRAC, inkDim, false, Paint.Align.LEFT, false);
+                c.drawText(ellipsize("Restart for a full refresh.", statusW), statusX,
+                        statusBaseline1 + statusLineH, text);
                 break;
             }
         }
@@ -3256,40 +4051,51 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             // Small text-style "Reset explored maps" action under the fog
             // toggle (its hit box is padded well beyond the glyphs).
             float captionY = btnA.bottom + h * 0.03f;
-            setText(h * 0.02f, INK, true, Paint.Align.CENTER, false);
+            setText(h * 0.02f, INK, true, Paint.Align.LEFT, false);
             String resetLabel = "Reset explored maps";
-            c.drawText(resetLabel, btnA.centerX(), captionY, text);
+            c.drawText(resetLabel, btnA.left, captionY, text);
             float resetHalfW = text.measureText(resetLabel) / 2f + w * 0.01f;
-            fogResetHitBox.set(btnA.centerX() - resetHalfW, btnA.bottom,
-                    btnA.centerX() + resetHalfW, captionY + h * 0.02f);
+            fogResetHitBox.set(btnA.left - w * 0.01f, btnA.bottom,
+                    btnA.left + resetHalfW * 2f, captionY + h * 0.02f);
+            settingsFocusRects.add(new RectF(fogResetHitBox));
+            settingsFocusActivate.add(() -> FogOfWar.clearAll());
+            settingsFocusStepLeft.add(null);
+            settingsFocusStepRight.add(null);
         } else if (page == SPEED_PAGE) {
             drawSettingsButton(c, btnA, labelA, winTex, false, ffSpeedHitBox);
             drawSettingsButton(c, btnB, labelB, winTex, false, ffModeHitBox);
         } else if (page == MODS_PAGE) { // Mods
-            // Per-row Get/On/Off buttons are drawn earlier, inside the row
-            // list's own clip/scroll pass above (see the Mods case in the
-            // switch), so they scroll and clip with their row instead of
+            // Per-row Get/On/Off/picker buttons are drawn earlier, inside the
+            // row list's own clip/scroll pass above (see the Mods case in
+            // the switch), so they scroll and clip with their row instead of
             // sitting on top of everything unclipped like this page's other
             // buttons. Only the fixed Import-file button belongs here.
             drawSettingsButton(c, btnA, labelA, winTex, modsImporting, modImportButtonHitBox);
         }
 
-        // Bottom row: [prev] [Back] [next], arrows kept close to square.
-        float navH = h * 0.065f;
-        float navTop = parchment.bottom - h * 0.09f;
-        float backW = parchment.width() * 0.34f;
-        float arrowW = navH * 1.3f;
-        float navGap = parchment.width() * 0.02f;
-        RectF backBtn = new RectF(parchment.centerX() - backW / 2f, navTop,
-                parchment.centerX() + backW / 2f, navTop + navH);
-        RectF prevBtn = new RectF(backBtn.left - navGap - arrowW, navTop, backBtn.left - navGap, navTop + navH);
-        RectF nextBtn = new RectF(backBtn.right + navGap, navTop, backBtn.right + navGap + arrowW, navTop + navH);
-        drawCommandButton(c, prevBtn, TARGET_LABELS[0], winTex, false);
+        // Rail's own Back button, bottom of the rail.
         drawCommandButton(c, backBtn, "Back", winTex, false);
-        drawCommandButton(c, nextBtn, TARGET_LABELS[2], winTex, false);
-        settingsPrevHitBox.set(prevBtn);
         settingsBackHitBox.set(backBtn);
-        settingsNextHitBox.set(nextBtn);
+
+        // D-pad focus ring: 2px navy outline around whatever's focused --
+        // a rail tab/Back, or the current content-area item.
+        RectF ring = null;
+        if (settingsFocusArea == SETTINGS_FOCUS_RAIL) {
+            ring = settingsRailFocus < SETTINGS_PAGES.length ? settingsTabHitBoxes[settingsRailFocus] : backBtn;
+        } else if (settingsContentFocus >= 0 && settingsContentFocus < settingsFocusRects.size()) {
+            RectF r = settingsFocusRects.get(settingsContentFocus);
+            if (r != null && !r.isEmpty()) ring = r;
+        }
+        if (settingsFocusArea == SETTINGS_FOCUS_CONTENT && settingsFocusRects.isEmpty()) {
+            settingsFocusArea = SETTINGS_FOCUS_RAIL; // page has nothing focusable -- don't strand the cursor
+        }
+        if (ring != null && !ring.isEmpty()) {
+            stroke.setStrokeWidth(2f);
+            stroke.setColor(BOX_BG);
+            RectF ringR = new RectF(ring);
+            ringR.inset(-2f, -2f);
+            c.drawRect(ringR, stroke);
+        }
     }
 
     /** Settings section heading (monospace, INK) at {@code y}; returns the y for the body text that follows. */
