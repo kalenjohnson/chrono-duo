@@ -117,6 +117,7 @@ public class AppActivity extends Cocos2dxActivity {
             return;
         }
         sLiveInstance = this;
+        controllerInput.setContext(this);
         try {
             runtime = ChronoRuntime.bootstrap(this);
         } catch (Exception e) {
@@ -415,6 +416,24 @@ public class AppActivity extends Cocos2dxActivity {
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
         int kc = event.getKeyCode();
+        // Right trigger (R2) is fast-forward, not a game input (the game
+        // uses L1/R1 for page-shift, not the triggers) -- always swallowed,
+        // never reaches controllerInput/the game. See GameSpeed for the
+        // HOLD/TOGGLE semantics; the analog-trigger path lives in
+        // GameControllerInput.handleMotionEvent (AXIS_RTRIGGER/AXIS_GAS).
+        if (kc == KeyEvent.KEYCODE_BUTTON_R2) {
+            if (event.getRepeatCount() == 0) {
+                // GameSpeed merges this KEY edge with the analog AXIS edge
+                // (an analog trigger delivers both for one pull) and
+                // branches HOLD (activate) vs TOGGLE (flip) itself.
+                if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                    com.kalenjohnson.chronoduo.GameSpeed.press(this, com.kalenjohnson.chronoduo.GameSpeed.Source.KEY);
+                } else if (event.getAction() == KeyEvent.ACTION_UP) {
+                    com.kalenjohnson.chronoduo.GameSpeed.release(this, com.kalenjohnson.chronoduo.GameSpeed.Source.KEY);
+                }
+            }
+            return true;
+        }
         if (event.getAction() == KeyEvent.ACTION_UP && swallowedKeys.remove((Integer) kc)) {
             return true;
         }

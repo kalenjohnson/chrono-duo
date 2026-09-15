@@ -230,6 +230,31 @@ public final class GameState {
 
     public static native void nativeUpdateBattleFlag();           // GL thread only
     public static native boolean nativeGetBattleFlag();
+
+    // --- fast-forward (cocos2d::Scheduler::_timeScale) ---------------------
+    // See NOTES.md "Fast-forward research (2026-09-15)": every game mode
+    // converts cocos delta-time into 1..10 SNES logic frames per render, so
+    // scaling Scheduler::_timeScale scales the whole game uniformly. Music
+    // tempo (SEAD, real-time) is unaffected; sound effects fire faster.
+
+    /**
+     * Sets the desired speed multiplier (clamped to [0.25, 10] natively).
+     * Just stores the value -- does not touch the Scheduler. Safe to call
+     * from any thread; call nativeApplyGameSpeed on the GL thread afterwards
+     * to actually apply it.
+     */
+    public static native void nativeSetGameSpeed(float speed);
+
+    /**
+     * Writes the last value passed to nativeSetGameSpeed into
+     * cocos2d::Scheduler::_timeScale. GL thread only -- call via
+     * Cocos2dxHelper.runOnGLThread(GameState::nativeApplyGameSpeed). Also
+     * re-invoked from inside nativeUpdateBattleFlag (already GL-thread, 2x/s)
+     * so the speed is re-asserted if anything ever resets it. No-ops (once,
+     * with a LOGE) if the first read of the Scheduler+0x24 slot doesn't read
+     * exactly 1.0 -- the offset would be wrong for this build.
+     */
+    public static native void nativeApplyGameSpeed();
     public static native void nativeDumpBattleBuffers(String dir); // any thread; uses cached node ptr
     // Live battle actor array (10 * 0x80-byte slots), or null if not in battle
     // or any pointer in the chase is bad. Any thread; uses cached node ptr.

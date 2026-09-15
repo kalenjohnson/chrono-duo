@@ -344,10 +344,11 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // settingsPage is the 0-based page in view, kept across open/close so
     // reopening lands where the user left off. The prev/next hit boxes are
     // set only while drawSettingsScreen draws the corresponding arrow.
-    private static final String[] SETTINGS_PAGES = {"Imports", "Graphics", "Maps", "Mods"};
+    private static final String[] SETTINGS_PAGES = {"Imports", "Graphics", "Maps", "Speed", "Mods"};
     // Mods is always the last page -- derived so nothing else needs updating
     // if another page is ever inserted before it.
     private static final int MODS_PAGE = SETTINGS_PAGES.length - 1;
+    private static final int SPEED_PAGE = MODS_PAGE - 1;
     private int settingsPage;
     private final RectF settingsPrevHitBox = new RectF();
     private final RectF settingsNextHitBox = new RectF();
@@ -683,6 +684,15 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     // Hit box for the "Build original art" button -- left empty while
     // building, same double-fire guard as importButtonHitBox.
     private final RectF origArtButtonHitBox = new RectF();
+    // Speed settings page (see GameSpeed) -- "Speed: Nx" and "Right trigger:
+    // Hold/Toggle" buttons, same drawSettingsButton style/hit-box handling
+    // as the Graphics page's pixelGraphicsHitBox/origArtButtonHitBox above.
+    private final RectF ffSpeedHitBox = new RectF();
+    private final RectF ffModeHitBox = new RectF();
+    // On-panel fast-forward badge (both in and out of battle) -- see
+    // drawFastForwardBadge. Tapping it toggles GameSpeed regardless of
+    // ffMode.
+    private final RectF ffHitBox = new RectF();
 
     /**
      * Pushes live original-art rebuild progress/result to the settings screen
@@ -761,6 +771,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         pixelGraphicsOn = GameState.getPixelGraphicsPref(context);
         fogOn = prefs.getBoolean(KEY_FOG_ON, true);
         FogOfWar.init(context.getFilesDir());
+        // Repaints the badge (see drawFastForwardBadge) whenever the R2
+        // trigger/analog binding or the Speed settings page changes
+        // GameSpeed's state from outside this view.
+        GameSpeed.setListener(this::invalidate);
     }
 
     /** Toggles and persists the enemy hidden-HP display setting; called from the eye-glyph tap handler in {@link #onTouchEvent}. */
@@ -909,6 +923,18 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 if (settingsHost != null) settingsHost.requestOrigArtBuild();
                 return true;
             }
+            if (!ffSpeedHitBox.isEmpty()
+                    && ffSpeedHitBox.contains(event.getX(), event.getY())) {
+                GameSpeed.cycleSpeed(getContext());
+                invalidate();
+                return true;
+            }
+            if (!ffModeHitBox.isEmpty()
+                    && ffModeHitBox.contains(event.getX(), event.getY())) {
+                GameSpeed.cycleMode(getContext());
+                invalidate();
+                return true;
+            }
             if (!settingsPrevHitBox.isEmpty()
                     && settingsPrevHitBox.contains(event.getX(), event.getY())) {
                 if (modsPageActive) modScrollY = 0f; // leaving the Mods page
@@ -939,6 +965,13 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         if (!snap.inBattle && !gearHitBox.isEmpty()
                 && gearHitBox.contains(event.getX(), event.getY())) {
             settingsMode = true;
+            invalidate();
+            return true;
+        }
+        // Fast-forward badge (see drawFastForwardBadge): drawn/hit-testable
+        // both in and out of battle, toggle semantics regardless of ffMode.
+        if (!ffHitBox.isEmpty() && ffHitBox.contains(event.getX(), event.getY())) {
+            GameSpeed.toggle(getContext());
             invalidate();
             return true;
         }
@@ -1844,6 +1877,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         if (s.autoBattleAvailable) {
             areaTop = Math.max(areaTop, autoChipRect(parchment).bottom + h * 0.065f);
         }
+        // The fast-forward badge (see drawFastForwardBadge) is drawn
+        // top-left in every battle, unconditionally (unlike the AUTO chip
+        // above) -- clear it the same way regardless of autoBattleAvailable.
+        areaTop = Math.max(areaTop, parchment.top + 14f + dp(MOD_ROW_BUTTON_H_DP) + h * 0.065f);
         // Leave room for the command-button band (see drawCommandButtons)
         // when it's showing, so a long enemy list compresses instead of
         // drawing through the buttons.
@@ -2500,6 +2537,54 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
     }
 
     /**
+     * On-panel fast-forward badge, drawn both in and out of battle (see the
+     * {@link #onDraw} call sites) -- reuses {@link #drawCommandButton}'s
+     * chrome like {@link #drawAutoToggle} does. Shows ">> Nx" (highlighted)
+     * while {@link GameSpeed#isActive} is true; otherwise a dimmed/hollow
+     * ">>" so it stays discoverable and tappable to turn fast-forward on.
+     * Tapping it always toggles, regardless of {@link GameSpeed.Mode}. Out
+     * of battle it sits immediately right of the gear chip (which occupies
+     * the top-left corner then); in battle the gear chip is hidden, so the
+     * badge takes that same top-left spot instead -- either way it stays
+     * clear of the top-right eye glyph/AUTO chip and the enemy HP rows
+     * below. Sized to a {@link #MOD_ROW_BUTTON_H_DP}-tall (>=48dp) touch
+     * target, like the AUTO chip. Sets {@link #ffHitBox}.
+     */
+    private void drawFastForwardBadge(Canvas c, RectF parchment, boolean inBattle) {
+        float chipH = dp(MOD_ROW_BUTTON_H_DP);
+        float chipW = dp(84f);
+        float left, top;
+        if (inBattle) {
+            left = parchment.left + 24f;
+            top = parchment.top + 14f;
+        } else {
+            left = parchment.left + 24f + GEAR_CHIP_SIZE + dp(10f);
+            top = parchment.top + 24f + (GEAR_CHIP_SIZE - chipH) / 2f;
+        }
+        if (inBattle) {
+            // Clamp against the AUTO chip (top-right) on a narrow panel so
+            // the two never meet -- autoChipRect is only meaningful when the
+            // AUTO chip is actually shown, but it's a safe upper bound either way.
+            float maxRight = autoChipRect(parchment).left - dp(8f);
+            chipW = Math.min(chipW, Math.max(dp(32f), maxRight - left));
+        }
+        RectF box = new RectF(left, top, left + chipW, top + chipH);
+        ffHitBox.set(box);
+
+        boolean active = GameSpeed.isActive();
+        Bitmap winTex = ChronoAssets.getWindowTex();
+        String label = active ? (">> " + (int) GameSpeed.getSpeed(getContext()) + "x") : ">>";
+        drawCommandButton(c, box, label, winTex, false, active);
+        if (!active) {
+            // Dim/hollow when inactive -- still tappable (toggles on), just
+            // visually secondary to the active state.
+            fill.setShader(null);
+            fill.setColor(Color.argb(140, 0, 0, 0));
+            c.drawRect(box, fill);
+        }
+    }
+
+    /**
      * Settings gear chip in the parchment's top-left corner, inset just
      * inside the aged-paper overlay's ink frame line (see {@link
      * #drawParchmentOverlay}). Drawn only outside battle (see {@link
@@ -2676,6 +2761,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         fogToggleHitBox.setEmpty();
         fogResetHitBox.setEmpty();
         origArtButtonHitBox.setEmpty();
+        ffSpeedHitBox.setEmpty();
+        ffModeHitBox.setEmpty();
+        ffHitBox.setEmpty();
         modImportButtonHitBox.setEmpty();
         for (int i = 0; i < MAX_MOD_ROWS; i++) modRowHitBoxes[i].setEmpty();
         modRowCount = 0;
@@ -2766,6 +2854,22 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
                 y = drawSettingsHeading(c, worldMapStatusText(), left, y, h);
                 drawSettingsBody(c, "Overworld maps are rendered from the game's own data "
                         + "the first time it runs.", left, y, textW, h, inkDim);
+                break;
+            }
+            case 3: { // Speed (SPEED_PAGE)
+                y = drawSettingsHeading(c, "Fast-forward", left, y, h);
+                y = drawSettingsBody(c, "Speeds up the whole game -- field, world map and "
+                        + "battle alike -- while held or toggled on. Sound effects and music "
+                        + "tempo are unaffected.", left, y, textW, h, inkDim);
+                btnA = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
+                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                labelA = "Speed: " + (int) GameSpeed.getSpeed(getContext()) + "x";
+                y = btnA.bottom + h * 0.03f;
+
+                btnB = new RectF(parchment.centerX() - btnW / 2f, y + h * 0.01f,
+                        parchment.centerX() + btnW / 2f, y + h * 0.01f + btnH);
+                labelB = "Right trigger: "
+                        + (GameSpeed.getMode(getContext()) == GameSpeed.Mode.HOLD ? "Hold" : "Toggle");
                 break;
             }
             default: { // Mods -- a curated catalog (tap to get) plus any installed/imported mods.
@@ -3037,7 +3141,10 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             float resetHalfW = text.measureText(resetLabel) / 2f + w * 0.01f;
             fogResetHitBox.set(btnA.centerX() - resetHalfW, btnA.bottom,
                     btnA.centerX() + resetHalfW, captionY + h * 0.02f);
-        } else { // page == 3, Mods
+        } else if (page == SPEED_PAGE) {
+            drawSettingsButton(c, btnA, labelA, winTex, false, ffSpeedHitBox);
+            drawSettingsButton(c, btnB, labelB, winTex, false, ffModeHitBox);
+        } else if (page == MODS_PAGE) { // Mods
             // Per-row Get/On/Off buttons are drawn earlier, inside the row
             // list's own clip/scroll pass above (see the Mods case in the
             // switch), so they scroll and clip with their row instead of
@@ -3628,6 +3735,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         boolean listMode = !resultsMode && snap.inBattle && snap.listOpen && !snap.listRows.isEmpty();
         if (snap.inBattle) {
             gearHitBox.setEmpty();
+            // Top-left is free in battle (the gear chip is hidden), so the
+            // badge takes its spot -- see drawFastForwardBadge.
+            drawFastForwardBadge(c, parchment, true);
             drawEyeToggle(c, parchment);
             if (snap.autoBattleAvailable) {
                 drawAutoToggle(c, parchment);
@@ -3664,6 +3774,9 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
             listVisibleCount = 0;
             listBackHitBox.setEmpty();
             drawGearChip(c, parchment);
+            // Outside battle the gear chip occupies the top-left corner, so
+            // the badge sits immediately to its right instead.
+            drawFastForwardBadge(c, parchment, false);
         }
         // targeting mode has its own wall-clock timeout (see
         // isTargetingActive) that isn't tied to a snapshot change, so the

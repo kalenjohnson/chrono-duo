@@ -2548,7 +2548,13 @@ static int resolve_battle_auto_toggle_index(void *battle_node) {
 }
 
 JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeApplyGameSpeed(JNIEnv *env, jclass cls);
+
+JNIEXPORT void JNICALL
 Java_com_kalenjohnson_chronoduo_GameState_nativeUpdateBattleFlag(JNIEnv *env, jclass cls) {
+    // Re-assert the fast-forward speed here too (this already runs on the GL
+    // thread 2x/s) in case anything ever resets Scheduler::_timeScale.
+    Java_com_kalenjohnson_chronoduo_GameState_nativeApplyGameSpeed(env, cls);
     void *scene = find_running_scene();
     void *node = scene ? find_node_by_type(scene, "Battle", 2) : NULL;
     g_battle_node = node;
@@ -3944,4 +3950,90 @@ Java_com_kalenjohnson_chronoduo_GameState_nativeGetWorldPixelPos(JNIEnv *env, jc
     if (!arr) return NULL;
     (*env)->SetIntArrayRegion(env, arr, 0, 9, buf);
     return arr;
+}
+
+// ---------------------------------------------------------------------------
+// Fast-forward: cocos2d::Scheduler::_timeScale. See NOTES.md "Fast-forward
+// research (2026-09-15)" for the disassembly this is based on.
+//
+//   Director::getInstance()   exported, already dlsym'd as p_dir_getInstance
+//   Director+0xa0             cocos2d::Scheduler* (_scheduler)
+//   Scheduler+0x24            float _timeScale (default 1.0f)
+//
+// Every game mode (Battle/FieldMap/WorldImpl/SpecialEventScene) converts
+// cocos delta-time into 1..10 SNES logic frames per render using the same
+// `acc += dt; n = (int)(acc*60)` idiom, so scaling dt via _timeScale scales
+// the whole game uniformly. Scheduler::setTimeScale is inlined in the game
+// (no non-library writer of Scheduler+0x24 exists), so writing the float
+// directly IS the setter -- there is nothing else to call.
+// ---------------------------------------------------------------------------
+#define SCHEDULER_OFFSET     0xa0
+#define TIMESCALE_OFFSET     0x24
+
+static volatile float g_game_speed = 1.0f;
+static int g_timescale_verified;      // 1 once we've confirmed the offset reads 1.0f
+static int g_timescale_offset_bad;    // 1 if the first read didn't match 1.0f -- never write
+static float g_timescale_last_applied = 1.0f; // for change-only LOGI
+
+// Plain pointer write, not process_vm_writev: the target is game heap that
+// we've just successfully safe_read from (so it's mapped and, per the RE
+// notes, plain writable -- process_vm_writev is a separate seccomp-gated
+// syscall from process_vm_readv and there's no reason to risk it here).
+// Address is validated with plausible_ptr by the only caller before this
+// runs.
+static void plain_write_f32(void *addr, float val) {
+    *(float *)addr = val;
+}
+
+/**
+ * Sets the desired game speed multiplier. Any thread -- just stores a clamped
+ * float; the actual Scheduler write happens on the GL thread via
+ * nativeApplyGameSpeed (or the periodic re-assert from nativeUpdateBattleFlag).
+ */
+JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeSetGameSpeed(JNIEnv *env, jclass cls, jfloat speed) {
+    if (speed < 0.25f) speed = 0.25f;
+    if (speed > 10.0f) speed = 10.0f;
+    g_game_speed = speed;
+}
+
+/**
+ * Applies g_game_speed to cocos2d::Scheduler::_timeScale. GL thread only --
+ * call via Cocos2dxHelper.runOnGLThread. On the very first successful read of
+ * the Scheduler+0x24 slot, requires it to read exactly 1.0f (the engine's own
+ * default and never touched by game code, per NOTES.md) before trusting the
+ * offset; if it reads anything else, logs once and never writes (offset would
+ * be wrong on this build). Only LOGIs when the value actually changes.
+ */
+JNIEXPORT void JNICALL
+Java_com_kalenjohnson_chronoduo_GameState_nativeApplyGameSpeed(JNIEnv *env, jclass cls) {
+    if (g_timescale_offset_bad) return;
+    if (!p_dir_getInstance) return;
+    uint8_t *dir = (uint8_t *)p_dir_getInstance();
+    if (!plausible_ptr(dir)) return;
+    uint8_t *sched = NULL;
+    if (!safe_read(dir + SCHEDULER_OFFSET, &sched, sizeof(sched)) || !plausible_ptr(sched)) return;
+
+    float cur = 0.0f;
+    if (!safe_read(sched + TIMESCALE_OFFSET, &cur, sizeof(cur))) return;
+
+    if (!g_timescale_verified) {
+        if (cur != 1.0f) {
+            g_timescale_offset_bad = 1;
+            LOGE("fast-forward: Scheduler+0x%x read %.4f (expected 1.0) -- offset wrong, disabling",
+                 TIMESCALE_OFFSET, cur);
+            return;
+        }
+        g_timescale_verified = 1;
+        LOGI("fast-forward: verified Scheduler+0x%x == 1.0 (sched=%p)", TIMESCALE_OFFSET, (void *)sched);
+    }
+
+    float target = g_game_speed;
+    if (cur != target) {
+        plain_write_f32(sched + TIMESCALE_OFFSET, target);
+        if (target != g_timescale_last_applied) {
+            LOGI("fast-forward: timeScale %.3f -> %.3f", cur, target);
+            g_timescale_last_applied = target;
+        }
+    }
 }

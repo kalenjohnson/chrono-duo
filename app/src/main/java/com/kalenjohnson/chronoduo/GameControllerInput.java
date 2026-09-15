@@ -1,5 +1,6 @@
 package com.kalenjohnson.chronoduo;
 
+import android.content.Context;
 import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -43,6 +44,18 @@ public final class GameControllerInput {
     public void setCommandNavSink(CommandNavSink sink) {
         navSink = sink;
     }
+
+    private Context context;
+
+    /** Set once from {@link org.cocos2dx.cpp.AppActivity#onCreate} so the analog-trigger
+     * fast-forward binding below can reach {@link GameSpeed} (prefs-backed). */
+    public void setContext(Context ctx) {
+        context = ctx;
+    }
+
+    private static final float TRIGGER_PRESS_THRESHOLD = 0.5f;
+    private static final float TRIGGER_RELEASE_THRESHOLD = 0.3f;
+    private boolean rTriggerHeld;
 
     private boolean connected;
     private boolean hatLeft, hatRight, hatUp, hatDown;
@@ -165,6 +178,24 @@ public final class GameControllerInput {
             }
         }
         hatDown = isDown;
+
+        // Analog right trigger (AXIS_RTRIGGER, or AXIS_GAS on some pads) ->
+        // fast-forward, mirroring the hat-axis edge-tracking pattern above
+        // instead of forwarding to the game (the game has no trigger binding
+        // -- see GameControllerInput's class javadoc). GameSpeed merges this
+        // AXIS edge with the digital KEYCODE_BUTTON_R2 edge from AppActivity
+        // (an analog trigger delivers both for one pull) and applies the
+        // HOLD/TOGGLE semantics once per physical press.
+        float rt = event.getAxisValue(MotionEvent.AXIS_RTRIGGER);
+        float gas = event.getAxisValue(MotionEvent.AXIS_GAS);
+        float trigger = Math.max(rt, gas);
+        if (!rTriggerHeld && trigger > TRIGGER_PRESS_THRESHOLD) {
+            rTriggerHeld = true;
+            if (context != null) GameSpeed.press(context, GameSpeed.Source.AXIS);
+        } else if (rTriggerHeld && trigger < TRIGGER_RELEASE_THRESHOLD) {
+            rTriggerHeld = false;
+            if (context != null) GameSpeed.release(context, GameSpeed.Source.AXIS);
+        }
         return true;
     }
 

@@ -720,9 +720,7 @@ inventory (`resources.bin` pulled from `split_assetPack.apk`, 9,494 entries,
   ItemMenuDataTable,TechnicBaseDataTable,TechnicData0/1Table,
   TechnicMemberTable,TechnicMpTable}.dat`; text `item_mes.txt`,
   `item_mes2.txt`, `tec_mes.txt` per language.
-- **Game speed**: nothing researched yet. `Director::getInstance()` is
-  exported; `Scheduler::setTimeScale` would be the obvious lever (needs
-  GL-thread call), untested.
+- **Game speed**: SOLVED, see "Fast-forward research" below.
 
 ### Auto Battle on the second screen (2026-09-15)
 
@@ -767,3 +765,74 @@ so it was toggling invisibly. Now mirrored as the AUTO chip:
   same 7×8+7 frame grid, 46 colours vs 37,919 — a drop-in for the one
   sheet `rebuild_worldchara.py` proved unrebuildable. Steam ↔ Android file
   parity therefore holds at least for this path.
+
+## Fast-forward research (2026-09-15)
+
+Question: can we add an emulator-style fast-forward through the cocos2d
+engine? **Yes — `Scheduler::_timeScale` alone does it, no code patching.**
+
+How the game advances time (all from `libchrono.so` disassembly,
+`llvm-objdump -d`; the game is a 65816 transliteration — `Asm::_inc8b`,
+`getRegister`, `nmi_battle` etc.):
+
+- Every game mode converts the cocos delta-time into a number of SNES
+  frames with the same accumulator idiom: `acc += dt; n = (int)(acc * 60);
+  clamp n to [1, 10]; acc -= n / 60.0f;` then runs `n` logic frames per
+  render. Users of the idiom (all contain the literal `0x42700000` = 60.0f):
+  - `Battle::update(float)` @0x649c04: n → `SceneBattle+0x2190`, doubled
+    (clamp [2,12]) when `BattleMenu::isAutoBattle()` — that is the game's
+    own auto-battle speed-up. `SceneBattle::update()` @0x64bea4 then does
+    `n` handshakes with the battle thread (created in
+    `SceneBattle::exec_battle_system`; `battle_wait` sets the sync byte at
+    `SceneBattle+0x31d1` = `Battle::isSync()`, notifies cond var
+    `0xbc72c8`, waits on `0xbc72d0` until the main thread clears it).
+  - `FieldMap::Scroll(float)` @0x576ec8 (called from `FieldMap::update`,
+    which first clamps dt: `dt > 0.2f → 1/60`): n → fieldwork+0xcc0.
+  - `WorldImpl::update(float)` @0x60bfb0: n → `WorldImpl+0x2fac`, then
+    `Kazumi()` → `kazumi_Nmi()` per frame. `WorldScene::update` has the
+    same `dt > 0.2f → 1/60` clamp.
+  - `SpecialEventScene::update(float)` @0x778e50 (cutscenes): n frames,
+    no upper clamp.
+- Nothing in game code reads the wall clock for pacing: the only
+  `gettimeofday`/`getTimeInMilliseconds` callers are the SEAD audio
+  driver, bullet/chipmunk profilers and cocos `ui::ScrollView`.
+  `cSfcWork::SetPlayTime()` uses `time()` (wall clock), so the save's play
+  timer is NOT inflated by fast-forward.
+- The game never touches `_timeScale` itself (no non-library
+  `str s, [x, #0x24]`), and `Director::setAnimationInterval` is called
+  once, from `AppDelegate::applicationDidFinishLaunching`.
+
+The lever:
+
+- `Director::drawScene()` @0x8d85a0 does `_scheduler->update(_deltaTime)`
+  through the PLT (`bl <_ZN7cocos2d9Scheduler6updateEf@plt>` at 0x8d8648,
+  so it is GOT-hookable too if ever needed).
+- `Scheduler::update(float)` @0x9003c4 starts with
+  `s8 = *(float*)(this + 0x24) * dt` and passes `s8` to every
+  scheduleUpdate target, timer and the ActionManager — i.e. `_timeScale`
+  lives at **Scheduler+0x24**; `Scheduler::setTimeScale` is inline, so
+  writing the float IS the API.
+- `Director::_scheduler` is at **Director+0xa0** (from the exported
+  `Director::setScheduler`). `Director::getInstance()` is exported and
+  already dlsym'd in gamestate.c.
+
+Shipped (2026-09-15, user-verified: whole game speeds up, music tempo
+unchanged): `GameSpeed` (Java) + `nativeSetGameSpeed`/`nativeApplyGameSpeed`
+(GL thread; refuses to write unless Scheduler+0x24 first reads exactly
+1.0f). R2 = fast-forward (Hold or Toggle, Settings → Speed; 2x/3x/5x);
+panel badge ">>" top-left toggles too. Analog-trigger lesson: the Thor's
+R2 delivers BOTH an AXIS_RTRIGGER motion and a synthetic
+KEYCODE_BUTTON_R2 key for one pull, at different travel points -- merge
+both sources into one held state or Toggle mode fires twice per pull.
+
+Original plan: `nativeSetGameSpeed(float)` → on the GL tick,
+`sched = *(void**)(Director::getInstance() + 0xa0)`,
+`*(float*)(sched + 0x24) = scale` (sanity-check that the slot reads 1.0f
+before the first write). Useful range 1x–5x: the per-update clamp of 10
+logic frames caps the effect at ~10x anyway, and beyond ~6x a dropped
+render frame trips the `dt > 0.2f` reset. Expected side effects: cocos
+actions/fades speed up consistently (good); music tempo does not change
+(SEAD is real-time), sound effects fire faster; input is sampled once per
+render frame so a tap = `n` logic frames (same as emulator fast-forward).
+Also confirmed: every scene's `update` runs on the GL thread, so any
+per-frame native work belongs there.
