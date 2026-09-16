@@ -496,7 +496,7 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         c.drawRect(portrait, fill);
         RectF pin = new RectF(portrait);
         pin.inset(2, 2);
-        int charIdx = indexOfName(m.name);
+        int charIdx = (m.id >= 0 && m.id < PartySnapshot.DEFAULT_NAMES.length) ? m.id : -1; // by id, not name: renamed characters keep their face
         Bitmap face = ChronoAssets.getFace();
         if (face != null && charIdx >= 0) {
             Rect src = faceTileRect(face, charIdx);
@@ -955,10 +955,4 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         return new Rect(x, y, x + tileW, y + tileH);
     }
 
-    private static int indexOfName(String name) {
-        for (int i = 0; i < PartySnapshot.DEFAULT_NAMES.length; i++) {
-            if (PartySnapshot.DEFAULT_NAMES[i].equals(name)) return i;
-        }
-        return -1;
-    }
 }

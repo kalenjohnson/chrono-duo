@@ -132,7 +132,14 @@ Verified live on device (values matched Crono/Marle/Lucca/… canonical stats):
   NOTE: all 7 records hold default join stats even before recruitment — need the
   party list to filter (open question below).
 - **Names: two libc++ std::string tables** (SSO, stride 0x18, 8 entries:
-  chars + Epoch): defaults at cSfcWork+0x18e8, active names at +0x19a8.
+  chars + Epoch). CORRECTED (2026-09-16): the roles were backwards. The LIVE
+  table is cSfcWork+0x18e8 (canvas+0x1928): `NameInputScene::setCharaName`
+  writes it, and `MsgWindow::setupMes`, `BattleMenu::battleMesReplace`,
+  `MenuNodeEquip::setupPageFixedLabels`, `nsShop::CharaStatus::init` read
+  it. The +0x19a8 table (canvas+0x19e8) is only refilled by `GalleryScene` /
+  `EndingListScene` from `TextManager::getTextRemoveCRLF` + `getNickname`,
+  so it held the stock names and the second screen ignored renames.
+  Nicknames (Crono/Marle) live at canvas+0xc0 / +0xd8.
 - `cSfcWork::GetCharaData(i)` = this+0x6924+i*0x154 — a *different* staging
   array, observed all-zero during field play. Not the live store.
 - **Translated-65816 layer**: class `Asm` (`_ld8/_ld16/_adc8/...`), virtual

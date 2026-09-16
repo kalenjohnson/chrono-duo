@@ -9,7 +9,13 @@ import java.util.List;
  * +0x40 level (u32 LE each). HP order verified live (post-loss panel read
  * "70/1" — 70 is Crono's max, at +0x10). MP order is inferred to mirror HP's
  * (max-then-cur) and is NOT independently verified. Active names: libc++
- * std::strings at +0x19a8, stride 0x18 (always SSO-short for 6-char names).
+ * std::strings at +0x18e8 (ChronoCanvas+0x1928), stride 0x18, always
+ * SSO-short for the port's 5-char names. This is the table every game UI
+ * reads (MsgWindow::setupMes, BattleMenu::battleMesReplace, the equip/shop
+ * status panes) and the one NameInputScene::setCharaName writes, so it
+ * follows renames. The +0x19a8 table (canvas+0x19e8) is only rebuilt by the
+ * gallery/ending scenes from the default text and nicknames -- reading it
+ * showed the stock names after a rename.
  */
 public final class PartySnapshot {
     public static final String[] DEFAULT_NAMES =
@@ -17,7 +23,7 @@ public final class PartySnapshot {
 
     private static final int CHARA_BASE = 0x10;
     private static final int CHARA_STRIDE = 0x120;
-    private static final int NAMES_BASE = 0x19a8;
+    private static final int NAMES_BASE = 0x18e8;
     private static final int NAME_STRIDE = 0x18;
     // Active party list in the translated-65816 ("Asm") memory: 3 PC-id
     // bytes, 0x80 = empty slot (SNES CT's $7E2980 convention). Same offset
@@ -74,7 +80,8 @@ public final class PartySnapshot {
     private static final int BTL_MAX_PLAUSIBLE_HP = 9999;
 
     public static final class Member {
-        public String name;
+        public int id; // character id 0..6 (Crono..Magus): record index, portrait/face index
+        public String name; // live name, follows renames -- never use it to identify the character
         public int level, curHp, maxHp, curMp, maxMp;
         public int slot; // 1-based active-party position (party order)
         // Live battle HP, when inBattle -- overrides curHp/maxHp for display
@@ -340,6 +347,7 @@ public final class PartySnapshot {
             int maxHp = u32(b, 0x10);
             if (level <= 0 || level > 99 || maxHp <= 0 || maxHp > 999) continue;
             Member m = new Member();
+            m.id = i;
             m.slot = slot;
             m.level = level;
             m.maxHp = maxHp;
