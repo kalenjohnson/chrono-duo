@@ -13,8 +13,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Drives an SNES/DS -&gt; ChronoDuo save import end to end: reads an .srm or
- * DS .sav, converts the chosen slot via {@link SaveConverter}, and installs
+ * Drives an SNES/DS/Steam -&gt; ChronoDuo save import end to end: reads an
+ * .srm, DS .sav or Steam save_NN.bin, converts the chosen slot via
+ * {@link SaveConverter} (port saves need only a version byte), and installs
  * the result as a {@code Chrono_sp_<N>_0.dat} file plus an updated
  * {@code meta.bin}, per REPORT.md #6.2/#6.3 (facts confirmed live on
  * device, not just from the report) and #7 (DS format).
@@ -28,32 +29,55 @@ public final class SaveImporter {
     private static final int META_SLOT_COUNT = 23;
 
     /**
-     * A save file read off disk, parsed as either SNES or DS -- decided by
-     * size (8192 -&gt; SNES; anything DS-shaped -&gt; DS, see
-     * {@link #parseSaveFile}). Lets the UI flow (slot picker, destination
-     * picker, import) work the same way regardless of source format.
+     * A save file read off disk, parsed as SNES, DS or a Steam/PC port save
+     * -- decided by size first (8192 -&gt; SNES; a DS wrapper size -&gt; DS)
+     * and otherwise by whether it decrypts as the port's own container
+     * (see {@link #parseSaveFile}). Lets the UI flow (slot picker,
+     * destination picker, import) work the same way regardless of source
+     * format. A port save holds exactly one slot.
      */
     public static final class ParsedSaveFile {
-        public final boolean isDs;
-        public final SnesSrm.SrmFile snes; // non-null iff !isDs
-        public final DsSav.DsSlot[] ds; // non-null iff isDs
+        public enum Kind { SNES, DS, PORT }
 
-        private ParsedSaveFile(boolean isDs, SnesSrm.SrmFile snes, DsSav.DsSlot[] ds) {
-            this.isDs = isDs;
+        public final Kind kind;
+        public final boolean isDs; // kept for the existing callers; == (kind == DS)
+        public final SnesSrm.SrmFile snes; // non-null iff kind == SNES
+        public final DsSav.DsSlot[] ds; // non-null iff kind == DS
+        public final byte[] portPayload; // non-null iff kind == PORT: decrypted payload, verbatim
+        public final CtSave port; // non-null iff kind == PORT: parsed view of portPayload
+
+        private ParsedSaveFile(Kind kind, SnesSrm.SrmFile snes, DsSav.DsSlot[] ds,
+                               byte[] portPayload, CtSave port) {
+            this.kind = kind;
+            this.isDs = kind == Kind.DS;
             this.snes = snes;
             this.ds = ds;
+            this.portPayload = portPayload;
+            this.port = port;
         }
 
         public int slotCount() {
-            return isDs ? ds.length : snes.slots.length;
+            switch (kind) {
+                case DS: return ds.length;
+                case PORT: return 1;
+                default: return snes.slots.length;
+            }
         }
 
         public boolean slotUsedInFile(int i) {
-            return isDs ? ds[i].used : snes.slots[i] != null;
+            switch (kind) {
+                case DS: return ds[i].used;
+                case PORT: return i == 0;
+                default: return snes.slots[i] != null;
+            }
         }
 
         public String describe(int i) {
-            return isDs ? SaveImporter.describeSlot(ds[i]) : SaveImporter.describeSlot(snes.slots[i]);
+            switch (kind) {
+                case DS: return SaveImporter.describeSlot(ds[i]);
+                case PORT: return SaveImporter.describeSlot(port);
+                default: return SaveImporter.describeSlot(snes.slots[i]);
+            }
         }
     }
 
@@ -68,12 +92,61 @@ public final class SaveImporter {
                 || size == 524288 || size == DsSav.IMAGE_SIZE + DsSav.DESMUME_FOOTER_SIZE;
     }
 
-    /** Parses {@code data} as SNES (exactly 8192 bytes) or DS (any other recognized wrapper). */
+    /**
+     * Parses {@code data} as SNES (exactly 8192 bytes), DS (any other
+     * recognized wrapper size), or else a Steam/PC port save
+     * ({@code save_NN.bin}: the same Blowfish container the Android build
+     * writes, REPORT.md #3.1). Throws {@link IllegalArgumentException} if
+     * it is none of these.
+     */
     public static ParsedSaveFile parseSaveFile(byte[] data) {
         if (data.length == 8192) {
-            return new ParsedSaveFile(false, SnesSrm.parseSrm(data), null);
+            return new ParsedSaveFile(ParsedSaveFile.Kind.SNES, SnesSrm.parseSrm(data), null, null, null);
         }
-        return new ParsedSaveFile(true, null, DsSav.parseFile(data));
+        if (isRecognizedSaveFileSize(data.length)) {
+            return new ParsedSaveFile(ParsedSaveFile.Kind.DS, null, DsSav.parseFile(data), null, null);
+        }
+        byte[] payload = parsePortContainer(data);
+        if (payload == null) {
+            throw new IllegalArgumentException("file is " + data.length + " bytes -- expected an SNES .srm "
+                    + "(8192 bytes), a DS save (64 KB, 256 KB ARDS export, 512 KB padded image, or DeSmuME .dsv), "
+                    + "or a Steam/PC save_NN.bin");
+        }
+        return new ParsedSaveFile(ParsedSaveFile.Kind.PORT, null, null, payload, CtSave.parse(payload));
+    }
+
+    /**
+     * Port save format versions accepted: 1 is what the Android build
+     * writes; 3 is what Steam writes with an otherwise identical layout
+     * (verified loading on device with the byte set to 1, REPORT.md #6).
+     */
+    private static final int PORT_VERSION_ANDROID = 1;
+    private static final int PORT_VERSION_STEAM = 3;
+    private static final int PORT_MIN_PAYLOAD = 0x1000; // every real save is ~7.9 KB; meta.bin is 447 bytes
+
+    /**
+     * Tries {@code data} as a port save container. Returns the decrypted
+     * payload if it decrypts to a plausible save (sane length trailer,
+     * known format version byte, parses as a {@link CtSave}), else null.
+     * Never throws: a random file just fails the length check.
+     */
+    static byte[] parsePortContainer(byte[] data) {
+        if (data.length < 16 || data.length > 0x10000) return null;
+        byte[] payload;
+        try {
+            payload = CtContainer.decrypt(data);
+        } catch (RuntimeException e) {
+            return null;
+        }
+        if (payload.length < PORT_MIN_PAYLOAD) return null;
+        int version = payload[0] & 0xFF;
+        if (version != PORT_VERSION_ANDROID && version != PORT_VERSION_STEAM) return null;
+        try {
+            CtSave.parse(payload);
+        } catch (RuntimeException e) {
+            return null;
+        }
+        return payload;
     }
 
     /**
@@ -129,6 +202,39 @@ public final class SaveImporter {
         return party + " · " + slot.gold + " G · " + String.format("%02d:%02d", hours, minutes);
     }
 
+    /** Same as {@link #describeSlot(SnesSrm.SnesSlot)}, for a Steam/PC port save. */
+    public static String describeSlot(CtSave save) {
+        StringBuilder party = new StringBuilder();
+        for (byte pb : save.party) {
+            int id = pb & 0xFF;
+            if (id >= 7) continue;
+            if (party.length() > 0) party.append(", ");
+            String name = (id < save.names.size()) ? save.names.get(id) : null;
+            if (name == null || name.isEmpty()) name = SnesSrm.CHAR_ORDER[id];
+            party.append(name).append(" Lv").append(save.chars[id].getLevel());
+        }
+        long hours = save.playTimeSeconds / 3600;
+        long minutes = (save.playTimeSeconds % 3600) / 60;
+        return party + " · " + save.gold + " G · " + String.format("%02d:%02d", hours, minutes);
+    }
+
+    /**
+     * Installs a Steam/PC port save verbatim into {@code destSlot}: the only
+     * change is payload byte 0 (format version 3 -&gt; 1, the sole value the
+     * Android loader accepts). No template is involved, so the scene and
+     * position state is the player's own.
+     */
+    public static String importPortSave(byte[] payload, int destSlot, File saveDir, SecureRandom random)
+            throws IOException {
+        if (payload == null || payload.length < PORT_MIN_PAYLOAD) throw new IllegalArgumentException("not a port save");
+        byte[] out = payload.clone();
+        out[0] = (byte) PORT_VERSION_ANDROID;
+        byte[] fileBytes = CtContainer.encrypt(out, random);
+        writeAtomic(saveDir, destinationFileName(destSlot), fileBytes);
+        updateMetaSavedTime(saveDir, destSlot, random);
+        return "steam";
+    }
+
     /**
      * Converts {@code slot} and writes it into {@code destSlot} of
      * {@code saveDir}, atomically (temp file + rename), then updates
@@ -158,13 +264,15 @@ public final class SaveImporter {
         return installConverted(result, pick.candidate.name, destSlot, saveDir, random);
     }
 
-    /** Dispatches to the SNES or DS {@code importSave} based on {@link ParsedSaveFile#isDs}. */
+    /** Dispatches on {@link ParsedSaveFile#kind}. Port saves ignore {@code templates}. */
     public static String importSave(ParsedSaveFile file, int slotIndex, int destSlot, File saveDir,
                                      List<SaveConverter.TemplateCandidate> templates,
                                      SecureRandom random) throws IOException {
-        return file.isDs
-                ? importSave(file.ds[slotIndex], destSlot, saveDir, templates, random)
-                : importSave(file.snes.slots[slotIndex], destSlot, saveDir, templates, random);
+        switch (file.kind) {
+            case DS: return importSave(file.ds[slotIndex], destSlot, saveDir, templates, random);
+            case PORT: return importPortSave(file.portPayload, destSlot, saveDir, random);
+            default: return importSave(file.snes.slots[slotIndex], destSlot, saveDir, templates, random);
+        }
     }
 
     private static String installConverted(CtSave result, String templateName, int destSlot, File saveDir,

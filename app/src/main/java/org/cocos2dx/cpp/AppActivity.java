@@ -1755,8 +1755,8 @@ public class AppActivity extends Cocos2dxActivity {
     // --- SNES/DS save import (see com.kalenjohnson.chronoduo.saveimport) --
 
     /**
-     * Launches the SAF document picker so the user can pick an SNES or DS
-     * Chrono Trigger save file. Mirrors {@link #launchRomPicker()}.
+     * Launches the SAF document picker so the user can pick an SNES, DS or
+     * Steam/PC Chrono Trigger save file. Mirrors {@link #launchRomPicker()}.
      */
     private void launchSavePicker() {
         android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT);
@@ -1793,11 +1793,8 @@ public class AppActivity extends Cocos2dxActivity {
                     return;
                 }
                 byte[] data = com.kalenjohnson.chronoduo.saveimport.SaveImporter.readAll(in);
-                if (!com.kalenjohnson.chronoduo.saveimport.SaveImporter.isRecognizedSaveFileSize(data.length)) {
-                    postSaveImportError("file is " + data.length + " bytes -- expected an SNES .srm (8192 bytes) "
-                            + "or a DS save (64 KB, 256 KB ARDS export, 512 KB padded image, or DeSmuME .dsv)");
-                    return;
-                }
+                // Size gates SNES/DS; anything else is tried as a Steam/PC
+                // save_NN.bin container inside parseSaveFile.
                 com.kalenjohnson.chronoduo.saveimport.SaveImporter.ParsedSaveFile parsed;
                 try {
                     parsed = com.kalenjohnson.chronoduo.saveimport.SaveImporter.parseSaveFile(data);
@@ -1819,7 +1816,7 @@ public class AppActivity extends Cocos2dxActivity {
                     showSaveSlotPicker(finalParsed);
                 });
             } catch (Throwable t) {
-                Log.e(TAG, "SNES/DS save import (read) failed", t);
+                Log.e(TAG, "SNES/DS/Steam save import (read) failed", t);
                 postSaveImportError(t.getMessage() != null ? t.getMessage() : t.toString());
             }
         }, "SaveRead").start();
@@ -1833,6 +1830,11 @@ public class AppActivity extends Cocos2dxActivity {
             if (!parsed.slotUsedInFile(i)) continue;
             usedIndices.add(i);
             labels.add("Slot " + (i + 1) + ": " + parsed.describe(i));
+        }
+        if (parsed.kind == com.kalenjohnson.chronoduo.saveimport.SaveImporter.ParsedSaveFile.Kind.PORT) {
+            // A Steam/PC file is a single save: skip the slot question.
+            showDestinationSlotPicker(parsed, 0);
+            return;
         }
         new android.app.AlertDialog.Builder(this)
                 .setTitle("Import which save slot?")

@@ -1389,13 +1389,13 @@ final class SettingsScreen {
                 settingsFocusStepRight.add(null);
                 y = btnA.bottom + h * 0.06f;
 
-                y = drawSettingsHeading(c, "SNES/DS save:", left, y, h);
+                y = drawSettingsHeading(c, "SNES/DS/Steam save:", left, y, h);
                 y = drawSettingsBody(c, saveImportStatusText(), left, y, textW, h, INK);
-                y = drawSettingsBody(c, "Copies a save from a SNES (.srm) or DS (.sav/.dst/"
-                        + ".duc/.dsv) file into one of this game's save slots.",
+                y = drawSettingsBody(c, "Copies a save from a SNES (.srm), DS (.sav/.dst/"
+                        + ".duc/.dsv) or Steam/PC (save_NN.bin) file into one of this game's save slots.",
                         left, y, textW, h, inkDim);
                 btnB = new RectF(left, y + h * 0.01f, left + btnW, y + h * 0.01f + btnH);
-                labelB = "Import SNES/DS save...";
+                labelB = "Import save...";
                 final boolean saveBusyB = savingImport;
                 settingsFocusRects.add(btnB);
                 settingsFocusActivate.add(() -> {

@@ -72,8 +72,8 @@ saves.
 - **Original pixel art**: rebuilds the unfiltered SNES-style sprites, field
   chips, and overworld tiles from the 1x art the game itself ships, with
   nearest-neighbour filtering.
-- **Save import**: load a SNES (`.srm`) or DS (`.sav`, `.dst`, `.duc`,
-  `.dsv`) save into a save slot.
+- **Save import**: load a SNES (`.srm`), DS (`.sav`, `.dst`, `.duc`,
+  `.dsv`) or Steam/PC (`save_NN.bin`) save into a save slot.
 
 ## Mods
 
