@@ -135,6 +135,8 @@ public final class PartyPanelView extends View implements ChronoAssets.Listener 
         void requestModGet(String id);
         /** A grouped mod's option-row cycle button tapped (see {@link com.kalenjohnson.chronoduo.mods.ModManager.ModGroup}): {@code group} is the download name, {@code optionTitle} the {@link com.kalenjohnson.chronoduo.mods.ModManager.OptionGroup#title}, and {@code dirOrNull} the choice directory to select ({@code null} to select none). */
         void onModOptionSelected(String group, String optionTitle, String dirOrNull);
+        /** A mod row's ▲/▼ reorder button tapped: {@code name} is the mod's directory name (or any member of its group's move-as-one unit -- see {@link com.kalenjohnson.chronoduo.mods.ModManager#deriveUnits}), {@code up} true for ▲. */
+        void onModMoved(String name, boolean up);
     }
     /** Sets (or clears, with null) the host that handles requests from the settings screen -- see {@link SettingsHost}. Delegates to {@link SettingsScreen}. */
     public void setSettingsHost(SettingsHost host) {

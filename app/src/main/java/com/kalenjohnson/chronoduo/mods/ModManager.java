@@ -44,9 +44,12 @@ import com.github.junrar.rarfile.FileHeader;
  * themselves.
  *
  * <p>{@link #scan()} is the normal entry point: it walks every enabled mod
- * in case-insensitive alphabetical order, resolves conflicts (first mod to
- * claim an archive path wins; later claims of the same path count as a
- * conflict against the LATER mod, i.e. the one that lost), and registers the
+ * in the user's priority order (see {@link ModOrder}, persisted in {@code
+ * mods/.order} and editable from the Mods settings page's ▲/▼ buttons --
+ * unlisted mods fall back to case-insensitive alphabetical order), resolves
+ * conflicts (first mod to claim an archive path wins; later claims of the
+ * same path count as a conflict against the LATER mod, i.e. the one that
+ * lost), and registers the
  * winning set with the native side. {@link #importArchive} unpacks a
  * user-picked {@code .ctp}/{@code .zip} mod archive into the root and
  * rescans; {@link #setEnabled} flips a mod's {@code .disabled} marker and
@@ -352,15 +355,16 @@ public final class ModManager {
     // --- pure scan/collect (no Android, no native calls) --------------------
 
     /**
-     * Walks {@code modsRoot}'s immediate subdirectories in case-insensitive
-     * alphabetical order; each is one mod, skipped entirely (fileCount=0,
-     * conflictCount=0) if it contains a {@code .disabled} marker file.
-     * Within an enabled mod, every regular file is visited depth-first
-     * (dotfiles/dot-directories skipped everywhere; {@code readme*} and
-     * {@code *.txt} skipped only directly at the mod's root, since real
-     * assets like {@code Localize/en/msg/tech.txt} live under subdirs and
-     * must not be swept up by that rule). The archive path is the file's
-     * path relative to the mod directory with {@code '/'} separators.
+     * Walks {@code modsRoot}'s immediate subdirectories in the user's
+     * priority order (see {@link ModOrder#orderedModDirs}); each is one
+     * mod, skipped entirely (fileCount=0, conflictCount=0) if it contains a
+     * {@code .disabled} marker file. Within an enabled mod, every regular
+     * file is visited depth-first (dotfiles/dot-directories skipped
+     * everywhere; {@code readme*} and {@code *.txt} skipped only directly
+     * at the mod's root, since real assets like {@code
+     * Localize/en/msg/tech.txt} live under subdirs and must not be swept up
+     * by that rule). The archive path is the file's path relative to the
+     * mod directory with {@code '/'} separators.
      *
      * <p>The first mod (in the walk order above) to claim a given archive
      * path wins; every later mod that names the same path has that file
@@ -372,14 +376,7 @@ public final class ModManager {
      * on a plain JVM.
      */
     public static ScanResult collect(File modsRoot) {
-        List<File> modDirs = new ArrayList<>();
-        File[] children = modsRoot.isDirectory() ? modsRoot.listFiles() : null;
-        if (children != null) {
-            for (File f : children) {
-                if (f.isDirectory()) modDirs.add(f);
-            }
-        }
-        modDirs.sort(Comparator.comparing(f -> f.getName().toLowerCase(Locale.ROOT)));
+        List<File> modDirs = ModOrder.orderedModDirs(modsRoot);
 
         Set<String> claimed = new HashSet<>();
         List<ModInfo> infos = new ArrayList<>();
@@ -455,24 +452,19 @@ public final class ModManager {
     }
 
     /**
-     * Returns the font file of the first enabled mod (same alphabetical
-     * order {@link #collect} walks) that has one, or {@code null} if none
-     * do. A mod's font is {@code font.ttf} at its root if present (the
-     * lowest-numbered {@code string_N.bin} decrypted by {@link
-     * #processFonts} during import, or a raw {@code .ttf}/{@code .otf}
-     * dropped in under that exact name); failing that, the alphabetically
-     * first raw {@code .ttf}/{@code .otf} file at the mod's root. Pure --
-     * touches only {@code java.io}, so it's JVM-testable; {@link #scan()}
-     * calls this and publishes the result to {@code Cocos2dxBitmap}.
+     * Returns the font file of the first enabled mod (same priority order
+     * {@link #collect} walks -- see {@link ModOrder#orderedModDirs}) that
+     * has one, or {@code null} if none do. A mod's font is {@code
+     * font.ttf} at its root if present (the lowest-numbered {@code
+     * string_N.bin} decrypted by {@link #processFonts} during import, or a
+     * raw {@code .ttf}/{@code .otf} dropped in under that exact name);
+     * failing that, the alphabetically first raw {@code .ttf}/{@code .otf}
+     * file at the mod's root. Pure -- touches only {@code java.io}, so
+     * it's JVM-testable; {@link #scan()} calls this and publishes the
+     * result to {@code Cocos2dxBitmap}.
      */
     public static File findFont(File modsRoot) {
-        File[] children = modsRoot.isDirectory() ? modsRoot.listFiles() : null;
-        if (children == null) return null;
-        List<File> modDirs = new ArrayList<>();
-        for (File f : children) {
-            if (f.isDirectory()) modDirs.add(f);
-        }
-        modDirs.sort(Comparator.comparing(f -> f.getName().toLowerCase(Locale.ROOT)));
+        List<File> modDirs = ModOrder.orderedModDirs(modsRoot);
         for (File modDir : modDirs) {
             if (new File(modDir, DISABLED_MARKER).isFile()) continue;
             File primary = new File(modDir, "font.ttf");
@@ -1696,6 +1688,76 @@ public final class ModManager {
     public void setEnabled(String name, boolean enabled) {
         applyMainToggle(root, groups(), name, enabled);
         scan();
+    }
+
+    /**
+     * Maps {@code orderedDirs} (see {@link ModOrder#orderedModDirs}) to
+     * "move as one" units for the Mods page's ▲/▼ reorder buttons: every
+     * directory that's a member of some {@link ModGroup} in {@code gr} --
+     * its {@code mainDir} or any {@link OptionGroup} {@link Choice#dir} --
+     * is grouped into ONE unit with every other dir sharing that same
+     * group, positioned at the index of whichever member appears FIRST in
+     * {@code orderedDirs}; every other directory is its own singleton
+     * unit. A group with no {@code mainDir} (an all-options download --
+     * see {@link ModGroup#mainDir}'s doc) still moves as one block by this
+     * rule, even though the Mods page shows its sub-mods as separate flat
+     * rows today.
+     */
+    public static List<List<String>> deriveUnits(List<File> orderedDirs, GroupResult gr) {
+        Map<String, String> memberGroupKey = new java.util.HashMap<>();
+        for (ModGroup g : gr.groups) {
+            if (g.mainDir != null) memberGroupKey.put(g.mainDir, g.downloadName);
+            for (OptionGroup og : g.options) {
+                for (Choice c : og.choices) memberGroupKey.put(c.dir, g.downloadName);
+            }
+        }
+        List<List<String>> units = new ArrayList<>();
+        Map<String, Integer> unitIndexByKey = new java.util.HashMap<>();
+        for (File dir : orderedDirs) {
+            String name = dir.getName();
+            String key = memberGroupKey.get(name);
+            if (key == null) {
+                units.add(new ArrayList<>(Collections.singletonList(name)));
+                continue;
+            }
+            Integer idx = unitIndexByKey.get(key);
+            if (idx == null) {
+                List<String> unit = new ArrayList<>();
+                unit.add(name);
+                units.add(unit);
+                unitIndexByKey.put(key, units.size() - 1);
+            } else {
+                units.get(idx).add(name);
+            }
+        }
+        return units;
+    }
+
+    /**
+     * Moves {@code dirName}'s unit (see {@link #deriveUnits}) up or down
+     * one slot among its siblings and persists the new order (see {@link
+     * ModOrder#move}), then rescans -- called from the Mods page's ▲/▼
+     * buttons (see {@code PartyPanelView.SettingsHost#onModMoved}).
+     *
+     * @return {@code false} (no change, no rescan) if {@code dirName}
+     * isn't found or its unit is already at the end in the requested
+     * direction.
+     */
+    public boolean moveMod(String dirName, boolean up) {
+        GroupResult gr = groups();
+        List<File> ordered = ModOrder.orderedModDirs(root);
+        List<List<String>> units = deriveUnits(ordered, gr);
+        int unitIndex = -1;
+        for (int i = 0; i < units.size(); i++) {
+            if (units.get(i).contains(dirName)) {
+                unitIndex = i;
+                break;
+            }
+        }
+        if (unitIndex < 0) return false;
+        boolean moved = ModOrder.move(root, units, unitIndex, up);
+        if (moved) scan();
+        return moved;
     }
 
     // --- multi-.ctp download grouping (see the class doc's multi-archive- --

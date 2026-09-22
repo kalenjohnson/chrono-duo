@@ -251,13 +251,30 @@ final class SettingsScreen {
     // non-empty ModGroup#options list (see buildDisplayRows).
     private final RectF[] modExpanderHitBoxes = new RectF[MAX_MOD_ROWS];
     private final String[] modExpanderKey = new String[MAX_MOD_ROWS]; // the group's downloadName
+    // ▲/▼ reorder buttons, drawn left of an installed parent row's On/Off
+    // button (never for a Get row or an option-cycle row) -- see
+    // drawSettingsScreen's Mods case and ModManager#moveMod. Tapping either
+    // calls onModMoved(modRowDirName[i], up); no separate dir-name array.
+    private final RectF[] modRowUpHitBoxes = new RectF[MAX_MOD_ROWS];
+    private final RectF[] modRowDownHitBoxes = new RectF[MAX_MOD_ROWS];
     private int modRowCount;
     {
         for (int i = 0; i < MAX_MOD_ROWS; i++) {
             modRowHitBoxes[i] = new RectF();
             modExpanderHitBoxes[i] = new RectF();
+            modRowUpHitBoxes[i] = new RectF();
+            modRowDownHitBoxes[i] = new RectF();
         }
     }
+    // Set by the d-pad reorder runnables (not by touch, which never moves
+    // the d-pad focus) so that once the async rescan re-pushes the list and
+    // the moved mod's row lands at a DIFFERENT display index than
+    // pendingFocusModRow, the Mods case's per-row loop puts the focus ring
+    // back on that mod's reorder item and clears both fields. Comparing the
+    // index is what makes a draw pass that runs BEFORE the rescan lands
+    // (same index still) leave the pending state alone.
+    private String pendingFocusModDir;
+    private int pendingFocusModRow = -1;
     // Which groups (keyed by ModGroup#downloadName) are expanded on the Mods
     // page, showing their option-group rows -- session-only UI state, never
     // persisted, reset implicitly whenever the app restarts. Not cleared on
@@ -367,36 +384,34 @@ final class SettingsScreen {
     }
 
     /**
-     * Builds the Mods page's row list: every {@link #modCatalog} entry, in
-     * catalog order (a "Get" row if {@link
-     * com.kalenjohnson.chronoduo.mods.ModCatalog#findInstalledDirName} finds
-     * no matching installed directory, an On/Off row if it does), followed
-     * by any installed mod directory (from {@link #modsList}) that matches
-     * no catalog entry at all -- a mod imported before the catalog existed,
-     * or dropped in by hand.
+     * Builds the Mods page's row list: every installed mod directory (from
+     * {@link #modsList}) FIRST, in that list's own order -- the user's mod
+     * priority order (see {@link com.kalenjohnson.chronoduo.mods.ModOrder},
+     * {@link com.kalenjohnson.chronoduo.mods.ModManager#collect} already
+     * returns {@link #modsList} walked that way) -- so the row order on
+     * screen always matches conflict-resolution order, with the ▲/▼
+     * buttons (see drawSettingsScreen's Mods case) right there to change
+     * it. Not-yet-installed {@link #modCatalog} entries follow, in catalog
+     * order, as "Get" rows.
      *
      * <p>A multi-.ctp download (see {@link #modGroupList}) collapses to a
      * SINGLE row bound to its {@link com.kalenjohnson.chronoduo.mods.ModManager.ModGroup#mainDir}:
      * a catalog entry matching that group's main dir (via {@link
      * com.kalenjohnson.chronoduo.mods.ModCatalog#findInstalledDirName}'s
-     * group-aware overload) gets the row as usual, but with {@code
-     * ModRow#group} set so drawSettingsScreen draws the Options ▾/▴
-     * expander; an uncatalogued group's main dir gets an "Imported mod" row
-     * titled by the group's OWN download name (not the raw directory name)
-     * instead. Every other directory belonging to a group -- the main dir
-     * of a group already emitted, and every option-choice dir -- is
-     * excluded entirely from the flat list; see {@link #buildDisplayRows}
-     * for how an expanded group's option rows get drawn instead. Pure
-     * w.r.t. this view's own fields.
+     * group-aware overload) supplies the row's title/summary/notes, but
+     * with {@code ModRow#group} set so drawSettingsScreen draws the Options
+     * ▾/▴ expander; an uncatalogued group's main dir gets an "Imported mod"
+     * row titled by the group's OWN download name (not the raw directory
+     * name) instead. Every other directory belonging to a group -- the
+     * main dir of a group already emitted, and every option-choice dir --
+     * is excluded entirely from the flat list; see {@link
+     * #buildDisplayRows} for how an expanded group's option rows get drawn
+     * instead. Pure w.r.t. this view's own fields.
      */
     private java.util.List<ModRow> buildModRows() {
         java.util.List<ModRow> rows = new java.util.ArrayList<>();
         java.util.List<String> dirNames = new java.util.ArrayList<>();
-        java.util.Map<String, com.kalenjohnson.chronoduo.mods.ModManager.ModInfo> byDir = new java.util.HashMap<>();
-        for (com.kalenjohnson.chronoduo.mods.ModManager.ModInfo m : modsList) {
-            dirNames.add(m.name);
-            byDir.put(m.name, m);
-        }
+        for (com.kalenjohnson.chronoduo.mods.ModManager.ModInfo m : modsList) dirNames.add(m.name);
 
         java.util.Map<String, com.kalenjohnson.chronoduo.mods.ModManager.ModGroup> groupByMainDir =
                 new java.util.HashMap<>();
@@ -417,27 +432,34 @@ final class SettingsScreen {
             }
         }
 
-        java.util.Set<String> consumedDirs = new java.util.HashSet<>();
+        // Catalog entry per installed dir, first catalog-order match wins
+        // (mirrors the old consumedDirs bookkeeping) -- only used for a
+        // row's title/summary/notes now, never its position.
+        java.util.Map<String, com.kalenjohnson.chronoduo.mods.ModCatalog.Entry> catalogByDir = new java.util.HashMap<>();
+        java.util.Set<String> matchedEntryIds = new java.util.HashSet<>();
         for (com.kalenjohnson.chronoduo.mods.ModCatalog.Entry e : modCatalog) {
             String dir = com.kalenjohnson.chronoduo.mods.ModCatalog.findInstalledDirName(e, dirNames, modGroupList);
             if (dir != null) {
-                consumedDirs.add(dir);
-                com.kalenjohnson.chronoduo.mods.ModManager.ModInfo m = byDir.get(dir);
-                com.kalenjohnson.chronoduo.mods.ModManager.ModGroup g = groupByMainDir.get(dir);
-                rows.add(new ModRow(e.name, e.summary, e.notes, true, dir, null, m.enabled, modSuffix(m), g));
-            } else {
-                rows.add(new ModRow(e.name, e.summary, e.notes, false, null, e.id, false, null, null));
+                matchedEntryIds.add(e.id);
+                catalogByDir.putIfAbsent(dir, e);
             }
         }
+
         for (com.kalenjohnson.chronoduo.mods.ModManager.ModInfo m : modsList) {
-            if (consumedDirs.contains(m.name)) continue;
             if (optionDirs.contains(m.name)) continue; // grouped option sub-dir -- shown only via its expanded parent
             com.kalenjohnson.chronoduo.mods.ModManager.ModGroup g = groupByMainDir.get(m.name);
-            if (g != null) {
-                consumedDirs.add(m.name);
+            com.kalenjohnson.chronoduo.mods.ModCatalog.Entry e = catalogByDir.get(m.name);
+            if (e != null) {
+                rows.add(new ModRow(e.name, e.summary, e.notes, true, m.name, null, m.enabled, modSuffix(m), g));
+            } else if (g != null) {
                 rows.add(new ModRow(g.downloadName, "Imported mod", null, true, m.name, null, m.enabled, modSuffix(m), g));
             } else {
                 rows.add(new ModRow(m.name, "Imported mod", null, true, m.name, null, m.enabled, modSuffix(m), null));
+            }
+        }
+        for (com.kalenjohnson.chronoduo.mods.ModCatalog.Entry e : modCatalog) {
+            if (!matchedEntryIds.contains(e.id)) {
+                rows.add(new ModRow(e.name, e.summary, e.notes, false, null, e.id, false, null, null));
             }
         }
         return rows;
@@ -855,6 +877,17 @@ final class SettingsScreen {
                 }
             }
             for (int i = 0; i < modRowCount; i++) {
+                boolean upHit = !modRowUpHitBoxes[i].isEmpty() && modRowUpHitBoxes[i].contains(event.getX(), event.getY());
+                boolean downHit = !upHit && !modRowDownHitBoxes[i].isEmpty()
+                        && modRowDownHitBoxes[i].contains(event.getX(), event.getY());
+                if (upHit || downHit) {
+                    if (settingsHost != null && modRowDirName[i] != null) {
+                        settingsHost.onModMoved(modRowDirName[i], upHit);
+                    }
+                    return true;
+                }
+            }
+            for (int i = 0; i < modRowCount; i++) {
                 if (!modRowHitBoxes[i].isEmpty()
                         && modRowHitBoxes[i].contains(event.getX(), event.getY())) {
                     if (settingsHost != null) {
@@ -1247,6 +1280,8 @@ final class SettingsScreen {
         for (int i = 0; i < MAX_MOD_ROWS; i++) {
             modRowHitBoxes[i].setEmpty();
             modExpanderHitBoxes[i].setEmpty();
+            modRowUpHitBoxes[i].setEmpty();
+            modRowDownHitBoxes[i].setEmpty();
         }
         modRowCount = 0;
         modListViewport.setEmpty();
@@ -1359,7 +1394,7 @@ final class SettingsScreen {
             case 1: subtitle = "Pixel-perfect rendering and original sprite/chip art."; break;
             case 2: subtitle = "Dungeon fog of war and overworld map rendering."; break;
             case 3: subtitle = "Speed up the whole game, held or toggled."; break;
-            default: subtitle = "Alphabetical order, first mod wins a conflict."; break;
+            default: subtitle = "Top mod wins a conflict. Use ▲▼ to reorder."; break;
         }
         setText(h * 0.022f, inkDim, false, Paint.Align.LEFT, false);
         c.drawText(subtitle, left, y, text);
@@ -1522,6 +1557,13 @@ final class SettingsScreen {
                 float toggleW = w * (150f / 1240f);
                 float pickerW = w * (520f / 1240f);
                 float modsBtnH = h * 0.055f;
+                // ▲/▼ reorder column -- installed parent rows only (see the
+                // per-row loop below), always reserved in the layout math
+                // (rowTextMaxW, the expander's right edge) even for a Get
+                // row so the text/expander columns never shift width row to
+                // row within the same page.
+                float reorderW = w * (56f / 1240f);
+                float reorderGap = w * 0.01f;
                 // Leave room to the right of the button/picker column for the
                 // scrollbar track (trackX0..trackX1 below, contentRight-0.022w
                 // .. -0.006w) so a wide On/Off/Get button can never sit under it.
@@ -1544,7 +1586,7 @@ final class SettingsScreen {
                 // both. Option rows are indented under their parent's title
                 // and sit next to the much wider picker button, so they get
                 // their own (narrower) max width.
-                float rowTextMaxW = textW - toggleW - w * 0.02f;
+                float rowTextMaxW = textW - toggleW - reorderW - reorderGap - w * 0.02f;
                 float optionIndent = w * 0.04f;
                 float optionTextMaxW = Math.max(0f, textW - pickerW - optionIndent - w * 0.02f);
 
@@ -1609,6 +1651,20 @@ final class SettingsScreen {
                 // order so the two stay in lockstep.
                 java.util.List<Integer> focusRowIndex = new java.util.ArrayList<>();
                 float contentH = 0f;
+                // First/last installed PARENT row index (display-row index,
+                // not focus-list index) -- installed rows are already
+                // contiguous at the front of displayRows (see
+                // buildModRows), so a single forward scan finds both;
+                // used below to hide the ▲ on the first and the ▼ on the
+                // last instead of leaving a dead arrow that moves nothing.
+                int firstInstalledRow = -1, lastInstalledRow = -1;
+                for (int k = 0; k < rowCount; k++) {
+                    ModDisplayRow d = displayRows.get(k);
+                    if (d.parent != null && d.parent.installed) {
+                        if (firstInstalledRow < 0) firstInstalledRow = k;
+                        lastInstalledRow = k;
+                    }
+                }
                 for (int i = 0; i < rowCount; i++) {
                     ModDisplayRow dr = displayRows.get(i);
                     if (dr.parent != null) {
@@ -1638,6 +1694,14 @@ final class SettingsScreen {
                         rowHeights[i] = Math.max(textStackH, h * 0.02f + buttonBlockH);
                         if (dr.expandable) focusRowIndex.add(i); // "Options ▾/▴" line
                         focusRowIndex.add(i); // the row's own button
+                        // ▲/▼ reorder pair -- ALWAYS emitted for an installed
+                        // row (never conditioned on "not first"/"not last",
+                        // so this measure pass and the draw loop's matching
+                        // settingsFocusRects.add below stay in lockstep
+                        // regardless of the row's position; an unusable
+                        // arrow just gets an empty hit box, not a missing
+                        // focus item).
+                        if (row.installed) focusRowIndex.add(i);
                     } else {
                         // Option row title (left label): shared-prefix
                         // stripped already (dr.optionDisplayTitle -- see
@@ -1779,7 +1843,7 @@ final class SettingsScreen {
                             // button column (checked AFTER this hit box in
                             // onTouchEvent) so widening this box can never
                             // swallow a tap meant for that button.
-                            expBox.set(contentLeft, expTop, btnRight - toggleW - w * 0.01f, expBottom);
+                            expBox.set(contentLeft, expTop, btnRight - toggleW - reorderW - reorderGap - w * 0.01f, expBottom);
                             modExpanderKey[i] = dr.expandKey;
                             if (modsImporting || !rowVisible) expBox.setEmpty();
                             final String expKey = dr.expandKey;
@@ -1840,6 +1904,64 @@ final class SettingsScreen {
                         });
                         settingsFocusStepLeft.add(null);
                         settingsFocusStepRight.add(null);
+
+                        // ▲/▼ reorder buttons -- installed rows only,
+                        // immediately left of the On/Off button, same
+                        // vertical span (boxTop..boxTop+boxH -- NOT box's
+                        // current left/top, which modsImporting/!rowVisible
+                        // above may already have zeroed via setEmpty()).
+                        // Not drawn (and no hit box) at either end of the
+                        // installed-row run instead of moving nothing.
+                        RectF upBox = modRowUpHitBoxes[i];
+                        RectF downBox = modRowDownHitBoxes[i];
+                        if (row.installed) {
+                            float reorderRight = btnRight - toggleW - reorderGap;
+                            float reorderLeft = reorderRight - reorderW;
+                            float halfH = boxH / 2f;
+                            upBox.set(reorderLeft, boxTop, reorderRight, boxTop + halfH);
+                            downBox.set(reorderLeft, boxTop + halfH, reorderRight, boxTop + boxH);
+                            boolean canUp = i != firstInstalledRow;
+                            boolean canDown = i != lastInstalledRow;
+                            if (canUp) drawCommandButton(c, upBox, "▲", winTex, false);
+                            if (canDown) drawCommandButton(c, downBox, "▼", winTex, false);
+                            if (!canUp || modsImporting || !rowVisible) upBox.setEmpty();
+                            if (!canDown || modsImporting || !rowVisible) downBox.setEmpty();
+
+                            final String reorderDir = row.dirName;
+                            final boolean canUpFinal = canUp, canDownFinal = canDown;
+                            final int reorderRow = i;
+                            RectF reorderFocusRect = new RectF(reorderLeft, boxTop, reorderRight, boxTop + boxH);
+                            if (modsImporting || !rowVisible) reorderFocusRect.setEmpty();
+                            int reorderFocusIdx = settingsFocusRects.size();
+                            settingsFocusRects.add(reorderFocusRect);
+                            Runnable moveUp = () -> {
+                                if (!rowActionable || settingsHost == null || !canUpFinal) return;
+                                pendingFocusModDir = reorderDir;
+                                pendingFocusModRow = reorderRow;
+                                settingsHost.onModMoved(reorderDir, true);
+                            };
+                            Runnable moveDown = () -> {
+                                if (!rowActionable || settingsHost == null || !canDownFinal) return;
+                                pendingFocusModDir = reorderDir;
+                                pendingFocusModRow = reorderRow;
+                                settingsHost.onModMoved(reorderDir, false);
+                            };
+                            settingsFocusActivate.add(moveUp); // activate == ▲, per spec
+                            settingsFocusStepLeft.add(moveUp);
+                            settingsFocusStepRight.add(moveDown);
+                            // Focus follow across the async rescan/rebuild
+                            // (see pendingFocusModDir's field doc). The ring
+                            // itself is painted after this loop, so no
+                            // invalidate is needed.
+                            if (reorderDir.equals(pendingFocusModDir) && i != pendingFocusModRow) {
+                                settingsContentFocus = reorderFocusIdx;
+                                pendingFocusModDir = null;
+                                pendingFocusModRow = -1;
+                            }
+                        } else {
+                            upBox.setEmpty();
+                            downBox.setEmpty();
+                        }
                     } else {
                         // Indented option-group row (only present when its
                         // parent is expanded -- see buildDisplayRows): title

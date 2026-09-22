@@ -197,6 +197,9 @@ public class AppActivity extends Cocos2dxActivity {
             @Override public void onModOptionSelected(String group, String optionTitle, String dirOrNull) {
                 setModOption(group, optionTitle, dirOrNull);
             }
+            @Override public void onModMoved(String name, boolean up) {
+                moveMod(name, up);
+            }
         });
         // A Presentation the system tears down and recreates behind our
         // back (sleep/wake being the common trigger -- see
@@ -918,6 +921,17 @@ public class AppActivity extends Cocos2dxActivity {
             updateModsStatus(false, null);
             refreshCompanionAssetsForModChange();
         }, "ChronoModOption").start();
+    }
+
+    /** Reorders a mod's priority via {@link com.kalenjohnson.chronoduo.mods.ModManager#moveMod} on a background thread, then pushes the result. Called from the settings screen's Mods page ▲/▼ buttons. */
+    private void moveMod(String name, boolean up) {
+        if (modManager == null) return;
+        final com.kalenjohnson.chronoduo.mods.ModManager mm = modManager;
+        new Thread(() -> {
+            mm.moveMod(name, up);
+            updateModsStatus(false, null);
+            refreshCompanionAssetsForModChange();
+        }, "ChronoModMove").start();
     }
 
     /** Same as the 3-arg overload with no success message -- the common idle/importing/error case. */

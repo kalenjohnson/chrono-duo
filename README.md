@@ -92,8 +92,10 @@ top of the game's own assets; the Google Play install is never modified.
   just the changed files.
 - **Cutscene and font mods** work: replacement FMVs and custom in-game fonts.
 - Mods live under `Android/data/com.kalenjohnson.chronoduo/files/mods/` and
-  can be dropped there by hand. If two mods change the same file, the one
-  that sorts first alphabetically wins.
+  can be dropped there by hand. **Order matters**: the Mods tab has ▲/▼
+  buttons to set each mod's priority, and if two mods change the same file
+  the one higher in that order wins. The order is stored in
+  `mods/.order`; a mod not yet listed there falls back to alphabetical.
 
 ### Settings
 
